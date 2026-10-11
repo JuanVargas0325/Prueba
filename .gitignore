@@ -1,0 +1,19 @@
+# Secretos y configuración local
+.env
+*.env.local
+
+# Resultados de compilación y pruebas
+backend/coverage.out
+backend/bin/
+*.test
+
+# Archivos generados localmente
+data/
+*.pdf
+!docs/**/*.pdf
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

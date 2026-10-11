@@ -1,0 +1,4 @@
+# Normaliza los saltos de línea a LF en el repositorio (Go, Docker y scripts lo requieren).
+* text=auto eol=lf
+*.png binary
+*.pdf binary
