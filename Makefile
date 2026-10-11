@@ -3,7 +3,7 @@
 
 GO_IMG      := golang:1.26
 LINT_IMG    := golangci/golangci-lint:latest
-NEWMAN_IMG  := postman/newman:alpine
+NEWMAN_IMG  := postman/newman:ubuntu
 DOCKER_GO   := docker run --rm -v "$(CURDIR)/backend:/src" -v gomod:/go/pkg/mod -v gocache:/root/.cache/go-build -w /src
 ADMIN_PASSWORD ?= $(shell grep '^ADMIN_PASSWORD=' .env 2>/dev/null | cut -d= -f2)
 
@@ -30,10 +30,10 @@ pruebas: ## Pruebas unitarias con detector de condiciones de carrera
 pruebas-integracion: ## Pruebas unitarias y de integración contra un PostgreSQL temporal
 	-docker network create red-pruebas >/dev/null 2>&1
 	-docker rm -f pg-pruebas >/dev/null 2>&1
-	docker run -d --name pg-pruebas --network red-pruebas -e POSTGRES_USER=pruebas -e POSTGRES_PASSWORD=pruebas -e POSTGRES_DB=pruebas postgres:16-alpine
+	docker run -d --name pg-pruebas --network red-pruebas -e POSTGRES_USER=pruebas -e POSTGRES_PASSWORD=pruebas -e POSTGRES_DB=pruebas postgres:16-bookworm
 	sleep 5
 	$(DOCKER_GO) --network red-pruebas -e DATABASE_URL_PRUEBAS=postgres://pruebas:pruebas@pg-pruebas:5432/pruebas?sslmode=disable \
-		$(GO_IMG) go test -race -tags integracion -cover ./... ; status=$$?; docker rm -f pg-pruebas >/dev/null; exit $$status
+		$(GO_IMG) go test -race -tags integracion -coverpkg=./internal/... -cover ./... ; status=$$?; docker rm -f pg-pruebas >/dev/null; exit $$status
 
 lint: ## Formato y análisis estático (golangci-lint)
 	$(DOCKER_GO) $(LINT_IMG) sh -c 'test -z "$$(gofmt -l .)" || (gofmt -l . && exit 1); golangci-lint run ./...'
