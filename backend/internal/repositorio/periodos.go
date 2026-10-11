@@ -37,13 +37,13 @@ func (r *Periodos) Crear(ctx context.Context, p dominio.PeriodoAcademico) (domin
 	if esViolacionUnica(err) {
 		return creado, apperr.Conflicto("ya existe el período %s", p.Codigo)
 	}
-	return creado, traducir(err, "período")
+	return creado, traducir(err, recursoPeriodo)
 }
 
 // Obtener devuelve el período con el identificador dado.
 func (r *Periodos) Obtener(ctx context.Context, id string) (dominio.PeriodoAcademico, error) {
 	p, err := escanearPeriodo(r.db.QueryRow(ctx, `SELECT `+columnasPeriodo+` FROM periodos_academicos WHERE id = $1`, id))
-	return p, traducir(err, "período")
+	return p, traducir(err, recursoPeriodo)
 }
 
 // Listar devuelve los períodos, del más reciente al más antiguo.
@@ -56,10 +56,10 @@ func (r *Periodos) Listar(ctx context.Context, f dominio.FiltroPeriodos) ([]domi
 		` ORDER BY fecha_inicio DESC` + w.paginar(f.Paginacion)
 	filas, err := r.db.Query(ctx, sql, w.args...)
 	if err != nil {
-		return nil, traducir(err, "períodos")
+		return nil, traducir(err, recursoPeriodos)
 	}
 	periodos, err := recolectar(filas, escanearPeriodo)
-	return periodos, traducir(err, "períodos")
+	return periodos, traducir(err, recursoPeriodos)
 }
 
 // Actualizar guarda el estado y la ventana de creación del período.
@@ -68,5 +68,5 @@ func (r *Periodos) Actualizar(ctx context.Context, p dominio.PeriodoAcademico) (
 		`UPDATE periodos_academicos SET estado = $2, creacion_habilitada = $3
 		 WHERE id = $1 RETURNING `+columnasPeriodo,
 		p.ID, string(p.Estado), p.CreacionHabilitada))
-	return actualizado, traducir(err, "período")
+	return actualizado, traducir(err, recursoPeriodo)
 }

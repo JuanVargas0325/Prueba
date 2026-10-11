@@ -46,7 +46,7 @@ func leerArchivos(form *multipart.Form) ([]servicio.ArchivoAdjunto, func(), erro
 		f, err := cabecera.Open()
 		if err != nil {
 			cerrar()
-			return nil, func() {}, apperr.Validacion("no fue posible leer el archivo %q", cabecera.Filename)
+			return nil, func() { /* los archivos ya abiertos se cerraron arriba */ }, apperr.Validacion("no fue posible leer el archivo %q", cabecera.Filename)
 		}
 		abiertos = append(abiertos, f)
 		archivos = append(archivos, servicio.ArchivoAdjunto{Nombre: cabecera.Filename, Contenido: f})

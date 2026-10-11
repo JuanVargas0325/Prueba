@@ -43,7 +43,7 @@ func (r *Espacios) Crear(ctx context.Context, e dominio.Espacio) (dominio.Espaci
 		string(e.Tipo), e.Nombre, e.PeriodoID, e.ProfesorID, e.FechaInicio, e.FechaCierre, e.Observaciones,
 	).Scan(&id)
 	if err != nil {
-		return e, traducir(err, "curso o proyecto")
+		return e, traducir(err, recursoEspacio)
 	}
 	return r.Obtener(ctx, id)
 }
@@ -51,7 +51,7 @@ func (r *Espacios) Crear(ctx context.Context, e dominio.Espacio) (dominio.Espaci
 // Obtener devuelve el espacio con el identificador dado.
 func (r *Espacios) Obtener(ctx context.Context, id string) (dominio.Espacio, error) {
 	e, err := escanearEspacio(r.db.QueryRow(ctx, selectEspacio+` WHERE e.id = $1`, id))
-	return e, traducir(err, "curso o proyecto")
+	return e, traducir(err, recursoEspacio)
 }
 
 // Listar devuelve los espacios que cumplen el filtro.
@@ -72,10 +72,10 @@ func (r *Espacios) Listar(ctx context.Context, f dominio.FiltroEspacios) ([]domi
 	sql := selectEspacio + w.where() + ` ORDER BY e.estado, lower(e.nombre)` + w.paginar(f.Paginacion)
 	filas, err := r.db.Query(ctx, sql, w.args...)
 	if err != nil {
-		return nil, traducir(err, "cursos y proyectos")
+		return nil, traducir(err, recursoEspacios)
 	}
 	espacios, err := recolectar(filas, escanearEspacio)
-	return espacios, traducir(err, "cursos y proyectos")
+	return espacios, traducir(err, recursoEspacios)
 }
 
 // Cerrar pasa el espacio a estado cerrado (RF-03.5).
@@ -83,7 +83,7 @@ func (r *Espacios) Cerrar(ctx context.Context, id string) (dominio.Espacio, erro
 	etiqueta, err := r.db.Exec(ctx,
 		`UPDATE espacios SET estado = 'cerrado', actualizado_en = now() WHERE id = $1 AND estado = 'activo'`, id)
 	if err != nil {
-		return dominio.Espacio{}, traducir(err, "curso o proyecto")
+		return dominio.Espacio{}, traducir(err, recursoEspacio)
 	}
 	if etiqueta.RowsAffected() == 0 {
 		return dominio.Espacio{}, apperr.Conflicto("el curso o proyecto ya está cerrado")
@@ -97,5 +97,5 @@ func (r *Espacios) EsParticipante(ctx context.Context, espacioID, usuarioID stri
 	err := r.db.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM vinculaciones WHERE espacio_id = $1 AND usuario_id = $2)`,
 		espacioID, usuarioID).Scan(&existe)
-	return existe, traducir(err, "vinculación")
+	return existe, traducir(err, recursoVinculacion)
 }

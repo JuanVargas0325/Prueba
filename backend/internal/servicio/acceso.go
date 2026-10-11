@@ -29,7 +29,7 @@ func puedeVerDeProfesor(actor auth.Actor, profesorID string) bool {
 }
 
 // visiblePara devuelve el usuario por el que se deben filtrar los listados:
-// vacío para el administrador (ve todo) y el propio actor para los demás.
+// vacío para el administrador (sin restricción) y el propio actor para los demás.
 func visiblePara(actor auth.Actor) string {
 	if actor.EsAdministrador() {
 		return ""

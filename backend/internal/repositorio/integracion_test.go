@@ -53,6 +53,30 @@ func conectar(t *testing.T) *pgxpool.Pool {
 	return db
 }
 
+func TestMigracionesSobreBaseVacia(t *testing.T) {
+	db := conectar(t)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public;`); err != nil {
+		t.Fatal(err)
+	}
+	// Dos veces: la segunda no debe aplicar nada ni fallar.
+	for i := 0; i < 2; i++ {
+		if err := basedatos.Migrar(ctx, db, logPrueba); err != nil {
+			t.Fatalf("ejecución %d: %v", i+1, err)
+		}
+	}
+	var aplicadas, tablas int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM migraciones_aplicadas`).Scan(&aplicadas); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'`).Scan(&tablas); err != nil {
+		t.Fatal(err)
+	}
+	if aplicadas != 1 || tablas != 11 {
+		t.Errorf("se esperaba 1 migración y 11 tablas (10 del esquema + control), hay %d y %d", aplicadas, tablas)
+	}
+}
+
 func fecha(t *testing.T, texto string) time.Time {
 	t.Helper()
 	f, err := dominio.ParsearFecha(texto)
@@ -307,72 +331,98 @@ func TestTareasYAdjuntos(t *testing.T) {
 	}
 }
 
-func TestFlujoDeReportes(t *testing.T) {
+// loteDePrueba es un lote con dos reportes pendientes: Laura (con una tarea
+// en la semana) y Andrés (sin tareas).
+type loteDePrueba struct {
+	repo     *repositorio.Reportes
+	esc      escenario
+	semana   time.Time
+	lote     dominio.LoteReportes
+	personas []string
+	reportes []string
+}
+
+func prepararLote(t *testing.T) loteDePrueba {
+	t.Helper()
 	db := conectar(t)
 	ctx := context.Background()
-	e := crearEscenario(t, db)
-	vinculaciones := repositorio.NuevoVinculaciones(db)
-	vLaura, _ := vincular(t, vinculaciones, e.laura, e.curso, dominio.RolMonitor, 4)
-	if _, err := vincular(t, vinculaciones, e.andres, e.proyecto, dominio.RolMonitor, 6); err != nil {
-		t.Fatal(err)
-	}
-	semana := fecha(t, "2026-10-05")
-	if _, err := repositorio.NuevoTareas(db).Crear(ctx, dominio.Tarea{ID: uuid.NewString(), VinculacionID: vLaura.ID,
-		SemanaInicio: semana, Titulo: "Calificar", Descripcion: "Taller 2", Estado: dominio.TareaFinalizada, HorasInvertidas: 3}, nil); err != nil {
-		t.Fatal(err)
-	}
-	repo := repositorio.NuevoReportes(db)
+	l := loteDePrueba{repo: repositorio.NuevoReportes(db), esc: crearEscenario(t, db), semana: fecha(t, "2026-10-05")}
 
-	lote, err := repo.CrearLote(ctx, e.profesor.ID, semana)
+	vinculaciones := repositorio.NuevoVinculaciones(db)
+	vLaura, err := vincular(t, vinculaciones, l.esc.laura, l.esc.curso, dominio.RolMonitor, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if activo, _ := repo.ExisteLoteActivo(ctx, e.profesor.ID, semana); !activo {
-		t.Error("el lote recién creado debe estar activo")
+	if _, err := vincular(t, vinculaciones, l.esc.andres, l.esc.proyecto, dominio.RolMonitor, 6); err != nil {
+		t.Fatal(err)
 	}
-	personas, err := repo.ListarPersonasParaReporte(ctx, e.profesor.ID, semana, dominio.FinSemana(semana))
-	if err != nil || len(personas) != 2 {
-		t.Fatalf("personas inesperadas: %v %v", personas, err)
-	}
-	reportes, err := repo.CrearReportesPendientes(ctx, lote.ID, e.profesor.ID, semana, personas)
-	if err != nil || len(reportes) != 2 {
-		t.Fatalf("reportes inesperados: %v %v", reportes, err)
-	}
-	// Idempotente: repetirlo no duplica.
-	if otra, _ := repo.CrearReportesPendientes(ctx, lote.ID, e.profesor.ID, semana, personas); len(otra) != 2 {
-		t.Errorf("crear reportes dos veces no debe duplicarlos: %d", len(otra))
-	}
-	if err := repo.IniciarLote(ctx, lote.ID, len(reportes)); err != nil {
+	_, err = repositorio.NuevoTareas(db).Crear(ctx, dominio.Tarea{ID: uuid.NewString(), VinculacionID: vLaura.ID, SemanaInicio: l.semana,
+		Titulo: "Calificar", Descripcion: "Taller 2", Estado: dominio.TareaFinalizada, HorasInvertidas: 3}, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	datos, err := repo.ObtenerDatosSemana(ctx, e.profesor.ID, e.laura.ID, semana)
+	if l.lote, err = l.repo.CrearLote(ctx, l.esc.profesor.ID, l.semana); err != nil {
+		t.Fatal(err)
+	}
+	if l.personas, err = l.repo.ListarPersonasParaReporte(ctx, l.esc.profesor.ID, l.semana, dominio.FinSemana(l.semana)); err != nil {
+		t.Fatal(err)
+	}
+	if l.reportes, err = l.repo.CrearReportesPendientes(ctx, l.lote.ID, l.esc.profesor.ID, l.semana, l.personas); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.repo.IniciarLote(ctx, l.lote.ID, len(l.reportes)); err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+func TestCreacionDeLoteDeReportes(t *testing.T) {
+	l := prepararLote(t)
+	ctx := context.Background()
+
+	if len(l.personas) != 2 || len(l.reportes) != 2 {
+		t.Fatalf("se esperaban 2 personas y 2 reportes: %v %v", l.personas, l.reportes)
+	}
+	if activo, _ := l.repo.ExisteLoteActivo(ctx, l.esc.profesor.ID, l.semana); !activo {
+		t.Error("el lote en proceso debe considerarse activo")
+	}
+	// Idempotente: repetirlo no duplica.
+	if otra, _ := l.repo.CrearReportesPendientes(ctx, l.lote.ID, l.esc.profesor.ID, l.semana, l.personas); len(otra) != 2 {
+		t.Errorf("crear reportes dos veces no debe duplicarlos: %d", len(otra))
+	}
+	datos, err := l.repo.ObtenerDatosSemana(ctx, l.esc.profesor.ID, l.esc.laura.ID, l.semana)
 	if err != nil || datos.TotalTareas() != 1 || datos.TotalHoras() != 3 || datos.Persona != "Laura Martínez" || datos.Profesor != "Carolina Rojas" {
 		t.Errorf("datos de la semana inesperados: %+v %v", datos, err)
 	}
+	lista, err := l.repo.ListarReportes(ctx, dominio.FiltroReportes{LoteID: l.lote.ID, Paginacion: dominio.SinPaginar})
+	if err != nil || len(lista) != 2 {
+		t.Errorf("listado inesperado: %v %v", lista, err)
+	}
+}
 
-	if err := repo.MarcarReporteEnProceso(ctx, reportes[0]); err != nil {
+func TestFinalizacionDeReportes(t *testing.T) {
+	l := prepararLote(t)
+	ctx := context.Background()
+
+	if err := l.repo.MarcarReporteEnProceso(ctx, l.reportes[0]); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.CompletarReporte(ctx, reportes[0], dominio.ResultadoReporte{Resumen: "ok", RutaPDF: "r.pdf", TamanoBytes: 10}); err != nil {
+	if err := l.repo.CompletarReporte(ctx, l.reportes[0], dominio.ResultadoReporte{Resumen: "ok", RutaPDF: "r.pdf", TamanoBytes: 10}); err != nil {
 		t.Fatal(err)
 	}
 	// Completar dos veces no cuenta dos veces.
-	_ = repo.CompletarReporte(ctx, reportes[0], dominio.ResultadoReporte{Resumen: "ok"})
-	if err := repo.FallarReporte(ctx, reportes[1], "clave inválida"); err != nil {
+	_ = l.repo.CompletarReporte(ctx, l.reportes[0], dominio.ResultadoReporte{Resumen: "ok"})
+	if err := l.repo.FallarReporte(ctx, l.reportes[1], "clave inválida"); err != nil {
 		t.Fatal(err)
 	}
 
-	final, _ := repo.ObtenerLote(ctx, lote.ID)
+	final, _ := l.repo.ObtenerLote(ctx, l.lote.ID)
 	if final.Estado != dominio.LoteCompletadoConErrores || final.ReportesCompletados != 1 || final.ReportesFallidos != 1 || final.FinalizadoEn == nil {
 		t.Errorf("estado final del lote inesperado: %+v", final)
 	}
-	rep, _ := repo.ObtenerReporte(ctx, reportes[0])
+	rep, _ := l.repo.ObtenerReporte(ctx, l.reportes[0])
 	if rep.Estado != dominio.ReporteCompletado || rep.Intentos != 1 || rep.RutaPDF != "r.pdf" {
 		t.Errorf("reporte inesperado: %+v", rep)
-	}
-	lista, err := repo.ListarReportes(ctx, dominio.FiltroReportes{LoteID: lote.ID, Paginacion: dominio.SinPaginar})
-	if err != nil || len(lista) != 2 {
-		t.Errorf("listado inesperado: %v %v", lista, err)
 	}
 }

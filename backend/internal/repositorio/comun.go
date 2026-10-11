@@ -25,6 +25,26 @@ type consultor interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// Nombres de los recursos que aparecen en los mensajes de error de la capa de datos.
+const (
+	recursoUsuario       = "usuario"
+	recursoUsuarios      = "usuarios"
+	recursoPeriodo       = "período"
+	recursoPeriodos      = "períodos"
+	recursoEspacio       = "curso o proyecto"
+	recursoEspacios      = "cursos y proyectos"
+	recursoVinculacion   = "vinculación"
+	recursoVinculaciones = "vinculaciones"
+	recursoTarea         = "tarea"
+	recursoTareas        = "tareas"
+	recursoAdjunto       = "adjunto"
+	recursoAdjuntos      = "adjuntos"
+	recursoLote          = "lote de reportes"
+	recursoLotes         = "lotes de reportes"
+	recursoReporte       = "reporte"
+	recursoReportes      = "reportes"
+)
+
 // enTransaccion ejecuta fn dentro de una transacción: confirma si fn termina
 // sin error y revierte en cualquier otro caso.
 func enTransaccion(ctx context.Context, db *pgxpool.Pool, fn func(tx pgx.Tx) error) error {

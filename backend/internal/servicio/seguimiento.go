@@ -44,7 +44,7 @@ type DetallePersona struct {
 	Semanas []dominio.SemanaPersona
 }
 
-// ConsolidadoPersona es el resumen de todo el trabajo de una persona (RF-10.4).
+// ConsolidadoPersona es el resumen acumulado del trabajo de una persona (RF-10.4).
 type ConsolidadoPersona struct {
 	Persona       dominio.Usuario
 	Vinculaciones []dominio.ConsolidadoVinculacion

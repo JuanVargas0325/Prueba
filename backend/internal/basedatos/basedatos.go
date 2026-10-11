@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -81,34 +82,40 @@ func Migrar(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) error {
 	sort.Strings(nombres)
 
 	for _, nombre := range nombres {
-		version := strings.TrimSuffix(strings.TrimPrefix(nombre, "migraciones/"), ".sql")
-		var aplicada bool
-		if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM migraciones_aplicadas WHERE version = $1)", version).Scan(&aplicada); err != nil {
-			return fmt.Errorf("consultando migración %s: %w", version, err)
-		}
-		if aplicada {
-			continue
-		}
-		sql, err := archivosMigracion.ReadFile(nombre)
-		if err != nil {
+		if err := aplicarMigracion(ctx, conn.Conn(), nombre, log); err != nil {
 			return err
 		}
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			return err
-		}
+	}
+	return nil
+}
+
+// aplicarMigracion ejecuta un archivo de migración, si aún no se ha aplicado,
+// y lo registra en la misma transacción.
+func aplicarMigracion(ctx context.Context, conn *pgx.Conn, nombre string, log *slog.Logger) error {
+	version := strings.TrimSuffix(strings.TrimPrefix(nombre, "migraciones/"), ".sql")
+	var aplicada bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM migraciones_aplicadas WHERE version = $1)", version).Scan(&aplicada); err != nil {
+		return fmt.Errorf("consultando migración %s: %w", version, err)
+	}
+	if aplicada {
+		return nil
+	}
+	sql, err := archivosMigracion.ReadFile(nombre)
+	if err != nil {
+		return err
+	}
+	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, string(sql)); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("aplicando migración %s: %w", version, err)
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO migraciones_aplicadas (version) VALUES ($1)", version); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("registrando migración %s: %w", version, err)
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("confirmando migración %s: %w", version, err)
-		}
-		log.Info("migración aplicada", "version", version)
+		return nil
+	})
+	if err != nil {
+		return err
 	}
+	log.Info("migración aplicada", "version", version)
 	return nil
 }

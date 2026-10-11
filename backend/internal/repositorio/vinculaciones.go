@@ -52,7 +52,7 @@ func (r *Vinculaciones) Crear(ctx context.Context, v dominio.Vinculacion, valida
 		if err := tx.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM vinculaciones WHERE usuario_id = $1 AND espacio_id = $2 AND rol = $3)`,
 			v.UsuarioID, v.EspacioID, string(v.Rol)).Scan(&existe); err != nil {
-			return traducir(err, "vinculación")
+			return traducir(err, recursoVinculacion)
 		}
 		if existe {
 			return apperr.Conflicto("la persona ya está vinculada como %s en este curso o proyecto", v.Rol.Texto())
@@ -70,7 +70,7 @@ func (r *Vinculaciones) Crear(ctx context.Context, v dominio.Vinculacion, valida
 		if esViolacionUnica(err) {
 			return apperr.Conflicto("la persona ya está vinculada como %s en este curso o proyecto", v.Rol.Texto())
 		}
-		return traducir(err, "vinculación")
+		return traducir(err, recursoVinculacion)
 	})
 	if err != nil {
 		return dominio.Vinculacion{}, err
@@ -79,14 +79,14 @@ func (r *Vinculaciones) Crear(ctx context.Context, v dominio.Vinculacion, valida
 }
 
 // Rectificar corrige el rol o las horas de una vinculación (RF-04.5) y deja
-// registro de la corrección, todo en la misma transacción.
+// registro de la corrección dentro de la misma transacción.
 func (r *Vinculaciones) Rectificar(ctx context.Context, id string, rol dominio.Rol, horas int,
 	administradorID, motivo string, validar dominio.ValidadorCarga) (dominio.Vinculacion, error) {
 
 	err := enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
 		actual, err := escanearVinculacion(tx.QueryRow(ctx, selectVinculacion+` WHERE v.id = $1 FOR UPDATE OF v`, id))
 		if err != nil {
-			return traducir(err, "vinculación")
+			return traducir(err, recursoVinculacion)
 		}
 		if err := bloquearUsuario(ctx, tx, actual.UsuarioID); err != nil {
 			return err
@@ -108,7 +108,7 @@ func (r *Vinculaciones) Rectificar(ctx context.Context, id string, rol dominio.R
 			return apperr.Conflicto("la persona ya tiene otra vinculación como %s en este curso o proyecto", rol.Texto())
 		}
 		if err != nil {
-			return traducir(err, "vinculación")
+			return traducir(err, recursoVinculacion)
 		}
 		_, err = tx.Exec(ctx,
 			`INSERT INTO vinculacion_rectificaciones
@@ -126,7 +126,7 @@ func (r *Vinculaciones) Rectificar(ctx context.Context, id string, rol dominio.R
 // Obtener devuelve la vinculación con el identificador dado.
 func (r *Vinculaciones) Obtener(ctx context.Context, id string) (dominio.Vinculacion, error) {
 	v, err := escanearVinculacion(r.db.QueryRow(ctx, selectVinculacion+` WHERE v.id = $1`, id))
-	return v, traducir(err, "vinculación")
+	return v, traducir(err, recursoVinculacion)
 }
 
 // Listar devuelve las vinculaciones que cumplen el filtro.
@@ -150,10 +150,10 @@ func (r *Vinculaciones) Listar(ctx context.Context, f dominio.FiltroVinculacione
 	sql := selectVinculacion + w.where() + ` ORDER BY lower(u.nombre), lower(e.nombre), v.rol` + w.paginar(f.Paginacion)
 	filas, err := r.db.Query(ctx, sql, w.args...)
 	if err != nil {
-		return nil, traducir(err, "vinculaciones")
+		return nil, traducir(err, recursoVinculaciones)
 	}
 	vinculaciones, err := recolectar(filas, escanearVinculacion)
-	return vinculaciones, traducir(err, "vinculaciones")
+	return vinculaciones, traducir(err, recursoVinculaciones)
 }
 
 // ListarRectificaciones devuelve las correcciones de una vinculación, de la más reciente a la más antigua.
@@ -179,7 +179,7 @@ func (r *Vinculaciones) ListarRectificaciones(ctx context.Context, vinculacionID
 func bloquearUsuario(ctx context.Context, tx pgx.Tx, usuarioID string) error {
 	var id string
 	err := tx.QueryRow(ctx, `SELECT id FROM usuarios WHERE id = $1 FOR UPDATE`, usuarioID).Scan(&id)
-	return traducir(err, "usuario")
+	return traducir(err, recursoUsuario)
 }
 
 // listarSimultaneas devuelve las vinculaciones de la persona en espacios activos
@@ -195,8 +195,8 @@ func listarSimultaneas(ctx context.Context, c consultor, usuarioID string, inici
 	}
 	filas, err := c.Query(ctx, selectVinculacion+w.where(), w.args...)
 	if err != nil {
-		return nil, traducir(err, "vinculaciones")
+		return nil, traducir(err, recursoVinculaciones)
 	}
 	vinculaciones, err := recolectar(filas, escanearVinculacion)
-	return vinculaciones, traducir(err, "vinculaciones")
+	return vinculaciones, traducir(err, recursoVinculaciones)
 }

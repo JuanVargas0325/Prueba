@@ -80,38 +80,47 @@ func ConstruirSemanas(vinculaciones []Vinculacion, tareas []Tarea, desde, hasta,
 
 	var semanas []SemanaPersona
 	for semana := InicioSemana(hasta); !semana.Before(InicioSemana(desde)); semana = semana.AddDate(0, 0, -7) {
-		s := SemanaPersona{SemanaInicio: semana}
-		for _, v := range vinculaciones {
-			delSemana := porSemana[claveTareas{v.ID, semana}]
-			if !v.VigenteEnSemana(semana, zona) && len(delSemana) == 0 {
-				continue
-			}
-			d := DetalleVinculacionSemana{Vinculacion: v, Tareas: delSemana}
-			for _, t := range delSemana {
-				d.HorasReportadas += t.HorasInvertidas
-				if t.Tardia {
-					d.TareasTardias++
-				}
-			}
-			d.Estado = estadoSemana(semana, actual, len(delSemana))
-			s.Vinculaciones = append(s.Vinculaciones, d)
-			s.HorasContratadas += v.HorasSemanales
-			s.HorasReportadas += d.HorasReportadas
+		if s, ok := construirSemana(vinculaciones, porSemana, semana, actual, zona); ok {
+			semanas = append(semanas, s)
 		}
-		if len(s.Vinculaciones) == 0 {
-			continue
-		}
-		totalTareas := 0
-		for _, d := range s.Vinculaciones {
-			totalTareas += len(d.Tareas)
-		}
-		s.Estado = estadoSemana(semana, actual, totalTareas)
-		semanas = append(semanas, s)
 	}
 	return semanas
 }
 
-// ConsolidadoVinculacion resume todo lo reportado en una vinculación (RF-10.4).
+// construirSemana arma el detalle de una semana; ok es falso si ninguna
+// vinculación estaba vigente ni tiene tareas en esa semana.
+func construirSemana(vinculaciones []Vinculacion, porSemana map[claveTareas][]Tarea, semana, actual time.Time, zona *time.Location) (SemanaPersona, bool) {
+	s := SemanaPersona{SemanaInicio: semana}
+	totalTareas := 0
+	for _, v := range vinculaciones {
+		delSemana := porSemana[claveTareas{v.ID, semana}]
+		if !v.VigenteEnSemana(semana, zona) && len(delSemana) == 0 {
+			continue
+		}
+		d := detalleVinculacion(v, delSemana)
+		d.Estado = estadoSemana(semana, actual, len(delSemana))
+		s.Vinculaciones = append(s.Vinculaciones, d)
+		s.HorasContratadas += v.HorasSemanales
+		s.HorasReportadas += d.HorasReportadas
+		totalTareas += len(delSemana)
+	}
+	s.Estado = estadoSemana(semana, actual, totalTareas)
+	return s, len(s.Vinculaciones) > 0
+}
+
+// detalleVinculacion suma las horas y los reportes tardíos de las tareas de una semana.
+func detalleVinculacion(v Vinculacion, tareas []Tarea) DetalleVinculacionSemana {
+	d := DetalleVinculacionSemana{Vinculacion: v, Tareas: tareas}
+	for _, t := range tareas {
+		d.HorasReportadas += t.HorasInvertidas
+		if t.Tardia {
+			d.TareasTardias++
+		}
+	}
+	return d
+}
+
+// ConsolidadoVinculacion resume el trabajo reportado en una vinculación (RF-10.4).
 type ConsolidadoVinculacion struct {
 	Vinculacion          Vinculacion
 	SemanasTranscurridas int // semanas cerradas en las que la vinculación estuvo vigente
@@ -131,44 +140,57 @@ func ConstruirConsolidado(vinculaciones []Vinculacion, tareas []Tarea, ahora tim
 
 	resultado := make([]ConsolidadoVinculacion, 0, len(vinculaciones))
 	for _, v := range vinculaciones {
-		c := ConsolidadoVinculacion{Vinculacion: v, TareasPorEstado: map[EstadoTarea]int{}}
-		for _, e := range EstadosTarea {
-			c.TareasPorEstado[e] = 0
-		}
-		horasCerradas := 0
-		for _, t := range tareas {
-			if t.VinculacionID != v.ID {
-				continue
-			}
-			c.TotalTareas++
-			c.TotalHoras += t.HorasInvertidas
-			c.TareasPorEstado[t.Estado]++
-			if t.Tardia {
-				c.TareasTardias++
-			}
-			if InicioSemana(t.SemanaInicio).Before(actual) {
-				horasCerradas += t.HorasInvertidas
-			}
-		}
-
-		fin := InicioSemana(v.EspacioFechaCierre)
-		if !fin.Before(actual) {
-			fin = actual.AddDate(0, 0, -7) // solo semanas cerradas
-		}
-		for semana := InicioSemana(v.InicioVigencia(zona)); !semana.After(fin); semana = semana.AddDate(0, 0, 7) {
-			c.SemanasTranscurridas++
-			if len(porSemana[claveTareas{v.ID, semana}]) > 0 {
-				c.SemanasConReporte++
-			} else {
-				c.SemanasSinReporte++
-			}
-		}
+		c, horasCerradas := totalizarTareas(v, tareas, actual)
+		contarSemanas(&c, porSemana, actual, zona)
 		if c.SemanasTranscurridas > 0 {
 			c.PromedioHorasSemana = float64(horasCerradas) / float64(c.SemanasTranscurridas)
 		}
 		resultado = append(resultado, c)
 	}
 	return resultado
+}
+
+// totalizarTareas suma las tareas de la vinculación y devuelve también las
+// horas reportadas en semanas ya cerradas (base del promedio semanal).
+func totalizarTareas(v Vinculacion, tareas []Tarea, actual time.Time) (ConsolidadoVinculacion, int) {
+	c := ConsolidadoVinculacion{Vinculacion: v, TareasPorEstado: map[EstadoTarea]int{}}
+	for _, e := range EstadosTarea {
+		c.TareasPorEstado[e] = 0
+	}
+	horasCerradas := 0
+	for _, t := range tareas {
+		if t.VinculacionID != v.ID {
+			continue
+		}
+		c.TotalTareas++
+		c.TotalHoras += t.HorasInvertidas
+		c.TareasPorEstado[t.Estado]++
+		if t.Tardia {
+			c.TareasTardias++
+		}
+		if InicioSemana(t.SemanaInicio).Before(actual) {
+			horasCerradas += t.HorasInvertidas
+		}
+	}
+	return c, horasCerradas
+}
+
+// contarSemanas recorre las semanas cerradas en que la vinculación estuvo
+// vigente y cuenta cuáles tienen reporte y cuáles no.
+func contarSemanas(c *ConsolidadoVinculacion, porSemana map[claveTareas][]Tarea, actual time.Time, zona *time.Location) {
+	v := c.Vinculacion
+	fin := InicioSemana(v.EspacioFechaCierre)
+	if !fin.Before(actual) {
+		fin = actual.AddDate(0, 0, -7) // solo semanas cerradas
+	}
+	for semana := InicioSemana(v.InicioVigencia(zona)); !semana.After(fin); semana = semana.AddDate(0, 0, 7) {
+		c.SemanasTranscurridas++
+		if len(porSemana[claveTareas{v.ID, semana}]) > 0 {
+			c.SemanasConReporte++
+		} else {
+			c.SemanasSinReporte++
+		}
+	}
 }
 
 type claveTareas struct {

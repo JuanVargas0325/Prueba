@@ -56,7 +56,7 @@ func (r *Tareas) Crear(ctx context.Context, t dominio.Tarea, adjuntos []dominio.
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 			t.ID, t.VinculacionID, t.SemanaInicio, t.Titulo, t.Descripcion, string(t.Estado), t.HorasInvertidas, t.Observaciones, t.Tardia)
 		if err != nil {
-			return traducir(err, "tarea")
+			return traducir(err, recursoTarea)
 		}
 		return insertarAdjuntos(ctx, tx, adjuntos)
 	})
@@ -70,14 +70,14 @@ func (r *Tareas) Crear(ctx context.Context, t dominio.Tarea, adjuntos []dominio.
 func (r *Tareas) Obtener(ctx context.Context, id string) (dominio.Tarea, error) {
 	t, err := escanearTarea(r.db.QueryRow(ctx, selectTarea+` WHERE t.id = $1`, id))
 	if err != nil {
-		return t, traducir(err, "tarea")
+		return t, traducir(err, recursoTarea)
 	}
 	filas, err := r.db.Query(ctx, `SELECT `+columnasAdjunto+` FROM tarea_adjuntos WHERE tarea_id = $1 ORDER BY creado_en`, id)
 	if err != nil {
-		return t, traducir(err, "adjuntos")
+		return t, traducir(err, recursoAdjuntos)
 	}
 	t.Adjuntos, err = recolectar(filas, escanearAdjunto)
-	return t, traducir(err, "adjuntos")
+	return t, traducir(err, recursoAdjuntos)
 }
 
 // Listar devuelve las tareas que cumplen el filtro, de la semana más reciente a la más antigua.
@@ -101,10 +101,10 @@ func (r *Tareas) Listar(ctx context.Context, f dominio.FiltroTareas) ([]dominio.
 	sql := selectTarea + w.where() + ` ORDER BY t.semana_inicio DESC, t.creado_en DESC` + w.paginar(f.Paginacion)
 	filas, err := r.db.Query(ctx, sql, w.args...)
 	if err != nil {
-		return nil, traducir(err, "tareas")
+		return nil, traducir(err, recursoTareas)
 	}
 	tareas, err := recolectar(filas, escanearTarea)
-	return tareas, traducir(err, "tareas")
+	return tareas, traducir(err, recursoTareas)
 }
 
 // ListarPorVinculaciones devuelve todas las tareas de las vinculaciones dadas,
@@ -123,10 +123,10 @@ func (r *Tareas) ListarPorVinculaciones(ctx context.Context, vinculacionIDs []st
 	}
 	filas, err := r.db.Query(ctx, selectTarea+w.where()+` ORDER BY t.semana_inicio DESC, t.creado_en`, w.args...)
 	if err != nil {
-		return nil, traducir(err, "tareas")
+		return nil, traducir(err, recursoTareas)
 	}
 	tareas, err := recolectar(filas, escanearTarea)
-	return tareas, traducir(err, "tareas")
+	return tareas, traducir(err, recursoTareas)
 }
 
 // Actualizar guarda los campos editables. Como defensa adicional a la regla
@@ -138,7 +138,7 @@ func (r *Tareas) Actualizar(ctx context.Context, t dominio.Tarea) (dominio.Tarea
 		 WHERE id = $1 AND tardia = FALSE`,
 		t.ID, t.Titulo, t.Descripcion, string(t.Estado), t.HorasInvertidas, t.Observaciones)
 	if err != nil {
-		return t, traducir(err, "tarea")
+		return t, traducir(err, recursoTarea)
 	}
 	if etiqueta.RowsAffected() == 0 {
 		return t, apperr.ReglaNegocio("la tarea no se puede modificar")
@@ -153,15 +153,15 @@ func (r *Tareas) Eliminar(ctx context.Context, id string) ([]string, error) {
 	err := enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
 		filas, err := tx.Query(ctx, `SELECT ruta_almacenamiento FROM tarea_adjuntos WHERE tarea_id = $1`, id)
 		if err != nil {
-			return traducir(err, "adjuntos")
+			return traducir(err, recursoAdjuntos)
 		}
 		rutas, err = pgx.CollectRows(filas, pgx.RowTo[string])
 		if err != nil {
-			return traducir(err, "adjuntos")
+			return traducir(err, recursoAdjuntos)
 		}
 		etiqueta, err := tx.Exec(ctx, `DELETE FROM tareas WHERE id = $1 AND tardia = FALSE`, id)
 		if err != nil {
-			return traducir(err, "tarea")
+			return traducir(err, recursoTarea)
 		}
 		if etiqueta.RowsAffected() == 0 {
 			return apperr.ReglaNegocio("la tarea no se puede eliminar")
@@ -176,11 +176,11 @@ func (r *Tareas) AgregarAdjuntos(ctx context.Context, tareaID string, adjuntos [
 	return enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
 		var id string
 		if err := tx.QueryRow(ctx, `SELECT id FROM tareas WHERE id = $1 FOR UPDATE`, tareaID).Scan(&id); err != nil {
-			return traducir(err, "tarea")
+			return traducir(err, recursoTarea)
 		}
 		var actuales int
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM tarea_adjuntos WHERE tarea_id = $1`, tareaID).Scan(&actuales); err != nil {
-			return traducir(err, "adjuntos")
+			return traducir(err, recursoAdjuntos)
 		}
 		if actuales+len(adjuntos) > maximo {
 			return apperr.ReglaNegocio("una tarea admite máximo %d adjuntos (ya tiene %d)", maximo, actuales)
@@ -193,7 +193,7 @@ func (r *Tareas) AgregarAdjuntos(ctx context.Context, tareaID string, adjuntos [
 func (r *Tareas) ObtenerAdjunto(ctx context.Context, tareaID, adjuntoID string) (dominio.Adjunto, error) {
 	a, err := escanearAdjunto(r.db.QueryRow(ctx,
 		`SELECT `+columnasAdjunto+` FROM tarea_adjuntos WHERE id = $1 AND tarea_id = $2`, adjuntoID, tareaID))
-	return a, traducir(err, "adjunto")
+	return a, traducir(err, recursoAdjunto)
 }
 
 // EliminarAdjunto borra el registro del adjunto y devuelve la ruta del archivo.
@@ -202,7 +202,7 @@ func (r *Tareas) EliminarAdjunto(ctx context.Context, tareaID, adjuntoID string)
 	err := r.db.QueryRow(ctx,
 		`DELETE FROM tarea_adjuntos WHERE id = $1 AND tarea_id = $2 RETURNING ruta_almacenamiento`,
 		adjuntoID, tareaID).Scan(&ruta)
-	return ruta, traducir(err, "adjunto")
+	return ruta, traducir(err, recursoAdjunto)
 }
 
 func insertarAdjuntos(ctx context.Context, tx pgx.Tx, adjuntos []dominio.Adjunto) error {
@@ -212,7 +212,7 @@ func insertarAdjuntos(ctx context.Context, tx pgx.Tx, adjuntos []dominio.Adjunto
 			 VALUES ($1, $2, $3, $4, $5, $6)`,
 			a.ID, a.TareaID, a.NombreOriginal, a.RutaAlmacenamiento, a.TipoContenido, a.TamanoBytes)
 		if err != nil {
-			return traducir(err, "adjunto")
+			return traducir(err, recursoAdjunto)
 		}
 	}
 	return nil

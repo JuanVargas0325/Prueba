@@ -41,13 +41,13 @@ func escanearUsuario(fila pgx.Row) (dominio.Usuario, error) {
 func (r *Usuarios) BuscarPorCorreo(ctx context.Context, correo string) (dominio.Usuario, error) {
 	u, err := escanearUsuario(r.db.QueryRow(ctx,
 		selectUsuario+` WHERE lower(u.correo) = lower($1) GROUP BY u.id`, strings.TrimSpace(correo)))
-	return u, traducir(err, "usuario")
+	return u, traducir(err, recursoUsuario)
 }
 
 // BuscarPorID devuelve el usuario con el identificador dado.
 func (r *Usuarios) BuscarPorID(ctx context.Context, id string) (dominio.Usuario, error) {
 	u, err := escanearUsuario(r.db.QueryRow(ctx, selectUsuario+` WHERE u.id = $1 GROUP BY u.id`, id))
-	return u, traducir(err, "usuario")
+	return u, traducir(err, recursoUsuario)
 }
 
 // Listar devuelve los usuarios que cumplen el filtro, ordenados por nombre.
@@ -62,10 +62,10 @@ func (r *Usuarios) Listar(ctx context.Context, f dominio.FiltroUsuarios) ([]domi
 	sql := selectUsuario + w.where() + ` GROUP BY u.id ORDER BY lower(u.nombre), u.correo` + w.paginar(f.Paginacion)
 	filas, err := r.db.Query(ctx, sql, w.args...)
 	if err != nil {
-		return nil, traducir(err, "usuarios")
+		return nil, traducir(err, recursoUsuarios)
 	}
 	usuarios, err := recolectar(filas, escanearUsuario)
-	return usuarios, traducir(err, "usuarios")
+	return usuarios, traducir(err, recursoUsuarios)
 }
 
 // Crear inserta un usuario con sus roles y devuelve el usuario creado.
@@ -80,7 +80,7 @@ func (r *Usuarios) Crear(ctx context.Context, u dominio.Usuario) (dominio.Usuari
 			return apperr.Conflicto("ya existe un usuario con el correo %s", u.Correo)
 		}
 		if err != nil {
-			return traducir(err, "usuario")
+			return traducir(err, recursoUsuario)
 		}
 		return insertarRoles(ctx, tx, u.ID, u.Roles)
 	})
@@ -94,7 +94,7 @@ func (r *Usuarios) ReemplazarRoles(ctx context.Context, usuarioID string, roles 
 			return traducir(err, "roles")
 		}
 		if _, err := tx.Exec(ctx, `UPDATE usuarios SET actualizado_en = now() WHERE id = $1`, usuarioID); err != nil {
-			return traducir(err, "usuario")
+			return traducir(err, recursoUsuario)
 		}
 		return insertarRoles(ctx, tx, usuarioID, roles)
 	})
@@ -119,7 +119,7 @@ func (r *Usuarios) TieneVinculacionesActivas(ctx context.Context, usuarioID stri
 		`SELECT EXISTS (SELECT 1 FROM vinculaciones v JOIN espacios e ON e.id = v.espacio_id
 		 WHERE v.usuario_id = $1 AND v.rol = $2 AND e.estado = 'activo')`,
 		usuarioID, string(rol)).Scan(&existe)
-	return existe, traducir(err, "vinculaciones")
+	return existe, traducir(err, recursoVinculaciones)
 }
 
 // TieneEspaciosActivos indica si el usuario es profesor de algún espacio no cerrado.

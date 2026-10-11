@@ -115,7 +115,7 @@ type VinculacionSemana struct {
 	Tareas           []TareaSemana
 }
 
-// DatosSemanaPersona es todo lo que se necesita para generar el reporte
+// DatosSemanaPersona reúne la información necesaria para generar el reporte
 // semanal de una persona frente a un profesor.
 type DatosSemanaPersona struct {
 	UsuarioID     string

@@ -41,7 +41,7 @@ func (r *Reportes) CrearLote(ctx context.Context, profesorID string, semana time
 	l, err := escanearLote(r.db.QueryRow(ctx,
 		`INSERT INTO lotes_reportes (profesor_id, semana_inicio) VALUES ($1, $2) RETURNING `+columnasLote,
 		profesorID, semana))
-	return l, traducir(err, "lote de reportes")
+	return l, traducir(err, recursoLote)
 }
 
 // ExisteLoteActivo indica si el profesor ya tiene un lote en curso para la semana.
@@ -51,13 +51,13 @@ func (r *Reportes) ExisteLoteActivo(ctx context.Context, profesorID string, sema
 		`SELECT EXISTS (SELECT 1 FROM lotes_reportes
 		 WHERE profesor_id = $1 AND semana_inicio = $2 AND estado IN ('pendiente', 'en_proceso'))`,
 		profesorID, semana).Scan(&existe)
-	return existe, traducir(err, "lotes de reportes")
+	return existe, traducir(err, recursoLotes)
 }
 
 // ObtenerLote devuelve el lote con el identificador dado.
 func (r *Reportes) ObtenerLote(ctx context.Context, id string) (dominio.LoteReportes, error) {
 	l, err := escanearLote(r.db.QueryRow(ctx, `SELECT `+columnasLote+` FROM lotes_reportes WHERE id = $1`, id))
-	return l, traducir(err, "lote de reportes")
+	return l, traducir(err, recursoLote)
 }
 
 // ListarLotes devuelve los lotes que cumplen el filtro, del más reciente al más antiguo.
@@ -72,10 +72,10 @@ func (r *Reportes) ListarLotes(ctx context.Context, f dominio.FiltroLotes) ([]do
 	sql := `SELECT ` + columnasLote + ` FROM lotes_reportes` + w.where() + ` ORDER BY creado_en DESC` + w.paginar(f.Paginacion)
 	filas, err := r.db.Query(ctx, sql, w.args...)
 	if err != nil {
-		return nil, traducir(err, "lotes de reportes")
+		return nil, traducir(err, recursoLotes)
 	}
 	lotes, err := recolectar(filas, escanearLote)
-	return lotes, traducir(err, "lotes de reportes")
+	return lotes, traducir(err, recursoLotes)
 }
 
 // IniciarLote fija el total de reportes y pasa el lote a "en_proceso".
@@ -88,7 +88,7 @@ func (r *Reportes) IniciarLote(ctx context.Context, id string, total int) error 
 			finalizado_en = CASE WHEN $2 = 0 THEN now() ELSE NULL END,
 			actualizado_en = now()
 		 WHERE id = $1 AND estado IN ('pendiente', 'en_proceso')`, id, total)
-	return traducir(err, "lote de reportes")
+	return traducir(err, recursoLote)
 }
 
 // MarcarLoteFallido registra que el lote no pudo procesarse.
@@ -96,7 +96,7 @@ func (r *Reportes) MarcarLoteFallido(ctx context.Context, id, motivo string) err
 	_, err := r.db.Exec(ctx,
 		`UPDATE lotes_reportes SET estado = 'fallido', error = $2, finalizado_en = now(), actualizado_en = now()
 		 WHERE id = $1 AND estado IN ('pendiente', 'en_proceso')`, id, recortarTexto(motivo))
-	return traducir(err, "lote de reportes")
+	return traducir(err, recursoLote)
 }
 
 // ---------------------------------------------------------------------------
@@ -146,21 +146,21 @@ func (r *Reportes) CrearReportesPendientes(ctx context.Context, loteID, profesor
 			 ON CONFLICT (lote_id, usuario_id) DO NOTHING`,
 			loteID, profesorID, semana, usuarioIDs)
 		if err != nil {
-			return nil, traducir(err, "reportes")
+			return nil, traducir(err, recursoReportes)
 		}
 	}
 	filas, err := r.db.Query(ctx, `SELECT id::text FROM reportes_semanales WHERE lote_id = $1 ORDER BY creado_en, id`, loteID)
 	if err != nil {
-		return nil, traducir(err, "reportes")
+		return nil, traducir(err, recursoReportes)
 	}
 	ids, err := pgx.CollectRows(filas, pgx.RowTo[string])
-	return ids, traducir(err, "reportes")
+	return ids, traducir(err, recursoReportes)
 }
 
 // ObtenerReporte devuelve el reporte con el identificador dado.
 func (r *Reportes) ObtenerReporte(ctx context.Context, id string) (dominio.ReporteSemanal, error) {
 	rep, err := escanearReporte(r.db.QueryRow(ctx, selectReporte+` WHERE r.id = $1`, id))
-	return rep, traducir(err, "reporte")
+	return rep, traducir(err, recursoReporte)
 }
 
 // ListarReportes devuelve los reportes que cumplen el filtro.
@@ -181,10 +181,10 @@ func (r *Reportes) ListarReportes(ctx context.Context, f dominio.FiltroReportes)
 	sql := selectReporte + w.where() + ` ORDER BY r.semana_inicio DESC, lower(u.nombre), r.creado_en DESC` + w.paginar(f.Paginacion)
 	filas, err := r.db.Query(ctx, sql, w.args...)
 	if err != nil {
-		return nil, traducir(err, "reportes")
+		return nil, traducir(err, recursoReportes)
 	}
 	reportes, err := recolectar(filas, escanearReporte)
-	return reportes, traducir(err, "reportes")
+	return reportes, traducir(err, recursoReportes)
 }
 
 // MarcarReporteEnProceso registra el inicio de un intento de generación.
@@ -192,7 +192,7 @@ func (r *Reportes) MarcarReporteEnProceso(ctx context.Context, id string) error 
 	_, err := r.db.Exec(ctx,
 		`UPDATE reportes_semanales SET estado = 'en_proceso', intentos = intentos + 1, actualizado_en = now()
 		 WHERE id = $1 AND estado IN ('pendiente', 'en_proceso')`, id)
-	return traducir(err, "reporte")
+	return traducir(err, recursoReporte)
 }
 
 // CompletarReporte guarda el resultado del reporte y actualiza el avance del lote
@@ -227,7 +227,7 @@ func (r *Reportes) finalizarReporte(ctx context.Context, sqlReporte string, args
 			return nil // el reporte ya estaba en un estado final: nada que hacer
 		}
 		if err != nil {
-			return traducir(err, "reporte")
+			return traducir(err, recursoReporte)
 		}
 		_, err = tx.Exec(ctx,
 			`UPDATE lotes_reportes l SET
@@ -250,7 +250,7 @@ func (r *Reportes) finalizarReporte(ctx context.Context, sqlReporte string, args
 				END,
 				actualizado_en = now()
 			 WHERE l.id = $1`, loteID, completados, fallidos)
-		return traducir(err, "lote de reportes")
+		return traducir(err, recursoLote)
 	})
 }
 
@@ -279,7 +279,7 @@ func (r *Reportes) ObtenerDatosSemana(ctx context.Context, profesorID, usuarioID
 		 WHERE v.usuario_id = $1 AND e.profesor_id = $2 AND e.fecha_inicio <= $4 AND e.fecha_cierre >= $3
 		 ORDER BY e.nombre, v.rol`, usuarioID, profesorID, semana, fin)
 	if err != nil {
-		return d, traducir(err, "vinculaciones")
+		return d, traducir(err, recursoVinculaciones)
 	}
 	type fila struct {
 		id string
@@ -293,7 +293,7 @@ func (r *Reportes) ObtenerDatosSemana(ctx context.Context, profesorID, usuarioID
 		return x, err
 	})
 	if err != nil {
-		return d, traducir(err, "vinculaciones")
+		return d, traducir(err, recursoVinculaciones)
 	}
 	if len(leidas) == 0 {
 		return d, nil
@@ -312,18 +312,18 @@ func (r *Reportes) ObtenerDatosSemana(ctx context.Context, profesorID, usuarioID
 		 WHERE vinculacion_id = ANY($1::uuid[]) AND semana_inicio = $2
 		 ORDER BY creado_en, id`, ids, semana)
 	if err != nil {
-		return d, traducir(err, "tareas")
+		return d, traducir(err, recursoTareas)
 	}
 	defer filas.Close()
 	for filas.Next() {
 		var vincID, estado string
 		var t dominio.TareaSemana
 		if err := filas.Scan(&vincID, &t.Titulo, &t.Descripcion, &estado, &t.Horas, &t.Observaciones, &t.Tardia); err != nil {
-			return d, traducir(err, "tareas")
+			return d, traducir(err, recursoTareas)
 		}
 		t.Estado = dominio.EstadoTarea(estado)
 		i := indice[vincID]
 		d.Vinculaciones[i].Tareas = append(d.Vinculaciones[i].Tareas, t)
 	}
-	return d, traducir(filas.Err(), "tareas")
+	return d, traducir(filas.Err(), recursoTareas)
 }
