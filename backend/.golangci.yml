@@ -1,0 +1,12 @@
+# Configuración de golangci-lint (https://golangci-lint.run).
+# Se ejecuta en CI y localmente con: golangci-lint run ./...
+version: "2"
+
+run:
+  # Incluye las pruebas de integración en el análisis.
+  build-tags:
+    - integracion
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck y unused.
+  default: standard
