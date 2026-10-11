@@ -1,13 +1,15 @@
 # Integración continua: se ejecuta en cada push y en cada pull request.
 #  1. calidad: formato (gofmt), análisis estático (golangci-lint, incluye go vet).
 #  2. pruebas: pruebas unitarias y de integración (con PostgreSQL) con cobertura.
-#  3. sonarqube: análisis de calidad con SonarQube usando la cobertura del paso anterior.
+#  3. sonarqube: análisis con SonarQube y su Quality Gate. Sin SONAR_TOKEN se usa un
+#     SonarQube Community temporal y el reporte queda como artefacto "reporte-sonarqube".
 #  4. e2e: levanta todo con Docker Compose y ejecuta la colección de Postman con Newman.
 #
-# Para habilitar SonarQube configure en GitHub (Settings > Secrets and variables > Actions):
-#   - secreto  SONAR_TOKEN     token generado en SonarQube / SonarQube Cloud
+# Opcional, para usar SonarQube Cloud o un servidor propio en lugar del temporal, configure en
+# GitHub (Settings > Secrets and variables > Actions):
+#   - secreto  SONAR_TOKEN     token generado en el servidor
 #   - variable SONAR_HOST_URL  URL del servidor (para SonarQube Cloud: https://sonarcloud.io)
-# y complete sonar.projectKey (y sonar.organization si usa SonarQube Cloud) en sonar-project.properties.
+# y ajuste sonar.projectKey (y sonar.organization en SonarQube Cloud) en sonar-project.properties.
 
 name: CI
 
@@ -53,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-bookworm
         env:
           POSTGRES_USER: pruebas
           POSTGRES_PASSWORD: pruebas
@@ -79,7 +81,9 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Pruebas con cobertura
-        run: go test -race -tags integracion -covermode=atomic -coverprofile=coverage.out ./...
+        # -coverpkg mide la cobertura entre paquetes (por ejemplo, las migraciones
+        # que ejercitan las pruebas de integración de los repositorios).
+        run: go test -race -tags integracion -covermode=atomic -coverpkg=./internal/... -coverprofile=coverage.out ./...
 
       - name: Resumen de cobertura
         run: go tool cover -func=coverage.out | tail -n 1
@@ -106,13 +110,62 @@ jobs:
           name: cobertura
           path: backend
 
-      - name: Aviso si SonarQube no está configurado
-        if: env.SONAR_TOKEN == ''
-        run: echo "::warning::SONAR_TOKEN no está configurado; se omite el análisis de SonarQube."
-
-      - name: Escanear con SonarQube
+      # Opción 1: SonarQube Cloud o un servidor del curso (si se configuró SONAR_TOKEN).
+      - name: Escanear con el servidor configurado
         if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v5
+        with:
+          args: -Dsonar.qualitygate.wait=true
+
+      # Opción 2: sin token, se levanta un SonarQube Community temporal en el runner.
+      - name: Levantar SonarQube Community temporal
+        if: env.SONAR_TOKEN == ''
+        run: |
+          docker run -d --name sonarqube -p 9000:9000 sonarqube:community
+          for _ in $(seq 1 60); do
+            estado=$(curl -s localhost:9000/api/system/status | jq -r .status 2>/dev/null || true)
+            [ "$estado" = "UP" ] && break
+            sleep 5
+          done
+          echo "SonarQube: $estado"
+          token=$(curl -s -u admin:admin -X POST "localhost:9000/api/user_tokens/generate?name=ci&type=GLOBAL_ANALYSIS_TOKEN" | jq -r .token)
+          echo "::add-mask::$token"
+          echo "SONAR_LOCAL_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Escanear con SonarQube Community
+        if: env.SONAR_TOKEN == ''
+        run: |
+          docker run --rm --network host \
+            -e SONAR_HOST_URL=http://localhost:9000 -e SONAR_TOKEN="$SONAR_LOCAL_TOKEN" \
+            -v "$PWD:/usr/src" sonarsource/sonar-scanner-cli -Dsonar.qualitygate.wait=true
+
+      - name: Exportar el reporte de SonarQube
+        if: always() && env.SONAR_TOKEN == ''
+        run: |
+          mkdir -p reporte-sonarqube
+          base="http://localhost:9000/api"
+          proyecto=$(grep '^sonar.projectKey=' sonar-project.properties | cut -d= -f2)
+          curl -s -u admin:admin "$base/qualitygates/project_status?projectKey=$proyecto" > reporte-sonarqube/quality-gate.json
+          curl -s -u admin:admin "$base/measures/component?component=$proyecto&metricKeys=ncloc,coverage,bugs,vulnerabilities,security_hotspots,code_smells,duplicated_lines_density,reliability_rating,security_rating,sqale_rating,sqale_index" > reporte-sonarqube/metricas.json
+          curl -s -u admin:admin "$base/issues/search?componentKeys=$proyecto&resolved=false&ps=500" > reporte-sonarqube/hallazgos.json
+          curl -s -u admin:admin "$base/hotspots/search?projectKey=$proyecto&ps=500" > reporte-sonarqube/hotspots.json
+          {
+            echo "## SonarQube"
+            echo "**Quality Gate:** $(jq -r .projectStatus.status reporte-sonarqube/quality-gate.json)"
+            echo
+            echo "| Métrica | Valor |"
+            echo "|---|---|"
+            jq -r '.component.measures | sort_by(.metric)[] | "| \(.metric) | \(.value) |"' reporte-sonarqube/metricas.json
+            echo
+            echo "**Hallazgos abiertos:** $(jq -r .total reporte-sonarqube/hallazgos.json)"
+            jq -r '.issues[] | "- `\(.rule)` \(.component | split(":")[1]):\(.line // "-") — \(.message)"' reporte-sonarqube/hallazgos.json
+          } | tee reporte-sonarqube/resumen.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && env.SONAR_TOKEN == ''
+        with:
+          name: reporte-sonarqube
+          path: reporte-sonarqube
 
   e2e:
     name: Despliegue con Docker Compose y pruebas de punta a punta (Newman)
@@ -135,7 +188,7 @@ jobs:
 
       - name: Ejecutar la colección de Postman con Newman
         run: |
-          docker run --rm --network host -v "$PWD/postman:/etc/newman" postman/newman:alpine \
+          docker run --rm --network host -v "$PWD/postman:/etc/newman" postman/newman:ubuntu \
             run seguimiento.postman_collection.json \
             --env-var "baseUrl=http://localhost:8080" \
             --env-var "adminPassword=${ADMIN_PASSWORD_CI}"
