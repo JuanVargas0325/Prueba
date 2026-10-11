@@ -1,0 +1,117 @@
+# Despliegue local completo de la Entrega 1.
+#   1. cp .env.example .env   (y ajustar los valores)
+#   2. docker compose up --build -d
+#   3. La API queda disponible en http://localhost:8080 a través de Nginx.
+#
+# Perfiles opcionales:
+#   docker compose --profile monitoreo up -d   -> Asynqmon (panel de la cola) en http://localhost:8081
+#   docker compose --profile ollama up -d      -> modelo de IA local con Ollama
+
+name: seguimiento
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - datos-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Para conectarse desde una herramienta local (DBeaver, pgAdmin), descomente:
+    # ports:
+    #   - "5433:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - datos-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      target: api
+    image: seguimiento-api:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_DIRECCION: redis:6379
+      ALMACENAMIENTO_RUTA: /data
+    volumes:
+      - archivos:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8080"
+
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    image: seguimiento-worker:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_DIRECCION: redis:6379
+      ALMACENAMIENTO_RUTA: /data
+    # Comparte el volumen con la API: el worker escribe los PDF y la API los sirve.
+    volumes:
+      - archivos:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # La API aplica las migraciones al arrancar.
+      api:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PUERTO:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+  asynqmon:
+    profiles: ["monitoreo"]
+    image: hibiken/asynqmon:latest
+    command: ["--redis-addr=redis:6379"]
+    ports:
+      - "8081:8080"
+    depends_on:
+      - redis
+
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    volumes:
+      - modelos-ollama:/root/.ollama
+
+volumes:
+  datos-postgres:
+  datos-redis:
+  archivos:
+  modelos-ollama:
