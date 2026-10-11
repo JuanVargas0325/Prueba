@@ -8,7 +8,7 @@ Proyecto del curso **MISW4204 – Desarrollo de software en la nube** (Universid
 
 Plataforma web ligera para que un profesor haga seguimiento semanal al trabajo de sus monitores y asistentes graduados. Valida las reglas de dedicación horaria, registra tareas semana a semana (con reportes tardíos y estado "sin reporte") y genera por lotes reportes semanales en PDF resumidos con IA generativa.
 
-La documentación oficial del proyecto (arquitectura, deuda técnica y pruebas) está en la **Wiki** del repositorio. En [`docs/wiki/`](docs/wiki/) están las páginas listas para copiar.
+La documentación oficial del proyecto (arquitectura, deuda técnica, pruebas de carga y guías del equipo) está en la [**Wiki** del repositorio](https://github.com/JuanVargas0325/Prueba/wiki).
 
 ---
 
@@ -89,7 +89,6 @@ flowchart LR
 ├── scripts/datos_demo.sql         datos de demostración
 ├── postman/                       colección de punta a punta (73 peticiones) y archivo de prueba
 ├── pruebas-carga/                 pruebas de carga con Apache Benchmark: datos, script, análisis y resultados
-├── docs/wiki/                     páginas para la Wiki
 ├── Makefile                       comandos habituales (con Docker)
 ├── sonar-project.properties       configuración de SonarQube
 └── .github/workflows/ci.yml       integración continua

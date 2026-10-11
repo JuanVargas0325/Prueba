@@ -10,7 +10,6 @@ backend/bin/
 # Archivos generados localmente
 data/
 *.pdf
-!docs/**/*.pdf
 
 # Editores y sistema operativo
 .vscode/
