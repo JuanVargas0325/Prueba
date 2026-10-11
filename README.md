@@ -41,7 +41,7 @@ Según el enunciado, también quedan fuera del alcance: la aprobación de tareas
 ```mermaid
 flowchart LR
     cliente["Cliente<br/>(Postman / frontend)"] -->|HTTP :8080| nginx["Nginx<br/>proxy inverso"]
-    subgraph compose["Docker Compose (Linux)"]
+    subgraph compose["Docker Compose (Linux Debian 12)"]
         nginx --> api["API Go (Gin)<br/>handler → servicio → repositorio"]
         api --> pg[("PostgreSQL")]
         api -->|encola tareas| redis[("Redis")]
@@ -88,6 +88,7 @@ flowchart LR
 ├── .env.example                   plantilla de configuración (copiar a .env)
 ├── scripts/datos_demo.sql         datos de demostración
 ├── postman/                       colección de punta a punta (73 peticiones) y archivo de prueba
+├── pruebas-carga/                 pruebas de carga con Apache Benchmark: datos, script, análisis y resultados
 ├── docs/wiki/                     páginas para la Wiki
 ├── Makefile                       comandos habituales (con Docker)
 ├── sonar-project.properties       configuración de SonarQube
@@ -98,7 +99,7 @@ flowchart LR
 
 ## Puesta en marcha (local)
 
-Requisitos: **Docker Desktop** con Docker Compose v2. No hace falta instalar Go.
+Requisitos: **Docker Desktop** con Docker Compose v2. No hace falta instalar Go. Todas las imágenes del sistema se basan en **Linux Debian 12 (bookworm)**, como pide el stack del curso.
 
 ```bash
 # 1. Configuración
@@ -115,7 +116,7 @@ curl http://localhost:8080/salud          # {"estado":"ok", ...}
 docker compose exec -T postgres psql -U seguimiento -d seguimiento < scripts/datos_demo.sql
 
 # 5. Recorrido completo de la API con Newman (crea sus propios datos; se puede repetir)
-docker run --rm -v "$(pwd)/postman:/etc/newman" postman/newman:alpine run seguimiento.postman_collection.json \
+docker run --rm -v "$(pwd)/postman:/etc/newman" postman/newman:ubuntu run seguimiento.postman_collection.json \
   --env-var "baseUrl=http://host.docker.internal:8080" --env-var "adminPassword=<ADMIN_PASSWORD de su .env>"
 ```
 
@@ -269,9 +270,10 @@ sequenceDiagram
 | Unitarias | Reglas del dominio, servicios (con dobles en memoria), handlers HTTP, IA, PDF, cola, configuración | `make pruebas` o `go test -race ./...` |
 | Integración | Repositorios contra PostgreSQL real, incluida la concurrencia de las reglas de horas | `make pruebas-integracion` o `go test -tags integracion ./...` con `DATABASE_URL_PRUEBAS` |
 | Punta a punta | 73 peticiones y 104 verificaciones con Newman sobre el sistema desplegado con Docker Compose | `make e2e` |
+| Carga | Apache Benchmark sobre tres escenarios con concurrencia creciente y tres repeticiones por nivel | `bash pruebas-carga/ejecutar.sh` (ver abajo) |
 | Estático | `gofmt`, `golangci-lint` (errcheck, govet, staticcheck, ineffassign, unused) y SonarQube | `make lint` |
 
-La cobertura con pruebas unitarias e integración es de aproximadamente el 72 %. Las capas con lógica superan el 80 %: dominio 88 %, servicio 82 % y PDF 95 %.
+La cobertura con pruebas unitarias e integración es del 79 %, medida entre paquetes (`-coverpkg`). Las capas con lógica superan el 80 %: dominio 88 %, servicio 82 % y PDF 95 %. SonarQube reporta 0 bugs, 0 vulnerabilidades y 0 code smells.
 
 ### Integración continua
 
@@ -279,16 +281,24 @@ La cobertura con pruebas unitarias e integración es de aproximadamente el 72 %.
 
 1. **Calidad:** gofmt y golangci-lint.
 2. **Pruebas:** unitarias e integración con un PostgreSQL de servicio, con cobertura.
-3. **SonarQube:** análisis con la cobertura del paso anterior.
+3. **SonarQube:** análisis con Quality Gate obligatorio. Sin configuración adicional, el pipeline levanta un **SonarQube Community temporal**, analiza el código, publica el resumen en la página de la ejecución y deja el reporte completo (métricas, hallazgos y hotspots) en el artefacto `reporte-sonarqube`.
 4. **E2E:** levanta todo con Docker Compose y ejecuta la colección completa con Newman.
 
-Para activar SonarQube:
+Si prefieren conservar el historial en SonarQube Cloud (o en un servidor del curso):
 
-1. Cree el proyecto en SonarQube Cloud (o el servidor que indique el curso) y genere un token.
+1. Cree el proyecto en el servidor y genere un token.
 2. En GitHub, en *Settings → Secrets and variables → Actions*, agregue el secreto `SONAR_TOKEN` y la variable `SONAR_HOST_URL` (`https://sonarcloud.io` para SonarQube Cloud).
-3. Complete `sonar.projectKey` (y `sonar.organization` si aplica) en `sonar-project.properties`.
+3. Ajuste `sonar.projectKey` (y `sonar.organization` si aplica) en `sonar-project.properties`.
 
-Mientras no esté configurado, ese paso se omite con una advertencia.
+### Pruebas de carga
+
+Siguen la metodología del tutorial de análisis de capacidad del curso, con Apache Benchmark (`ab`). El plan, los resultados y el análisis están en la página de la Wiki *Entrega 1 – Pruebas de carga*.
+
+```bash
+docker compose exec -T postgres psql -U seguimiento -d seguimiento < pruebas-carga/datos_carga.sql   # datos de carga
+bash pruebas-carga/ejecutar.sh          # ~17 min: 3 escenarios × 5 niveles × 3 repeticiones de 15 s
+python pruebas-carga/analizar.py        # genera pruebas-carga/resultados/resumen.md con tablas y gráficas
+```
 
 ---
 

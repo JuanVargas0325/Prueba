@@ -2,17 +2,58 @@
 
 > **Grupo N° _completar_** · _Integrantes_
 >
-> Borrador. Las secciones marcadas con ✏️ deben completarse o revisarse en equipo. Cada diagrama debe ir acompañado de texto que explique su propósito y las decisiones que refleja (lineamientos, secciones 5, 6 y 9).
+> Cada diagrama va acompañado de texto que explica su propósito y las decisiones que refleja (lineamientos, secciones 5, 6 y 9). Las notas marcadas con ✏️ son para que el equipo las revise antes de la entrega.
 
-## 1. Problema de negocio y objetivo ✏️
+## 1. Problema de negocio y objetivo
 
-_Tomar del documento de visión de arquitectura del equipo. Mencionar también el componente de reportes semanales generados con IA (RF-14)._
+El seguimiento de las actividades de monitores y asistentes graduados exige gestionar vinculaciones, responsabilidades, tareas, horas dedicadas y reportes semanales. Esa información debe estar organizada y disponible para los profesores responsables, teniendo en cuenta que una misma persona puede participar en varios espacios y con distintos roles.
 
-## 2. Estilo de arquitectura ✏️
+El proceso debe cumplir reglas que no pueden depender del control manual: límites de horas semanales para asistentes graduados y monitores, restricciones sobre la cantidad de vinculaciones y condiciones cuando una persona desempeña ambos roles. También hay que controlar los períodos académicos, las semanas de trabajo, el cierre de los reportes y los permisos de acceso a la información. Sin una plataforma centralizada que aplique estas reglas de forma consistente, aparecen errores en el registro de horas, se pierde trazabilidad y el seguimiento oportuno se dificulta.
 
-Se adoptó una **arquitectura en tres capas** (presentación, lógica de negocio y acceso a datos).
+**Objetivo.** Construir una plataforma web para gestionar y hacer el seguimiento operativo de monitores y asistentes graduados vinculados a cursos y proyectos. La plataforma:
 
-_Completar con la comparación de alternativas (MVC, hexagonal, microservicios), el motivo de la elección, sus ventajas, sus desventajas y compromisos (por ejemplo, el riesgo de que la lógica se filtre a los handlers) y la tabla de atributos de calidad._
+- administra los períodos y espacios académicos, y las vinculaciones de las personas según su rol;
+- registra semanalmente las actividades, las horas dedicadas y la información complementaria de cada tarea;
+- automatiza las reglas de carga horaria, vinculación y manejo de períodos y semanas, sin que dependan de los usuarios;
+- garantiza que cada usuario acceda solo a la información que le corresponde y que los registros mantengan su trazabilidad;
+- genera por lotes, con IA generativa, un reporte semanal en PDF por persona que sintetiza el trabajo reportado, sin evaluar su desempeño (RF-14).
+
+La solución se diseña modular y mantenible, priorizando la lógica de negocio, para evolucionar en las siguientes entregas (frontend, despliegue en la nube, escalamiento y servicios gestionados) sin limitar su crecimiento.
+
+## 2. Estilo de arquitectura
+
+Se analizaron cuatro alternativas considerando el alcance de la primera versión, los atributos de calidad prioritarios y la complejidad del dominio:
+
+| Alternativa | Ventajas | Por qué no se eligió |
+|---|---|---|
+| MVC tradicional | Simple y conocido | Orientado a aplicaciones con vistas; en una API las reglas tienden a quedar en los controladores, y aquí las reglas son el núcleo del sistema. |
+| Hexagonal (puertos y adaptadores) | Aísla por completo el dominio de la infraestructura | Más abstracciones y adaptadores de los que justifica la primera versión. De ella se toma la idea de depender de interfaces. |
+| Microservicios | Escalado y despliegue independientes por servicio | El dominio es pequeño y muy cohesionado (las reglas de horas cruzan usuarios, espacios y vinculaciones); separarlo añadiría red, consistencia distribuida y operación sin beneficio en esta etapa. |
+| **Tres capas** (elegida) | Separa presentación, negocio y datos con bajo costo | — |
+
+Se eligió una **arquitectura en tres capas**: presentación (API REST), lógica de negocio (casos de uso y reglas) y acceso a datos (persistencia). Esta separación evita que las reglas de negocio dependan de la interfaz o de la base de datos, facilita las pruebas y permite que cada capa evolucione por separado. Como complemento, las reglas puras viven en un paquete de dominio sin dependencias, y la capa de servicio depende de interfaces (idea tomada de la arquitectura hexagonal).
+
+**Responsabilidades de cada capa**
+
+- **Presentación:** punto de entrada de las peticiones, expone la API REST, valida la entrada, autentica (JWT), verifica el rol y construye las respuestas.
+- **Lógica de negocio:** casos de uso, reglas y validaciones del dominio, coordinación entre componentes y decisión sobre qué operaciones están permitidas según el usuario y el contexto (visibilidad).
+- **Acceso a datos:** persistencia, consultas y transacciones; encapsula la interacción con PostgreSQL.
+
+**Atributos de calidad**
+
+| Atributo | Contribución del estilo | Nivel |
+|---|---|---|
+| Consistencia del negocio | Las reglas se centralizan en el dominio y la capa de servicio; las que dependen de varios registros se validan dentro de una transacción con bloqueo. | Alto |
+| Mantenibilidad | Cada capa y cada módulo tienen límites claros; un cambio en la persistencia no afecta las reglas. | Alto |
+| Testabilidad | La lógica se prueba sin base de datos gracias a las interfaces; la capa de datos tiene pruebas de integración propias. | Alto |
+| Modularidad | Un archivo por módulo en cada capa; agregar un módulo no modifica los existentes. | Alto |
+| Escalabilidad | La separación, y el worker independiente, facilitan escalar después, pero el estilo por sí solo no la garantiza. | Medio |
+
+**Desventajas y compromisos asumidos**
+
+- Riesgo de que la lógica se filtre a los handlers o a las consultas SQL. Se mitiga con la convención de que el handler solo traduce HTTP y el repositorio solo persiste; las reglas viven en dominio y servicio.
+- Más archivos y algo de código repetitivo (interfaces, conversiones a JSON) que en una aplicación sin capas.
+- Una sola unidad de despliegue para la API: escalarla escala todos los módulos a la vez. Es aceptable para el tamaño del dominio y se revisa con las pruebas de carga.
 
 Correspondencia de las capas con el código:
 
@@ -27,7 +68,7 @@ Correspondencia de las capas con el código:
 
 La capa de servicio depende de **interfaces** (por ejemplo `RepositorioReportes`, `Encolador`, `Almacenamiento`, `ia.Resumidor`), no de implementaciones concretas. Esto permite probar la lógica de negocio sin base de datos ni Redis, y cambiar la infraestructura en las siguientes entregas (por ejemplo, el volumen por Cloud Storage) sin tocar las reglas.
 
-## 3. Modelo de componentes ✏️
+## 3. Modelo de componentes
 
 ```mermaid
 flowchart TB
@@ -57,17 +98,28 @@ flowchart TB
 - La **API** atiende todas las operaciones síncronas. Cada módulo de negocio tiene un handler, un servicio y un repositorio, y los handlers se registran en el router con un método `Registrar`, de modo que agregar un módulo no modifica los existentes.
 - El **worker** es un proceso separado porque la generación con IA es lenta y depende de un servicio externo: no debe bloquear las peticiones HTTP, puede reintentar sin afectar al usuario y puede escalar de forma independiente en las siguientes entregas.
 - **API y worker comparten el código** de la capa de servicio y de datos (mismo módulo Go, dos ejecutables), así que las reglas son las mismas en ambos.
-- ✏️ _Complementar con la justificación del equipo._
 
-## 4. Modelo de despliegue ✏️
+## 4. Modelo de despliegue
 
-_Reemplazar por el diagrama de despliegue final del equipo._ Elementos que debe mostrar:
+![Diagrama de despliegue de la Entrega 1](imagenes/despliegue.png)
 
-- Nodo anfitrión Linux con Docker Engine y la red interna de Docker Compose.
-- Contenedores: `nginx` (único puerto expuesto, 8080→80), `api` (8080 interno), `worker`, `postgres` (5432 interno), `redis` (6379 interno).
-- Volúmenes: `datos-postgres`, `datos-redis` y `archivos` (montado en `/data` en **api** y **worker**: el worker escribe los PDF y la API los sirve).
-- Dependencia externa: el servicio LLM (HTTPS), salvo que se use Ollama como contenedor.
-- Orden de arranque: postgres y redis saludables → api (aplica migraciones) → worker y nginx.
+*Figura: despliegue local con Docker Compose sobre un nodo Linux (Debian 12).*
+
+La solución se despliega en un solo nodo Linux con Docker Compose, que crea una red interna donde se comunican cinco contenedores basados en Debian 12. **Nginx** es el único servicio expuesto (puerto 8080 del host) y actúa como proxy inverso hacia la **API**; la API, PostgreSQL y Redis no son accesibles desde fuera. La API atiende las peticiones REST, persiste en **PostgreSQL** (TCP 5432) y, para generar reportes, encola tareas en **Redis** (TCP 6379). El **worker** es un proceso independiente que consume esas tareas, consulta las tareas de la semana, llama al **proveedor LLM** por HTTPS (TCP 443), genera el PDF y lo guarda en el volumen **archivos**.
+
+Ese volumen está montado en `/data` en la API y en el worker: el worker escribe los PDF y la API los sirve en la descarga (lo mismo ocurre con los adjuntos de las tareas). Los datos de PostgreSQL y Redis persisten en sus propios volúmenes, así que sobreviven a la recreación de los contenedores.
+
+**Orden de arranque:** PostgreSQL y Redis deben estar saludables antes de iniciar la API, que aplica las migraciones al arrancar. El worker y Nginx esperan a que la API esté saludable (`healthcheck` sobre `/salud`).
+
+| Contenedor | Imagen | Puerto | Expuesto al host |
+|---|---|---|---|
+| nginx | `nginx:1.27-bookworm` | 80 | Sí (8080 → 80, configurable con `NGINX_PUERTO`) |
+| api | `seguimiento-api` (Go sobre `debian:bookworm-slim`) | 8080 | No |
+| worker | `seguimiento-worker` (Go sobre `debian:bookworm-slim`) | — | No |
+| postgres | `postgres:16-bookworm` | 5432 | No |
+| redis | `redis:7-bookworm` | 6379 | No |
+
+El puerto 8080 de Nginx en el host y el 8080 interno de la API no entran en conflicto: uno pertenece al equipo anfitrión y el otro a la red interna del contenedor.
 
 ## 5. Modelo de datos
 

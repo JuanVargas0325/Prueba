@@ -15,9 +15,11 @@
 - **Tag del repositorio:** `entrega-1`
 - **Video de sustentación:** _enlace (YouTube no listado / OneDrive)_
 - [Arquitectura de la solución](Entrega-1-Arquitectura)
+- [Pruebas de carga y análisis de capacidad](Entrega-1-Pruebas-de-carga)
 - [Deuda técnica](Entrega-1-Deuda-tecnica)
 - Despliegue y ejecución: ver el `README.md` del repositorio (sección "Puesta en marcha").
-- Colección de Postman: carpeta `postman/` del repositorio.
+- Pruebas: unitarias, de integración, de punta a punta con Postman (carpeta `postman/`) y de carga (carpeta `pruebas-carga/`). Todas, salvo las de carga, se ejecutan en el pipeline de CI.
+- Análisis de calidad: SonarQube en cada ejecución del pipeline (artefacto `reporte-sonarqube`).
 
 ## Entrega 2 (semanas 3 y 4)
 
