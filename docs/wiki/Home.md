@@ -14,10 +14,13 @@
 
 - **Tag del repositorio:** `entrega-1`
 - **Video de sustentación:** _enlace (YouTube no listado / OneDrive)_
+- [Lista de todo lo esperado en las semanas 1 y 2, con su estado](Entrega-1-Checklist)
 - [Arquitectura de la solución](Entrega-1-Arquitectura)
+- [Trazabilidad: cada requisito y dónde está en el código](Entrega-1-Trazabilidad)
+- [Despliegue y ejecución](Despliegue-y-ejecucion)
 - [Pruebas de carga y análisis de capacidad](Entrega-1-Pruebas-de-carga)
 - [Deuda técnica](Entrega-1-Deuda-tecnica)
-- Despliegue y ejecución: ver el `README.md` del repositorio (sección "Puesta en marcha").
+- [Guía: orden de implementación y división del trabajo](Guia-de-implementacion-y-trabajo-en-equipo)
 - Pruebas: unitarias, de integración, de punta a punta con Postman (carpeta `postman/`) y de carga (carpeta `pruebas-carga/`). Todas, salvo las de carga, se ejecutan en el pipeline de CI.
 - Análisis de calidad: SonarQube en cada ejecución del pipeline (artefacto `reporte-sonarqube`).
 
