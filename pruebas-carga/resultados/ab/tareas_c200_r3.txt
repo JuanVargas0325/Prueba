@@ -1,0 +1,48 @@
+This is ApacheBench, Version 2.3 <$Revision: 1923142 $>
+Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
+Licensed to The Apache Software Foundation, http://www.apache.org/
+
+Benchmarking nginx (be patient)
+Finished 61271 requests
+
+
+Server Software:        nginx
+Server Hostname:        nginx
+Server Port:            80
+
+Document Path:          /api/v1/tareas
+Document Length:        661 bytes
+
+Concurrency Level:      200
+Time taken for tests:   15.000 seconds
+Complete requests:      61271
+Failed requests:        6130
+   (Connect: 0, Receive: 0, Length: 6130, Exceptions: 0)
+Keep-Alive requests:    61271
+Total transferred:      54640104 bytes
+Total body sent:        37866136
+HTML transferred:       40486503 bytes
+Requests per second:    4084.63 [#/sec] (mean)
+Time per request:       48.964 [ms] (mean)
+Time per request:       0.245 [ms] (mean, across all concurrent requests)
+Transfer rate:          3557.21 [Kbytes/sec] received
+                        2465.18 kb/s sent
+                        6022.39 kb/s total
+
+Connection Times (ms)
+              min  mean[+/-sd] median   max
+Connect:        0    0   0.4      0      10
+Processing:    13   49   7.5     47     103
+Waiting:        4   49   7.5     47     103
+Total:         14   49   7.5     47     103
+
+Percentage of the requests served within a certain time (ms)
+  50%     47
+  66%     49
+  75%     50
+  80%     52
+  90%     56
+  95%     61
+  98%     73
+  99%     87
+ 100%    103 (longest request)

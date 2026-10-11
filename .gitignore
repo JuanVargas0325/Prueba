@@ -17,3 +17,7 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Cuerpos de petición que genera el script de pruebas de carga
+pruebas-carga/cuerpos/
+pruebas-carga/resultados/stats/.parar
