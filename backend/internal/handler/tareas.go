@@ -15,7 +15,7 @@ import (
 
 // ServicioTareas es lo que el handler de tareas necesita.
 type ServicioTareas interface {
-	Crear(ctx context.Context, actor auth.Actor, n servicio.NuevaTarea) (dominio.Tarea, error)
+	Crear(ctx context.Context, actor auth.Actor, n servicio.NuevaTarea, archivos []servicio.ArchivoAdjunto) (dominio.Tarea, error)
 	Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroTareas) ([]dominio.Tarea, error)
 	Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Tarea, error)
 	Actualizar(ctx context.Context, actor auth.Actor, id string, d dominio.DatosTarea) (dominio.Tarea, error)
@@ -129,7 +129,7 @@ func (h *HandlerTareas) Crear(c *gin.Context) {
 		Semana:        semana,
 		Datos: peticionActualizarTarea{Titulo: p.Titulo, Descripcion: p.Descripcion, Estado: p.Estado,
 			HorasInvertidas: p.HorasInvertidas, Observaciones: p.Observaciones}.datos(),
-	})
+	}, nil) // los archivos del formulario multipart llegan en el paso 40
 	if err != nil {
 		responderError(c, h.log, err)
 		return

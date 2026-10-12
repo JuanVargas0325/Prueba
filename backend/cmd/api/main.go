@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"seguimiento/internal/almacenamiento"
 	"seguimiento/internal/auth"
 	"seguimiento/internal/basedatos"
 	"seguimiento/internal/config"
@@ -59,6 +60,12 @@ func ejecutar(log *slog.Logger) error {
 		tareas        = repositorio.NuevoTareas(db)
 	)
 
+	// Infraestructura
+	almacen, err := almacenamiento.Nuevo(cfg.Almacenamiento)
+	if err != nil {
+		return err
+	}
+
 	// Capa de servicio
 	reloj := servicio.NuevoReloj(cfg.ZonaHoraria)
 	tokens := auth.NuevoGestorTokens(cfg.JWT.Secreto, cfg.JWT.Expiracion)
@@ -66,6 +73,7 @@ func ejecutar(log *slog.Logger) error {
 	if err := servicioAuth.AsegurarAdministrador(ctx, cfg.Admin.Nombre, cfg.Admin.Correo, cfg.Admin.Password); err != nil {
 		return err
 	}
+	maxBytesAdjunto := int64(cfg.MaxAdjuntoMB) << 20
 
 	// Capa de presentación
 	router := handler.NuevoRouter(handler.Dependencias{
@@ -74,7 +82,7 @@ func ejecutar(log *slog.Logger) error {
 		Periodos:      servicio.NuevoPeriodos(periodos, log),
 		Espacios:      servicio.NuevoEspacios(espacios, periodos, reloj, log),
 		Vinculaciones: servicio.NuevoVinculaciones(vinculaciones, usuarios, espacios, log),
-		Tareas:        servicio.NuevoTareas(tareas, vinculaciones, reloj, log),
+		Tareas:        servicio.NuevoTareas(tareas, vinculaciones, almacen, reloj, maxBytesAdjunto, log),
 		Tokens:        tokens,
 		OrigenesCORS:  cfg.OrigenesCORS,
 		Log:           log,

@@ -1,6 +1,7 @@
 package servicio
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -25,6 +26,26 @@ var (
 	// miércoles 14 de octubre de 2026
 	ahoraPrueba = time.Date(2026, 10, 14, 15, 0, 0, 0, time.UTC)
 )
+
+// almacenamientoFalso guarda los archivos en memoria.
+type almacenamientoFalso struct{ archivos map[string][]byte }
+
+func (a *almacenamientoFalso) Guardar(_ context.Context, ruta string, r io.Reader) (int64, error) {
+	b, _ := io.ReadAll(r)
+	a.archivos[ruta] = b
+	return int64(len(b)), nil
+}
+func (a *almacenamientoFalso) Abrir(_ context.Context, ruta string) (io.ReadCloser, error) {
+	b, ok := a.archivos[ruta]
+	if !ok {
+		return nil, apperr.NoEncontrado("no existe")
+	}
+	return io.NopCloser(bytes.NewReader(b)), nil
+}
+func (a *almacenamientoFalso) Eliminar(_ context.Context, ruta string) error {
+	delete(a.archivos, ruta)
+	return nil
+}
 
 type usuariosFalsos struct {
 	porCorreo map[string]dominio.Usuario

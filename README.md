@@ -1,244 +1,262 @@
-# Paso 38 · Almacenamiento local de archivos
+# Paso 39 · Adjuntos en el servicio de tareas
 
-> Rama `paso-a-paso` · paso 38 de 65 · anterior: **Paso 37 · Endpoints de tareas** · siguiente: **Paso 39 · Adjuntos en el servicio de tareas**
+> Rama `paso-a-paso` · paso 39 de 65 · anterior: **Paso 38 · Almacenamiento local** · siguiente: **Paso 40 · Endpoints de adjuntos (multipart)**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el paquete que **guarda archivos** (adjuntos de tareas y, más adelante, los PDF de los reportes) en una carpeta que vive en un **volumen de Docker**.
+El servicio de tareas ahora maneja **archivos de evidencia**: se pueden enviar al crear la tarea, agregar después, descargar y eliminar, con validación de tipo, tamaño y cantidad.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/almacenamiento/local.go` | **Nuevo.** `Local` con `Guardar`, `Abrir` y `Eliminar`, protegido contra rutas maliciosas. |
-| `backend/internal/almacenamiento/almacenamiento.go` | **Nuevo.** `Config` (tipo y ruta), la interfaz `Archivos` y `Nuevo`, que crea el almacenamiento según la configuración. |
-| `backend/internal/almacenamiento/local_test.go` | **Nuevo.** Pruebas de guardar, abrir y eliminar, de rechazo de rutas fuera de la carpeta raíz y de `Nuevo`. |
-| `backend/internal/config/config.go` | **Modificado.** `Almacenamiento` (`ALMACENAMIENTO_TIPO`, por defecto `local`, y `ALMACENAMIENTO_RUTA`, por defecto `/data`), `MaxAdjuntoMB` (`ADJUNTO_MAX_MB`, por defecto 10) y la función `entero`. |
-| `backend/internal/config/config_test.go` | **Modificado.** Valores por defecto y formato inválido de `ADJUNTO_MAX_MB`. |
-| `backend/Dockerfile` | **Modificado.** Crea `/data`, se lo asigna al usuario `app` y lo declara como `VOLUME`. |
-| `docker-compose.yml` | **Modificado.** Volumen con nombre `archivos` montado en `/data` de la API. |
-| `.env.example` | **Modificado.** Nueva sección `Archivos`. |
+| `backend/internal/dominio/tarea.go` | **Modificado.** Límites `MaxAdjuntosPorTarea` (5) y `LongitudMaxNombreArchivo`, lista blanca de tipos permitidos y `ValidarArchivoAdjunto`. |
+| `backend/internal/dominio/reglas_test.go` | **Modificado.** `TestValidarArchivoAdjunto`. |
+| `backend/internal/servicio/tareas.go` | **Modificado.** `ArchivoAdjunto`; el servicio recibe un `Almacenamiento` y un tamaño máximo; `Crear` acepta archivos; nuevos `AgregarAdjuntos`, `AbrirAdjunto` y `EliminarAdjunto`; `Eliminar` borra también los archivos; interfaz `Almacenamiento`. |
+| `backend/internal/servicio/modulos_test.go` | **Modificado.** Entorno de tareas con almacenamiento falso y límite de 10 bytes; dos pruebas nuevas. |
+| `backend/internal/servicio/autenticacion_test.go` | **Modificado.** Doble `almacenamientoFalso` (archivos en memoria). |
+| `backend/internal/handler/tareas.go` y `handler/modulos_test.go` | **Modificados (mínimo).** Se adaptan a la nueva firma de `Crear`; por ahora el handler pasa `nil` como archivos. |
+| `backend/cmd/api/main.go` | **Modificado.** Crea el almacenamiento local y le pasa el tamaño máximo al servicio. |
 
 ---
 
 ## 2. Por qué
 
-- **RF-06.4 / RN-23:** las tareas pueden llevar **archivos de evidencia**.
-- **RF-14.4 y RF-14.5:** los reportes se generan en **PDF** y se **almacenan** para descargarlos después.
-- **¿Por qué no en la base de datos?** Guardar archivos binarios en PostgreSQL agranda la base de datos, hace lentos los respaldos y ocupa conexiones durante las descargas. Lo habitual es guardar el archivo en un almacenamiento de archivos y en la base de datos **solo sus metadatos** (nombre, tipo, tamaño, ruta), como ya prevé la tabla `tarea_adjuntos` (paso 4).
-- **¿Por qué un volumen?** Un contenedor pierde todo lo que escribe en su propio sistema de archivos cuando se recrea. Un volumen persiste. En el paso 55 el worker montará el **mismo** volumen: él escribirá los PDF y la API los servirá.
+- **RF-06.4 / RN-23:** una tarea puede llevar archivos de evidencia.
+- **Adjuntos al crear:** un reporte **tardío** no se puede modificar después (RN-33); si los adjuntos solo pudieran agregarse luego, una tarea tardía nunca podría tener evidencia. Por eso `Crear` también recibe archivos.
+- **Seguridad:** sin límites, cualquiera podría subir ejecutables, páginas HTML con código o archivos gigantes que llenen el disco.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 `local.go`
+### 3.1 Dominio: qué archivos se aceptan
 
 ```go
-// Package almacenamiento guarda los archivos binarios (PDF de reportes y
-// adjuntos de tareas). En la Entrega 1 se usa un volumen de Docker montado en
-// el contenedor; en entregas posteriores puede añadirse una implementación
-// sobre Cloud Storage que cumpla la misma interfaz del servicio.
-package almacenamiento
-
-type Local struct {
-	raiz string
-}
-
-func NuevoLocal(raiz string) (*Local, error) {
-	abs, err := filepath.Abs(raiz)
+const (
 	...
-	if err := os.MkdirAll(abs, 0o750); err != nil { ... }
-	return &Local{raiz: abs}, nil
+	MaxAdjuntosPorTarea      = 5
+	LongitudMaxNombreArchivo = 200
+)
+
+var tiposPermitidos = map[string]string{
+	".pdf":  "application/pdf",
+	".png":  "image/png",
+	...
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	...
+	".zip":  "application/zip",
 }
 ```
-- Convierte la raíz en ruta absoluta y la crea si no existe. `0o750` son los permisos en notación octal: el dueño lee, escribe y entra; el grupo lee y entra; el resto, nada.
-
-#### Seguridad: que nadie escriba fuera de la raíz
+- **Lista blanca**: solo PDF, imágenes, texto, Office y ZIP. Es más segura que una lista negra (siempre aparece una extensión peligrosa que nadie anotó). Quedan fuera `.exe` y `.html`.
+- El tipo de contenido (*MIME type*) que se guarda **lo decide el servidor** según la extensión, no lo que diga el navegador.
 
 ```go
-func (l *Local) rutaSegura(ruta string) (string, error) {
-	limpia := filepath.Clean(filepath.FromSlash(strings.TrimSpace(ruta)))
-	if limpia == "." || filepath.IsAbs(limpia) || limpia == ".." ||
-		strings.HasPrefix(limpia, ".."+string(filepath.Separator)) {
-		return "", apperr.Validacion("ruta de archivo inválida")
+func ValidarArchivoAdjunto(nombre string) (nombreLimpio, extension, tipo string, err error) {
+	nombreLimpio = strings.TrimSpace(filepath.Base(strings.ReplaceAll(nombre, "\\", "/")))
+	...
+	if r := []rune(nombreLimpio); len(r) > LongitudMaxNombreArchivo {
+		nombreLimpio = string(r[:LongitudMaxNombreArchivo])
 	}
-	return filepath.Join(l.raiz, limpia), nil
-}
-```
-- Las rutas internas usan `/` (`adjuntos/<tarea>/<archivo>.pdf`). `filepath.Clean` resuelve `a/../b` → `b`.
-- Se rechazan: rutas vacías, absolutas (`/etc/passwd`) y las que **suben** de nivel (`../fuera.pdf`, `a/../../fuera.pdf`). Es la protección contra el ataque de **recorrido de directorios** (*path traversal*), que podría sobrescribir archivos del sistema.
-- Las rutas las arma el servidor (paso 39), no el usuario; aun así se valida: defensa en profundidad.
-
-#### Guardar de forma atómica
-
-```go
-func (l *Local) Guardar(_ context.Context, ruta string, contenido io.Reader) (int64, error) {
-	destino, err := l.rutaSegura(ruta)
-	...
-	if err := os.MkdirAll(filepath.Dir(destino), 0o750); err != nil { ... }
-	tmp, err := os.CreateTemp(filepath.Dir(destino), ".tmp-*")
-	...
-	defer func() { _ = os.Remove(tmp.Name()) }()
-
-	n, err := io.Copy(tmp, contenido)
-	...
-	if err := tmp.Close(); err != nil { ... }
-	if err := os.Rename(tmp.Name(), destino); err != nil { ... }
-	return n, nil
-}
-```
-- Recibe un `io.Reader`: el contenido llega **por partes**, sin cargar el archivo completo en memoria (importante con archivos de varios MB).
-- Escribe primero en un **archivo temporal** y al final lo **renombra** al destino. El renombrado es atómico: nadie puede ver un archivo a medio escribir, y si algo falla a la mitad, el destino no queda corrupto.
-- `defer func() { _ = os.Remove(tmp.Name()) }()`: si algo falla antes del renombrado, el temporal se borra. Después del renombrado el temporal ya no existe y el `Remove` simplemente falla en silencio (`_ =` ignora el error a propósito).
-- Devuelve los **bytes escritos**, con los que el servicio controla el tamaño máximo (paso 39).
-
-```go
-func (l *Local) Abrir(_ context.Context, ruta string) (io.ReadCloser, error) {
-	...
-	f, err := os.Open(origen)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, apperr.NoEncontrado("el archivo no existe")
+	extension = strings.ToLower(filepath.Ext(nombreLimpio))
+	tipo, ok := tiposPermitidos[extension]
+	if !ok {
+		return "", "", "", apperr.Validacion("tipo de archivo no permitido (%s): use PDF, imágenes, texto, Office o ZIP", extension)
 	}
-	...
-	return f, nil
-}
-
-func (l *Local) Eliminar(_ context.Context, ruta string) error {
-	...
-	if err := os.Remove(objetivo); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("eliminando archivo: %w", err)
-	}
-	return nil
+	return nombreLimpio, extension, tipo, nil
 }
 ```
-- `Abrir` devuelve un `io.ReadCloser` (algo que se lee y **se debe cerrar**); quien lo pide es responsable de cerrarlo.
-- `Eliminar` no falla si el archivo ya no existe: el resultado deseado ("que no esté") ya se cumple. Esto se llama **idempotencia**.
-- Los métodos reciben `context.Context` aunque el disco local no lo use (`_`): así su forma coincidirá con la interfaz `Almacenamiento` del servicio (paso 39), que una implementación en la nube sí necesitará.
+- **Resultados con nombre:** `(nombreLimpio, extension, tipo string, err error)` declara las variables de retorno en la firma.
+- Algunos navegadores (Internet Explorer, ciertas versiones de Edge) envían la ruta completa (`C:\fakepath\..\Informe Final.PDF`). Se reemplazan `\` por `/` y `filepath.Base` deja solo el nombre: `Informe Final.PDF`.
+- La extensión se compara en minúsculas (`.PDF` = `.pdf`).
 
-### 3.2 `almacenamiento.go` · elegir el almacenamiento en un solo lugar
+### 3.2 La interfaz `Almacenamiento`
 
 ```go
-const TipoLocal = "local"
-
-type Config struct {
-	Tipo string // ALMACENAMIENTO_TIPO
-	Ruta string // ALMACENAMIENTO_RUTA: carpeta raíz del almacenamiento local
-}
-
-type Archivos interface {
+// Almacenamiento guarda y recupera archivos binarios.
+type Almacenamiento interface {
 	Guardar(ctx context.Context, ruta string, contenido io.Reader) (int64, error)
 	Abrir(ctx context.Context, ruta string) (io.ReadCloser, error)
 	Eliminar(ctx context.Context, ruta string) error
 }
+```
+- El servicio depende de **esta interfaz**, no de `almacenamiento.Local` (paso 38), que la cumple. Por ahora se declara al final de `tareas.go`; en el paso 48 se trasladará a `reportes.go`, junto a las demás interfaces de infraestructura que también usa el generador de reportes.
 
-func Nuevo(c Config) (Archivos, error) {
-	switch c.Tipo {
-	case TipoLocal:
-		local, err := NuevoLocal(c.Ruta)
+### 3.3 `Crear` con archivos
+
+```go
+type ArchivoAdjunto struct {
+	Nombre    string
+	Contenido io.Reader
+}
+
+func (s *Tareas) Crear(ctx context.Context, actor auth.Actor, n NuevaTarea, archivos []ArchivoAdjunto) (dominio.Tarea, error) {
+	... (validaciones del paso 36) ...
+	if len(archivos) > dominio.MaxAdjuntosPorTarea {
+		return dominio.Tarea{}, apperr.Validacion("una tarea admite máximo %d adjuntos", dominio.MaxAdjuntosPorTarea)
+	}
+
+	t := dominio.Tarea{ID: uuid.NewString(), ...}
+	t.Aplicar(datos)
+
+	adjuntos, err := s.guardarArchivos(ctx, t.ID, archivos)
+	if err != nil {
+		return dominio.Tarea{}, err
+	}
+	creada, err := s.repo.Crear(ctx, t, adjuntos)
+	if err != nil {
+		s.eliminarArchivos(ctx, adjuntos)
+		return dominio.Tarea{}, err
+	}
+	...
+}
+```
+- El servicio recibe los archivos como **lectores** (`io.Reader`), no como bytes: el contenido pasa del formulario HTTP al disco sin cargarse entero en memoria.
+- Orden: (1) guardar los archivos; (2) guardar la tarea y sus metadatos en una transacción (paso 35). **Si falla la base de datos, se borran los archivos** ya escritos: no quedan archivos huérfanos.
+- Aquí se ve por qué el ID se genera en el servicio (paso 36): los archivos van a `adjuntos/<id de la tarea>/...` **antes** de que exista la fila.
+
+### 3.4 `guardarArchivos`: tamaño máximo sin confiar en el cliente
+
+```go
+func (s *Tareas) guardarArchivos(ctx context.Context, tareaID string, archivos []ArchivoAdjunto) ([]dominio.Adjunto, error) {
+	adjuntos := make([]dominio.Adjunto, 0, len(archivos))
+	for _, archivo := range archivos {
+		nombre, extension, tipo, err := dominio.ValidarArchivoAdjunto(archivo.Nombre)
 		if err != nil {
+			s.eliminarArchivos(ctx, adjuntos)
 			return nil, err
 		}
-		return local, nil
-	default:
-		return nil, fmt.Errorf("ALMACENAMIENTO_TIPO %q no es válido (use %q)", c.Tipo, TipoLocal)
+		id := uuid.NewString()
+		ruta := fmt.Sprintf("adjuntos/%s/%s%s", tareaID, id, extension)
+		// Se lee un byte más del máximo para detectar archivos demasiado grandes.
+		tamano, err := s.almacenamiento.Guardar(ctx, ruta, io.LimitReader(archivo.Contenido, s.maxBytes+1))
+		if err == nil && tamano > s.maxBytes {
+			s.eliminarArchivo(ctx, ruta)
+			err = apperr.Validacion("el archivo %q supera el tamaño máximo de %d MB", nombre, s.maxBytes>>20)
+		}
+		if err == nil && tamano == 0 {
+			s.eliminarArchivo(ctx, ruta)
+			err = apperr.Validacion("el archivo %q está vacío", nombre)
+		}
+		if err != nil {
+			s.eliminarArchivos(ctx, adjuntos)
+			return nil, err
+		}
+		adjuntos = append(adjuntos, dominio.Adjunto{...})
+	}
+	return adjuntos, nil
+}
+```
+- **El nombre en disco no es el del usuario:** es `<UUID><extensión>`. El nombre original se guarda solo en la base de datos (para mostrarlo y para la descarga). Así no hay choques de nombres ni nombres maliciosos en el disco.
+- **El truco del byte extra:** se leen como máximo `maxBytes + 1` bytes. Si se escribieron más de `maxBytes`, el archivo era demasiado grande: se borra y se responde 400. No se confía en el tamaño que declare el cliente, y nunca se escriben gigabytes.
+- `s.maxBytes>>20` convierte bytes a MB (desplazar 20 bits = dividir por 2²⁰).
+- **Todo o nada:** si cualquier archivo falla, se borran los que ya se habían guardado.
+
+### 3.5 Agregar, abrir y eliminar adjuntos
+
+```go
+func (s *Tareas) AgregarAdjuntos(ctx context.Context, actor auth.Actor, id string, archivos []ArchivoAdjunto) (dominio.Tarea, error) {
+	if len(archivos) == 0 { ... 400 ... }
+	if _, err := s.obtenerModificable(ctx, actor, id); err != nil { ... }
+	adjuntos, err := s.guardarArchivos(ctx, id, archivos)
+	...
+	if err := s.repo.AgregarAdjuntos(ctx, id, adjuntos, dominio.MaxAdjuntosPorTarea); err != nil {
+		s.eliminarArchivos(ctx, adjuntos)
+		return dominio.Tarea{}, err
+	}
+	return s.repo.Obtener(ctx, id)
+}
+```
+- Solo sobre tareas **modificables** (propias, semana activa, no tardías). El máximo de 5 lo controla el repositorio con bloqueo (paso 35).
+
+```go
+func (s *Tareas) AbrirAdjunto(ctx context.Context, actor auth.Actor, tareaID, adjuntoID string) (io.ReadCloser, dominio.Adjunto, error) {
+	if _, err := s.Obtener(ctx, actor, tareaID); err != nil { ... }
+	a, err := s.repo.ObtenerAdjunto(ctx, tareaID, adjuntoID)
+	...
+	contenido, err := s.almacenamiento.Abrir(ctx, a.RutaAlmacenamiento)
+	return contenido, a, err
+}
+```
+- Descargar exige poder **ver** la tarea (su dueña, su profesor o el administrador).
+
+### 3.6 Borrar archivos sin romper la operación
+
+```go
+func (s *Tareas) eliminarArchivo(ctx context.Context, ruta string) {
+	if err := s.almacenamiento.Eliminar(context.WithoutCancel(ctx), ruta); err != nil {
+		s.log.Warn("no fue posible eliminar el archivo", "ruta", ruta, "error", err)
 	}
 }
 ```
-- **Por qué existe.** La API (paso 39) y el worker (paso 55) necesitan un almacenamiento. Si cada uno llamara directamente a `NuevoLocal`, al agregar Cloud Storage en la Entrega 2 habría que cambiar ambos. Con `Nuevo`, ambos piden "el almacenamiento configurado" y la decisión vive en **un solo `switch`**: agregar Cloud Storage será un archivo nuevo (`gcs.go`) más un `case` aquí.
-- **`Archivos` es una interfaz**: los tres métodos que tiene cualquier almacenamiento. `Nuevo` debe devolver una interfaz porque, según la configuración, entregará tipos distintos (`*Local` hoy, el de Cloud Storage después). `*Local` la cumple sin declararlo, porque tiene esos tres métodos (interfaz implícita, paso 10).
-- **¿Por qué `local, err := ...; return local, nil` y no `return NuevoLocal(c.Ruta)`?** Es una trampa conocida de Go: si `NuevoLocal` falla devuelve un `*Local` nulo, y al convertirlo en interfaz **la interfaz no es `nil`** (lleva dentro el tipo `*Local`). Devolver `nil` explícitamente en el error evita esa confusión.
-- Un tipo desconocido es un error de arranque con un mensaje que dice qué valor usar.
+- Si falla el borrado de un archivo, **solo se registra**: la base de datos ya quedó consistente y un archivo huérfano no afecta al usuario.
+- `context.WithoutCancel(ctx)`: la limpieza se hace aunque el cliente haya cerrado la conexión.
+- `Eliminar` (de la tarea) ahora usa las rutas que devuelve el repositorio para borrar los archivos.
 
-### 3.3 Configuración
+### 3.7 Cambios mínimos fuera del servicio
 
-```go
-	c.Almacenamiento = almacenamiento.Config{
-		Tipo: texto("ALMACENAMIENTO_TIPO", almacenamiento.TipoLocal),
-		Ruta: texto("ALMACENAMIENTO_RUTA", "/data"),
-	}
-	c.MaxAdjuntoMB = entero("ADJUNTO_MAX_MB", 10, &errs)
-```
-- Igual que `ia.Config` más adelante (paso 51), cada paquete define **su** configuración y `config` solo la llena desde las variables de entorno.
-- `entero` es como `duracion` (paso 15) pero con `strconv.Atoi`. `ADJUNTO_MAX_MB=diez` produce un error de configuración.
-
-### 3.4 Docker
-
-```dockerfile
- && mkdir -p /data \
- && chown app:app /data
-# /data es el punto de montaje del volumen de archivos (PDF y adjuntos).
-VOLUME ["/data"]
-```
-- El proceso corre como `app` (no `root`, paso 5), así que la carpeta debe pertenecerle para poder escribir. Cuando Docker monta un volumen nuevo y vacío en `/data`, copia el dueño y los permisos de esa carpeta de la imagen.
-
-```yaml
-  api:
-    environment:
-      POSTGRES_HOST: postgres
-      ALMACENAMIENTO_RUTA: /data
-    volumes:
-      - archivos:/data
-...
-volumes:
-  datos-postgres:
-  archivos:
-```
+- El handler pasa `nil` como archivos (`}, nil)`): en el paso 40 se leerán del formulario multipart.
+- `main.go` crea el almacenamiento configurado (con la función `Nuevo` del paso 38, que hoy entrega el local) y calcula el tamaño máximo:
+  ```go
+  	// Infraestructura
+  	almacen, err := almacenamiento.Nuevo(cfg.Almacenamiento)
+  	...
+  	maxBytesAdjunto := int64(cfg.MaxAdjuntoMB) << 20
+  	...
+  	Tareas: servicio.NuevoTareas(tareas, vinculaciones, almacen, reloj, maxBytesAdjunto, log),
+  ```
+  `<< 20` multiplica por 2²⁰ (MB → bytes).
 
 ---
 
-## 4. Conceptos de este paso
+## 4. Las pruebas
+
+El entorno de tareas usa un **almacenamiento falso en memoria** y un tamaño máximo de **10 bytes**, para probar el límite sin crear archivos grandes.
+
+| Prueba | Qué verifica |
+|---|---|
+| `TestValidarArchivoAdjunto` (dominio) | `C:\fakepath\..\Informe Final.PDF` → `Informe Final.PDF`, `.pdf`, `application/pdf`. Se rechazan `virus.exe`, `pagina.html`, un nombre sin extensión y uno vacío. |
+| `TestCrearTareaConAdjuntos` | Un PDF se guarda en `adjuntos/<id de la tarea>/...` con su tipo; un archivo de 50 bytes supera el límite → 400 y **no queda nada guardado** (tampoco el archivo válido que iba antes); `virus.exe` → 400; si falla la base de datos, el archivo se borra. |
+| `TestAgregarAdjuntosATareaModificable` | Sin archivos → 400; un PNG se agrega y se guarda. |
+| `TestModificarTareas` (actualizada) | Eliminar una tarea ahora pasa por el almacenamiento. |
+
+---
+
+## 5. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| `io.Reader` / `io.ReadCloser` | Interfaces para leer datos por partes (y cerrarlos). |
-| `io.Copy` | Copia de un lector a un escritor sin cargar todo en memoria. |
-| Escritura atómica | Temporal + `os.Rename`. |
-| Path traversal | Ataque con `../` para salir de una carpeta; se evita con `filepath.Clean` y validaciones. |
-| Permisos octales | `0o750`. |
-| Idempotencia | Repetir la operación produce el mismo resultado (eliminar algo que ya no existe no falla). |
-| `VOLUME` | Declara en la imagen una carpeta pensada para un volumen. |
-| Función fábrica | Función (`Nuevo`) que decide qué implementación crear según la configuración. |
-| Interfaz con valor `nil` | Una interfaz que contiene un puntero nulo no es `nil`; por eso se devuelve `nil` explícito. |
+| Resultados con nombre | `func f() (a, b string, err error)`. |
+| Lista blanca | Solo se acepta lo explícitamente permitido. |
+| `io.LimitReader(r, n+1)` | Detectar archivos que superan `n` bytes sin leerlos completos. |
+| Compensación | Si un paso posterior falla, se deshace lo anterior (borrar archivos). |
+| `<<` / `>>` | Desplazamiento de bits: multiplicar o dividir por potencias de 2. |
 
 ---
 
-## 5. Cómo comprobarlo
+## 6. Cómo comprobarlo
 
 ```bash
-cd backend && go test ./internal/almacenamiento/ -v
-# TestGuardarAbrirYEliminar, TestRutasFueraDeLaRaizSonRechazadas, TestNuevoEligeElTipo
-
-docker compose up --build -d --wait
-docker compose exec api sh -c 'ls -ld /data && touch /data/prueba && echo ok'
-# drwxr-xr-x 2 app app ... /data   ok
-docker volume ls | grep archivos
+cd backend
+go test ./internal/dominio/ ./internal/servicio/ -v -run 'Adjunto|Tarea'
 ```
 
-`local_test.go` usa `t.TempDir()`, una carpeta temporal que Go borra al terminar la prueba.
+Por HTTP los adjuntos estarán disponibles en el paso 40.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 37
+## 7. Pasos para lograr esta versión desde el paso 38
 
-1. Crear `backend/internal/almacenamiento/local.go` (`Local`, `NuevoLocal`, `rutaSegura`, `Guardar`, `Abrir`, `Eliminar`) y `local_test.go`.
-2. Crear `backend/internal/almacenamiento/almacenamiento.go` (`TipoLocal`, `Config`, `Archivos`, `Nuevo`) y su prueba `TestNuevoEligeElTipo` en `local_test.go`.
-3. En `config.go`: campos `Almacenamiento` y `MaxAdjuntoMB`, su carga, la función `entero` y los imports `strconv` y `seguimiento/internal/almacenamiento`. En `config_test.go`, los nuevos valores por defecto y `ADJUNTO_MAX_MB=diez`.
-4. En `backend/Dockerfile`, etapa `base`: crear `/data`, `chown app:app /data` y `VOLUME ["/data"]`.
-5. En `docker-compose.yml`: en `api`, `ALMACENAMIENTO_RUTA: /data` y el volumen `archivos:/data`; declarar `archivos` en `volumes`.
-6. En `.env.example` (y su `.env`): la sección `Archivos` con `ALMACENAMIENTO_TIPO`, `ALMACENAMIENTO_RUTA` y `ADJUNTO_MAX_MB`.
-7. `make pruebas lint`, `docker compose up --build -d --wait` y commit: `git add . && git commit -m "Paso 38: almacenamiento local de archivos"`
-
----
-
-## 7. Preparación para las próximas entregas
-
-- **Este es el punto de extensión para la nube.** La Entrega 2 exige guardar los PDF y los adjuntos en un bucket de **Cloud Storage**, y en la Entrega 3, con varias instancias de la API, un volumen local ya no serviría (cada máquina tendría sus propios archivos). Para agregarlo basta con:
-  1. crear `almacenamiento/gcs.go` con los mismos tres métodos (`Guardar`, `Abrir`, `Eliminar`);
-  2. agregar un `case` en `Nuevo` (por ejemplo `ALMACENAMIENTO_TIPO=gcs`) y una variable con el nombre del bucket.
-
-  Ni los servicios ni los `main` cambian. Está registrado en la deuda técnica (DT-02).
-- Los métodos ya reciben `context.Context`, que las llamadas de red a Cloud Storage necesitarán para sus tiempos máximos.
+1. En `dominio/tarea.go`: `MaxAdjuntosPorTarea` y `LongitudMaxNombreArchivo` en las constantes, `tiposPermitidos` y `ValidarArchivoAdjunto`. En `reglas_test.go`: `TestValidarArchivoAdjunto`.
+2. En `servicio/tareas.go`:
+   - en `RepositorioTareas`, los métodos `AgregarAdjuntos`, `ObtenerAdjunto` y `EliminarAdjunto`;
+   - el tipo `ArchivoAdjunto`; los campos `almacenamiento` y `maxBytes` y los parámetros de `NuevoTareas`;
+   - `Crear` con `archivos`; `Eliminar` que borra los archivos; `AgregarAdjuntos`, `AbrirAdjunto`, `EliminarAdjunto`, `guardarArchivos`, `eliminarArchivos` y `eliminarArchivo`;
+   - al final, la interfaz `Almacenamiento`.
+3. En `autenticacion_test.go`: `almacenamientoFalso`. En `modulos_test.go`: `entornoTareas` con almacenamiento y límite de 10 bytes, `Crear(..., nil)` en las pruebas existentes y las dos pruebas nuevas.
+4. En `handler/tareas.go`: la nueva firma de `Crear` en `ServicioTareas` y `nil` en la llamada; en `handler/modulos_test.go`, la firma del servicio falso.
+5. En `main.go`: `almacen` con `almacenamiento.Nuevo(cfg.Almacenamiento)`, `maxBytesAdjunto` y los nuevos argumentos de `NuevoTareas`.
+6. `make pruebas lint` y commit: `git add . && git commit -m "Paso 39: adjuntos en el servicio de tareas"`
 
 ---
 
@@ -246,7 +264,7 @@ docker volume ls | grep archivos
 
 | Requisito | Cómo |
 |---|---|
-| RF-06.4 / RN-23 Evidencias | Base para guardar los adjuntos (paso 39). |
-| RF-14.5 Almacenar los PDF | El mismo almacenamiento guardará los reportes (paso 54). |
-| Stack: volúmenes de archivos | Volumen `archivos` en Docker Compose. |
-| RNF-03 Seguridad básica | Protección contra recorrido de directorios; escritura atómica. |
+| RF-06.4 / RN-23 Evidencias | Adjuntos al crear o después; descarga y eliminación. |
+| RF-08.5 / RN-33 | Los adjuntos de una tarea tardía se envían al crearla (después no se modifica). |
+| RNF-03 Seguridad básica | Lista blanca de tipos, tamaño máximo verificado en el servidor, nombres en disco generados. |
+| RNF-06 Consistencia | Archivos y metadatos se guardan o se descartan juntos. |

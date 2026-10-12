@@ -29,7 +29,7 @@ func tareaFalsa() dominio.Tarea {
 		Adjuntos: []dominio.Adjunto{{ID: uuidB, NombreOriginal: "evidencia.pdf", TipoContenido: "application/pdf", TamanoBytes: 4}}}
 }
 
-func (s *servicioTareasFalso) Crear(_ context.Context, _ auth.Actor, n servicio.NuevaTarea) (dominio.Tarea, error) {
+func (s *servicioTareasFalso) Crear(_ context.Context, _ auth.Actor, n servicio.NuevaTarea, _ []servicio.ArchivoAdjunto) (dominio.Tarea, error) {
 	s.nueva = n
 	return tareaFalsa(), nil
 }

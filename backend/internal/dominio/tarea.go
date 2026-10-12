@@ -1,16 +1,20 @@
 package dominio
 
 import (
+	"path/filepath"
+	"strings"
 	"time"
 
 	"seguimiento/internal/apperr"
 )
 
-// Límites de las tareas.
+// Límites de las tareas y sus adjuntos.
 const (
-	LongitudMaxTitulo      = 200
-	LongitudMaxDescripcion = 4000
-	MaxHorasPorTarea       = 168 // horas de una semana completa
+	LongitudMaxTitulo        = 200
+	LongitudMaxDescripcion   = 4000
+	MaxHorasPorTarea         = 168 // horas de una semana completa
+	MaxAdjuntosPorTarea      = 5
+	LongitudMaxNombreArchivo = 200
 )
 
 // EstadoTarea es el catálogo cerrado de estados de una tarea (RN-27, RN-28).
@@ -147,4 +151,43 @@ type Adjunto struct {
 	TipoContenido      string
 	TamanoBytes        int64
 	CreadoEn           time.Time
+}
+
+// tiposPermitidos restringe los adjuntos a documentos e imágenes comunes,
+// para no almacenar ejecutables ni páginas HTML.
+var tiposPermitidos = map[string]string{
+	".pdf":  "application/pdf",
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+	".txt":  "text/plain; charset=utf-8",
+	".md":   "text/markdown; charset=utf-8",
+	".csv":  "text/csv; charset=utf-8",
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".zip":  "application/zip",
+}
+
+// ValidarArchivoAdjunto limpia el nombre del archivo y devuelve su extensión y
+// tipo de contenido si es un formato permitido.
+func ValidarArchivoAdjunto(nombre string) (nombreLimpio, extension, tipo string, err error) {
+	nombreLimpio = strings.TrimSpace(filepath.Base(strings.ReplaceAll(nombre, "\\", "/")))
+	if nombreLimpio == "" || nombreLimpio == "." || nombreLimpio == "/" {
+		return "", "", "", apperr.Validacion("el archivo adjunto no tiene nombre")
+	}
+	if r := []rune(nombreLimpio); len(r) > LongitudMaxNombreArchivo {
+		nombreLimpio = string(r[:LongitudMaxNombreArchivo])
+	}
+	extension = strings.ToLower(filepath.Ext(nombreLimpio))
+	tipo, ok := tiposPermitidos[extension]
+	if !ok {
+		return "", "", "", apperr.Validacion("tipo de archivo no permitido (%s): use PDF, imágenes, texto, Office o ZIP", extension)
+	}
+	return nombreLimpio, extension, tipo, nil
 }

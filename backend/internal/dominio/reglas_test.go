@@ -178,6 +178,18 @@ func TestValidarSemanaDeRegistro(t *testing.T) {
 	}
 }
 
+func TestValidarArchivoAdjunto(t *testing.T) {
+	nombre, ext, tipo, err := ValidarArchivoAdjunto(`C:\fakepath\..\Informe Final.PDF`)
+	if err != nil || nombre != "Informe Final.PDF" || ext != ".pdf" || tipo != "application/pdf" {
+		t.Fatalf("resultado inesperado: %q %q %q %v", nombre, ext, tipo, err)
+	}
+	for _, malo := range []string{"virus.exe", "pagina.html", "sin-extension", ""} {
+		if _, _, _, err := ValidarArchivoAdjunto(malo); !apperr.Es(err, apperr.TipoValidacion) {
+			t.Errorf("%q debería rechazarse", malo)
+		}
+	}
+}
+
 func TestNormalizarCorreoYPassword(t *testing.T) {
 	if c, err := NormalizarCorreo("  Ana.Perez@Uniandes.EDU.co "); err != nil || c != "ana.perez@uniandes.edu.co" {
 		t.Errorf("correo normalizado = %q, %v", c, err)

@@ -1,7 +1,9 @@
 package servicio
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -533,7 +535,7 @@ func (l lectorVinculacionesFalso) Obtener(_ context.Context, id string) (dominio
 }
 
 // El reloj de prueba marca el miércoles 14 de octubre de 2026 (semana del 12 al 18).
-func entornoTareas(t *testing.T) (*Tareas, *repoTareasFalso) {
+func entornoTareas(t *testing.T) (*Tareas, *repoTareasFalso, *almacenamientoFalso) {
 	vinculaciones := lectorVinculacionesFalso{vinculaciones: map[string]dominio.Vinculacion{
 		"v1": {ID: "v1", UsuarioID: "mon-1", ProfesorID: "prof-1", EspacioTipo: dominio.EspacioCurso, EspacioEstado: dominio.EspacioActivo,
 			EspacioFechaInicio: fechaP(t, "2026-08-03"), EspacioFechaCierre: fechaP(t, "2026-12-04")},
@@ -543,7 +545,8 @@ func entornoTareas(t *testing.T) (*Tareas, *repoTareasFalso) {
 			EspacioFechaInicio: fechaP(t, "2026-08-03"), EspacioFechaCierre: fechaP(t, "2026-12-04")},
 	}}
 	repo := &repoTareasFalso{tareas: map[string]dominio.Tarea{}}
-	return NuevoTareas(repo, vinculaciones, RelojFijo(ahoraPrueba, time.UTC), logPrueba), repo
+	alm := &almacenamientoFalso{archivos: map[string][]byte{}}
+	return NuevoTareas(repo, vinculaciones, alm, RelojFijo(ahoraPrueba, time.UTC), 10, logPrueba), repo, alm
 }
 
 func nuevaTarea(t *testing.T, vinculacion, semana string) NuevaTarea {
@@ -552,8 +555,8 @@ func nuevaTarea(t *testing.T, vinculacion, semana string) NuevaTarea {
 }
 
 func TestCrearTareaEnLaSemanaActual(t *testing.T) {
-	s, repo := entornoTareas(t)
-	tarea, err := s.Crear(context.Background(), monitor, nuevaTarea(t, "v1", "2026-10-15"))
+	s, repo, _ := entornoTareas(t)
+	tarea, err := s.Crear(context.Background(), monitor, nuevaTarea(t, "v1", "2026-10-15"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,25 +566,25 @@ func TestCrearTareaEnLaSemanaActual(t *testing.T) {
 }
 
 func TestCrearTareaSinSemanaUsaLaSemanaActual(t *testing.T) {
-	s, _ := entornoTareas(t)
+	s, _, _ := entornoTareas(t)
 	n := nuevaTarea(t, "v1", "2026-10-15")
 	n.Semana = time.Time{}
-	tarea, err := s.Crear(context.Background(), monitor, n)
+	tarea, err := s.Crear(context.Background(), monitor, n, nil)
 	if err != nil || tarea.SemanaInicio.Format(dominio.FormatoFecha) != "2026-10-12" {
 		t.Fatalf("debería usarse la semana actual: %+v %v", tarea, err)
 	}
 }
 
 func TestCrearTareaEnSemanaPasadaEsTardia(t *testing.T) {
-	s, _ := entornoTareas(t)
-	tarea, err := s.Crear(context.Background(), monitor, nuevaTarea(t, "v1", "2026-10-07"))
+	s, _, _ := entornoTareas(t)
+	tarea, err := s.Crear(context.Background(), monitor, nuevaTarea(t, "v1", "2026-10-07"), nil)
 	if err != nil || !tarea.Tardia {
 		t.Fatalf("una tarea de una semana cerrada debe marcarse tardía (RN-32): %+v %v", tarea, err)
 	}
 }
 
 func TestCrearTareaValidaciones(t *testing.T) {
-	s, _ := entornoTareas(t)
+	s, _, _ := entornoTareas(t)
 	ctx := context.Background()
 	casos := []struct {
 		nombre string
@@ -596,18 +599,57 @@ func TestCrearTareaValidaciones(t *testing.T) {
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
-			_, err := s.Crear(ctx, monitor, c.n)
+			_, err := s.Crear(ctx, monitor, c.n, nil)
 			esperarTipo(t, err, c.tipo)
 		})
 	}
 	sinTitulo := nuevaTarea(t, "v1", "2026-10-14")
 	sinTitulo.Datos.Titulo = " "
-	_, err := s.Crear(ctx, monitor, sinTitulo)
+	_, err := s.Crear(ctx, monitor, sinTitulo, nil)
 	esperarTipo(t, err, apperr.TipoValidacion)
 }
 
+func TestCrearTareaConAdjuntos(t *testing.T) {
+	s, repo, alm := entornoTareas(t)
+	ctx := context.Background()
+
+	_, err := s.Crear(ctx, monitor, nuevaTarea(t, "v1", "2026-10-07"), []ArchivoAdjunto{
+		{Nombre: "evidencia.pdf", Contenido: strings.NewReader("%PDF-1")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.adjuntos) != 1 || repo.adjuntos[0].TipoContenido != "application/pdf" || len(alm.archivos) != 1 {
+		t.Fatalf("el adjunto debería guardarse: %+v", repo.adjuntos)
+	}
+	if !strings.HasPrefix(repo.adjuntos[0].RutaAlmacenamiento, "adjuntos/"+repo.creada.ID+"/") {
+		t.Errorf("ruta inesperada: %s", repo.adjuntos[0].RutaAlmacenamiento)
+	}
+
+	// Archivo demasiado grande (el límite de prueba es 10 bytes): no queda nada guardado.
+	alm.archivos = map[string][]byte{}
+	_, err = s.Crear(ctx, monitor, nuevaTarea(t, "v1", "2026-10-14"), []ArchivoAdjunto{
+		{Nombre: "a.pdf", Contenido: strings.NewReader("123")},
+		{Nombre: "grande.pdf", Contenido: strings.NewReader(strings.Repeat("x", 50))},
+	})
+	esperarTipo(t, err, apperr.TipoValidacion)
+	if len(alm.archivos) != 0 {
+		t.Errorf("los archivos guardados deben limpiarse si uno falla: %v", alm.archivos)
+	}
+
+	_, err = s.Crear(ctx, monitor, nuevaTarea(t, "v1", "2026-10-14"), []ArchivoAdjunto{{Nombre: "virus.exe", Contenido: strings.NewReader("x")}})
+	esperarTipo(t, err, apperr.TipoValidacion)
+
+	// Si la base de datos falla, el archivo se elimina.
+	repo.errCrear = errors.New("bd caída")
+	_, err = s.Crear(ctx, monitor, nuevaTarea(t, "v1", "2026-10-14"), []ArchivoAdjunto{{Nombre: "a.pdf", Contenido: strings.NewReader("123")}})
+	if err == nil || len(alm.archivos) != 0 {
+		t.Errorf("el archivo debe eliminarse si la tarea no se guarda: %v %v", err, alm.archivos)
+	}
+}
+
 func TestModificarTareas(t *testing.T) {
-	s, repo := entornoTareas(t)
+	s, repo, _ := entornoTareas(t)
 	ctx := context.Background()
 	base := dominio.Tarea{UsuarioID: "mon-1", ProfesorID: "prof-1", EspacioEstado: dominio.EspacioActivo, Titulo: "x"}
 	actual, pasada, tardia, cerrada := base, base, base, base
@@ -645,5 +687,20 @@ func TestModificarTareas(t *testing.T) {
 
 	if err := s.Eliminar(ctx, monitor, "actual"); err != nil || len(repo.eliminadas) != 1 {
 		t.Errorf("la tarea de la semana activa se puede eliminar: %v", err)
+	}
+}
+
+func TestAgregarAdjuntosATareaModificable(t *testing.T) {
+	s, repo, alm := entornoTareas(t)
+	ctx := context.Background()
+	repo.tareas["t1"] = dominio.Tarea{ID: "t1", UsuarioID: "mon-1", EspacioEstado: dominio.EspacioActivo, SemanaInicio: fechaP(t, "2026-10-12")}
+
+	_, err := s.AgregarAdjuntos(ctx, monitor, "t1", nil)
+	esperarTipo(t, err, apperr.TipoValidacion)
+	if _, err := s.AgregarAdjuntos(ctx, monitor, "t1", []ArchivoAdjunto{{Nombre: "foto.png", Contenido: bytes.NewReader([]byte("png"))}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.adjuntos) != 1 || len(alm.archivos) != 1 {
+		t.Error("el adjunto debería registrarse y guardarse")
 	}
 }
