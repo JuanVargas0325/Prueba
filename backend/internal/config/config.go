@@ -18,6 +18,9 @@ type Config struct {
 	PuertoHTTP  string
 	BaseDatos   string // URL de conexión a PostgreSQL
 	ZonaHoraria *time.Location
+	// OrigenesCORS son los orígenes (esquema://dominio:puerto) desde los que un
+	// frontend en el navegador puede llamar a la API.
+	OrigenesCORS []string
 }
 
 // EsDesarrollo indica si la aplicación corre en modo desarrollo.
@@ -27,8 +30,9 @@ func (c Config) EsDesarrollo() bool { return c.Entorno == "desarrollo" }
 func Cargar() (Config, error) {
 	var errs []error
 	c := Config{
-		Entorno:    texto("APP_ENTORNO", "desarrollo"),
-		PuertoHTTP: texto("APP_PUERTO", "8080"),
+		Entorno:      texto("APP_ENTORNO", "desarrollo"),
+		PuertoHTTP:   texto("APP_PUERTO", "8080"),
+		OrigenesCORS: lista("CORS_ORIGENES"),
 	}
 
 	zona, err := time.LoadLocation(texto("APP_ZONA_HORARIA", "America/Bogota"))
@@ -70,4 +74,15 @@ func texto(clave, porDefecto string) string {
 		return v
 	}
 	return porDefecto
+}
+
+// lista lee una variable con valores separados por comas, sin espacios ni vacíos.
+func lista(clave string) []string {
+	var valores []string
+	for _, v := range strings.Split(os.Getenv(clave), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			valores = append(valores, v)
+		}
+	}
+	return valores
 }

@@ -47,3 +47,12 @@ func TestCargarRechazaZonaHorariaInvalida(t *testing.T) {
 		t.Fatalf("se esperaba un error que mencionara APP_ZONA_HORARIA: %v", err)
 	}
 }
+
+func TestListaSeparaPorComas(t *testing.T) {
+	t.Setenv("CORS_ORIGENES", " http://localhost:5173 ,, https://ejemplo.com")
+
+	origenes := lista("CORS_ORIGENES")
+	if len(origenes) != 2 || origenes[0] != "http://localhost:5173" || origenes[1] != "https://ejemplo.com" {
+		t.Errorf("orígenes = %q", origenes)
+	}
+}

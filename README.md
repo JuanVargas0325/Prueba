@@ -1,136 +1,249 @@
-# Paso 9 · Errores de aplicación (`apperr`)
+# Paso 10 · Router por módulos y middleware de registro
 
-> Rama `paso-a-paso` · paso 9 de 65 · anterior: **Paso 8 · Integración continua** · siguiente: **Paso 10 · Router por módulos y middleware de registro**
+> Rama `paso-a-paso` · paso 10 de 65 · anterior: **Paso 9 · Errores de aplicación** · siguiente: **Paso 11 · Dominio: usuarios, roles y validaciones**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el paquete `apperr` con los **tipos de error** que usarán todas las capas del sistema.
+Se preparó el router para recibir **módulos** (usuarios, tareas, reportes...) y se le agregaron cuatro comportamientos comunes a toda la API:
+
+1. **Un log por petición** (método, ruta, código, duración e IP del cliente).
+2. **Errores 404 y 405 en JSON**, con el mismo formato que tendrán todos los errores de la API.
+3. **La IP real del cliente** cuando la petición viene a través de Nginx.
+4. **CORS**: permiso para que un frontend servido desde otro origen (el de la Entrega 2) llame a la API desde el navegador.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/apperr/apperr.go` | **Nuevo.** Tipo `Error` con una categoría (`Tipo`) y un mensaje para el usuario, más funciones para crearlos y reconocerlos. |
+| `backend/internal/handler/respuestas.go` | **Nuevo.** Formato estándar de error `RespuestaError` y la documentación del paquete `handler`. |
+| `backend/internal/handler/middleware.go` | **Nuevo.** Middlewares `RegistrarPeticiones` y `CORS`. |
+| `backend/internal/handler/router.go` | **Modificado.** Interfaz `modulo`, grupo `/api/v1`, `NoRoute`/`NoMethod`, proxies de confianza, CORS, y logger y orígenes en `Dependencias`. |
+| `backend/internal/handler/router_test.go` | **Modificado.** Logger de prueba y pruebas de 404/405 y de CORS. |
+| `backend/internal/config/config.go` | **Modificado.** `OrigenesCORS` (variable `CORS_ORIGENES`) y la función `lista`. |
+| `backend/internal/config/config_test.go` | **Modificado.** Prueba de la lectura de orígenes. |
+| `backend/cmd/api/main.go` | **Modificado.** Pasa el logger y los orígenes al router. |
+| `.env.example` | **Modificado.** Variable `CORS_ORIGENES`. |
 
-Todavía nadie usa el paquete. Lo usarán el dominio (paso 11), los repositorios (paso 13), los servicios (paso 14) y el handler, que traduce cada tipo a un código HTTP (paso 17).
+```bash
+curl -i http://localhost:8080/no-existe
+# HTTP/1.1 404 Not Found
+# {"error":"no_encontrado","mensaje":"ruta no encontrada"}
+
+curl -i -X DELETE http://localhost:8080/salud
+# HTTP/1.1 405 Method Not Allowed
+# {"error":"metodo_no_permitido","mensaje":"método no permitido"}
+```
+
+Y en `docker compose logs api` aparece una línea por petición:
+
+```json
+{"level":"INFO","msg":"petición","servicio":"api","metodo":"GET","ruta":"/no-existe","estado":404,"duracion_ms":0,"ip":"172.18.0.1"}
+```
 
 ---
 
 ## 2. Por qué
 
-La aplicación tendrá tres capas (sección 4): **presentación** (handler, HTTP), **servicio** (reglas y casos de uso) y **datos** (repositorios, SQL). Cuando algo sale mal en una capa interna, la capa HTTP tiene que decidir qué código responder:
-
-- un correo inválido → **400** (el cliente envió datos incorrectos);
-- una tarea que no existe → **404**;
-- superar las 22 horas de asistencia graduada → **422** (los datos son válidos, pero violan una regla de negocio);
-- un fallo de la base de datos → **500**.
-
-Sin un vocabulario común, el servicio tendría que conocer los códigos HTTP (y entonces ya no sería independiente de HTTP), o el handler tendría que adivinar a partir del texto del error. `apperr` resuelve eso: las capas internas dicen **qué clase de problema** ocurrió y solo el handler decide el código HTTP.
+- **Formato único de error.** Un cliente (Postman, el frontend de la Entrega 2) debe poder tratar todos los errores igual: siempre un JSON con `error` (código corto para programas) y `mensaje` (texto para personas). Antes, una ruta inexistente devolvía el texto plano `404 page not found` de Gin.
+- **Observabilidad.** Con un log por petición se puede saber qué se pidió, qué se respondió y cuánto tardó, sin agregar código a cada endpoint. Es la base para diagnosticar problemas y para las pruebas de carga.
+- **Organización por módulos.** Cada módulo (paso 17 en adelante) tendrá su archivo con su propio método `Registrar`. El router solo mantiene una lista. Agregar un módulo nuevo no exige modificar las rutas de los demás.
+- **CORS desde el inicio.** La Entrega 2 exige un frontend, y su propio enunciado anticipa que, si se publica en un bucket, "el backend requerirá una configuración adecuada de CORS". La Entrega 4 pide verificarlo de nuevo con Cloud Run. Tenerlo desde ahora no cambia nada para Postman o curl, y el frontend podrá conectarse sin tocar el backend: solo con una variable de entorno.
 
 ---
 
-## 3. Explicación detallada de `apperr.go`
+## 3. Explicación detallada
 
-### 3.1 Los tipos de error
+### 3.1 ¿Qué es un middleware?
 
-```go
-type Tipo string
+Un **middleware** es una función que se ejecuta **alrededor** de cada petición, antes y después del handler que la atiende. Gin los encadena en el orden en que se registran:
 
-const (
-	TipoValidacion    Tipo = "validacion"     // 400
-	TipoNoAutenticado Tipo = "no_autenticado" // 401
-	TipoProhibido     Tipo = "prohibido"      // 403
-	TipoNoEncontrado  Tipo = "no_encontrado"  // 404
-	TipoConflicto     Tipo = "conflicto"      // 409
-	TipoReglaNegocio  Tipo = "regla_negocio"  // 422
-	TipoInterno       Tipo = "interno"        // 500
-)
+```
+petición ─► Recovery ─► RegistrarPeticiones ─► CORS ─► (handler de la ruta) ─┐
+respuesta ◄──────────────────────────────────────────────────────────────────┘
 ```
 
-- `type Tipo string` crea un **tipo nuevo** basado en `string`. Aunque por dentro es texto, el compilador no deja mezclarlo con cualquier string por accidente.
-- `const ( ... )` agrupa constantes. El texto de cada una es el que verá el cliente en el campo `"error"` del JSON.
-
-| Tipo | Cuándo se usa | Ejemplo en este proyecto |
-|---|---|---|
-| `validacion` (400) | Los datos de la petición son incorrectos. | Fecha con formato inválido, correo mal escrito, título vacío. |
-| `no_autenticado` (401) | No se sabe quién es el usuario. | Credenciales incorrectas, token vencido. |
-| `prohibido` (403) | Se sabe quién es, pero no tiene permiso. | Un monitor intenta crear un usuario. |
-| `no_encontrado` (404) | El recurso no existe **o el usuario no debe saber que existe**. | Un profesor consulta el reporte de otro profesor. |
-| `conflicto` (409) | Choca con el estado actual. | Correo ya registrado, vinculación duplicada, lote ya en proceso. |
-| `regla_negocio` (422) | Datos válidos que violan una regla del dominio. | Más de 22 h de asistencia, editar una tarea de una semana cerrada. |
-| `interno` (500) | Fallo inesperado. | La base de datos no responde. |
-
-### 3.2 La estructura `Error`
+### 3.2 `middleware.go` · `RegistrarPeticiones`
 
 ```go
-type Error struct {
-	Tipo    Tipo
-	Mensaje string
-	Causa   error
-}
-
-func (e *Error) Error() string {
-	if e.Causa != nil {
-		return fmt.Sprintf("%s: %s: %v", e.Tipo, e.Mensaje, e.Causa)
+func RegistrarPeticiones(log *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		inicio := time.Now()
+		c.Next()
+		if c.Request.URL.Path == "/salud" {
+			return
+		}
+		log.Info("petición",
+			"metodo", c.Request.Method,
+			"ruta", c.Request.URL.Path,
+			"estado", c.Writer.Status(),
+			"duracion_ms", time.Since(inicio).Milliseconds(),
+			"ip", c.ClientIP(),
+		)
 	}
-	return fmt.Sprintf("%s: %s", e.Tipo, e.Mensaje)
-}
-
-func (e *Error) Unwrap() error { return e.Causa }
-```
-
-- **En Go, `error` es una interfaz** con un único método: `Error() string`. Cualquier tipo que tenga ese método **es** un error (sección 4). `*Error` lo tiene, así que se puede devolver donde se espera un `error`.
-- `Mensaje` es un texto **apto para el usuario** ("la persona superaría el máximo de 22 horas...").
-- `Causa` guarda el error técnico original (por ejemplo, el de la base de datos) para los logs, **sin mostrárselo al cliente**.
-- `Unwrap()` permite que `errors.Is` y `errors.As` "miren adentro" y encuentren la causa.
-- `%v` en `Sprintf` imprime un valor en su forma por defecto.
-
-### 3.3 Funciones constructoras
-
-```go
-func nuevo(tipo Tipo, formato string, args ...any) *Error {
-	return &Error{Tipo: tipo, Mensaje: fmt.Sprintf(formato, args...)}
-}
-
-func Validacion(formato string, args ...any) *Error {
-	return nuevo(TipoValidacion, formato, args...)
-}
-// ... NoAutenticado, Prohibido, NoEncontrado, Conflicto, ReglaNegocio
-```
-
-- Se usan así: `apperr.Validacion("el campo %s es obligatorio", "titulo")`.
-- `args ...any` es un parámetro **variádico**: acepta cualquier cantidad de argumentos de cualquier tipo (`any`), como `Printf`.
-
-```go
-func Interno(causa error, formato string, args ...any) *Error {
-	e := nuevo(TipoInterno, formato, args...)
-	e.Causa = causa
-	return e
 }
 ```
 
-- Para errores inesperados: guarda la causa técnica y un mensaje genérico para el usuario.
+- Recibe el logger y **devuelve** el middleware (otra vez el patrón *closure* del paso 2).
+- `c.Next()` ejecuta el resto de la cadena (el handler). Lo que está **antes** corre al llegar la petición y lo que está **después**, cuando ya se generó la respuesta. Por eso se puede medir la duración y leer el código de estado.
+- **`/salud` no se registra:** Docker la consulta cada 10 segundos; registrarla llenaría el log de líneas sin valor.
+- `time.Since(inicio).Milliseconds()`: tiempo transcurrido en milisegundos.
+- `c.ClientIP()`: la IP del cliente (ver 3.4).
 
-### 3.4 Reconocer errores
+### 3.3 `middleware.go` · `CORS`
+
+**El problema que resuelve.** Por seguridad, un navegador **no deja** que el JavaScript de una página lea respuestas de un servidor con otro **origen**. El origen es la combinación de esquema, dominio y puerto: `http://localhost:5173` y `http://localhost:8080` son orígenes distintos. Sin esta regla, cualquier página que el usuario visite podría usar sus sesiones en otros sitios.
+
+**CORS** (*Cross-Origin Resource Sharing*) es la forma en que el servidor le dice al navegador "este otro origen sí puede llamarme", mediante cabeceras `Access-Control-*`. Solo aplica a navegadores: Postman, curl o Newman no lo revisan.
+
+**La consulta previa (*preflight*).** Antes de una petición "no simple" (por ejemplo, un `POST` con JSON o cualquier petición con `Authorization`), el navegador envía automáticamente un `OPTIONS` preguntando si puede hacerla. Solo si la respuesta lo permite, envía la petición real.
 
 ```go
-func TipoDe(err error) Tipo {
-	var e *Error
-	if errors.As(err, &e) {
-		return e.Tipo
+func CORS(origenes []string) gin.HandlerFunc {
+	permitidos := map[string]bool{}
+	for _, o := range origenes {
+		permitidos[o] = true
 	}
-	return TipoInterno
-}
+	return func(c *gin.Context) {
+		origen := c.GetHeader("Origin")
+		if origen == "" || (!permitidos["*"] && !permitidos[origen]) {
+			c.Next()
+			return
+		}
+```
+- La lista de orígenes se convierte una sola vez en un **mapa** (`map[string]bool`), para preguntar "¿está permitido?" sin recorrer la lista en cada petición.
+- El navegador envía la cabecera `Origin` en las peticiones entre orígenes. Si no viene (Postman, curl) o el origen no está permitido, la petición sigue **sin cambios**. En ese caso el navegador bloqueará la respuesta por su cuenta.
+- `"*"` en la configuración acepta cualquier origen; sirve para pruebas, no para producción.
 
-func Es(err error, tipo Tipo) bool {
-	var e *Error
-	return errors.As(err, &e) && e.Tipo == tipo
+```go
+		cabeceras := c.Writer.Header()
+		cabeceras.Set("Access-Control-Allow-Origin", origen)
+		cabeceras.Add("Vary", "Origin")
+		// Consulta previa (preflight): el navegador pregunta si puede enviar la petición real.
+		if c.Request.Method == http.MethodOptions && c.GetHeader("Access-Control-Request-Method") != "" {
+			cabeceras.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE")
+			cabeceras.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			cabeceras.Set("Access-Control-Max-Age", "600")
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		// Permite que el frontend lea el nombre de los archivos descargados.
+		cabeceras.Set("Access-Control-Expose-Headers", "Content-Disposition, Location")
+		c.Next()
+```
+- `Access-Control-Allow-Origin` responde con el mismo origen que preguntó.
+- `Vary: Origin` avisa a cualquier caché intermedia que la respuesta depende del origen, para que no le entregue a un sitio la respuesta preparada para otro.
+- **Consulta previa:** un `OPTIONS` con `Access-Control-Request-Method` se responde aquí mismo con **204** (sin cuerpo), indicando los métodos y cabeceras permitidos. `Max-Age: 600` deja que el navegador recuerde el permiso 10 minutos y no repita la consulta en cada llamada. `AbortWithStatus` corta la cadena: la petición no llega a ningún handler.
+- `Expose-Headers`: por defecto el JavaScript solo puede leer unas pocas cabeceras. Se exponen `Content-Disposition` (el nombre del PDF al descargarlo) y `Location` (la dirección del recurso creado).
+- **No se usan cookies** (la autenticación será con un token en `Authorization`, paso 16), así que no hace falta `Access-Control-Allow-Credentials`.
+
+**Configuración** (`config.go` y `.env.example`):
+
+```go
+		OrigenesCORS: lista("CORS_ORIGENES"),
+...
+// lista lee una variable con valores separados por comas, sin espacios ni vacíos.
+func lista(clave string) []string {
+	var valores []string
+	for _, v := range strings.Split(os.Getenv(clave), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			valores = append(valores, v)
+		}
+	}
+	return valores
+}
+```
+```dotenv
+CORS_ORIGENES=
+# ejemplo con el servidor de desarrollo de un frontend y un bucket:
+# CORS_ORIGENES=http://localhost:5173,https://storage.googleapis.com
+```
+- Por defecto queda **vacía**: ningún sitio externo puede llamar a la API desde un navegador. Es lo seguro; cada despliegue declara su frontend.
+- `if v = strings.TrimSpace(v); v != ""`: en Go, un `if` puede tener una instrucción inicial antes del `;`. Aquí primero limpia el valor y luego lo evalúa.
+
+### 3.4 `respuestas.go` · el formato de error
+
+```go
+// Package handler es la capa de presentación: expone la API REST, valida la
+// entrada, aplica autenticación y autorización por rol, y traduce los
+// resultados y errores del servicio a respuestas HTTP.
+// ...
+package handler
+
+// RespuestaError es el formato de todos los errores de la API.
+type RespuestaError struct {
+	Error   string `json:"error"`
+	Mensaje string `json:"mensaje"`
 }
 ```
 
-- `errors.As(err, &e)` busca, dentro de la cadena de errores envueltos, uno que sea de tipo `*Error`; si lo encuentra, lo copia en `e` y devuelve `true`. Funciona aunque el error haya sido envuelto con `fmt.Errorf("...: %w", err)` varias veces.
-- `TipoDe` devuelve la categoría (y considera **interno** cualquier error que no sea de `apperr`, por ejemplo uno de la base de datos que no se tradujo).
-- `Es` responde preguntas como `apperr.Es(err, apperr.TipoNoEncontrado)`. Lo usarán mucho las pruebas y algunos servicios.
+- Este archivo reunirá todo lo relacionado con **leer peticiones y escribir respuestas** (en el paso 17 se agrega la traducción de `apperr` a códigos HTTP).
+- El comentario del paquete se movió aquí desde `router.go`: en Go basta con que **un** archivo del paquete lo tenga, y este describe mejor la responsabilidad de toda la capa.
+- `Error` coincidirá con los tipos de `apperr` (`validacion`, `no_encontrado`...). Para la ruta inexistente se usa `no_encontrado` y para el método no permitido, `metodo_no_permitido`.
+
+### 3.5 `router.go`
+
+```go
+type Dependencias struct {
+	Salud map[string]ComprobadorSalud
+	// OrigenesCORS son los orígenes de los frontends que pueden usar la API.
+	OrigenesCORS []string
+	Log          *slog.Logger
+}
+```
+- Se agregan el logger y los orígenes de CORS. El router no crea su logger ni lee variables de entorno: lo recibe todo de `main`, que es quien decide el formato del log (JSON), los campos fijos (`servicio=api`) y la configuración.
+
+```go
+type modulo interface {
+	Registrar(g *gin.RouterGroup)
+}
+```
+- Una **interfaz**: "cualquier cosa que tenga el método `Registrar(g *gin.RouterGroup)`". Cada handler de módulo lo implementará **automáticamente** al tener ese método (en Go no se declara `implements`). Está en minúscula porque es un detalle interno del paquete.
+
+```go
+	r.Use(gin.Recovery(), RegistrarPeticiones(d.Log), CORS(d.OrigenesCORS))
+```
+- Primero `Recovery`, para que un pánico en cualquier punto (incluido el log) se convierta en un 500.
+- `CORS` va registrado en el **router completo** (`r.Use`), no en un grupo. Así también responde las consultas previas `OPTIONS`, que no coinciden con ninguna ruta declarada: Gin aplica estos middlewares incluso a las respuestas 404 y 405.
+
+```go
+	// Detrás de Nginx la IP del cliente llega en X-Forwarded-For.
+	_ = r.SetTrustedProxies([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1"})
+```
+- Con Nginx delante (paso 7), todas las peticiones vienen desde la IP del contenedor de Nginx. Nginx informa la IP original en la cabecera `X-Forwarded-For`.
+- **Pero cualquiera puede escribir esa cabecera.** Por eso Gin solo la cree si la petición viene de un **proxy de confianza**. Se confía en las redes privadas (las que usan Docker y las redes internas de la nube) y en `127.0.0.1`. Una petición desde Internet que traiga una cabecera falsa no puede suplantar su IP.
+- `_ =` descarta el error que devuelve la función: con estas direcciones fijas nunca falla.
+
+```go
+	r.NoRoute(func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, RespuestaError{Error: "no_encontrado", Mensaje: "ruta no encontrada"})
+	})
+	r.NoMethod(func(c *gin.Context) {
+		c.JSON(http.StatusMethodNotAllowed, RespuestaError{Error: "metodo_no_permitido", Mensaje: "método no permitido"})
+	})
+	r.HandleMethodNotAllowed = true
+```
+- `NoRoute`: qué responder cuando ninguna ruta coincide (404).
+- `NoMethod` + `HandleMethodNotAllowed = true`: si la ruta existe pero con otro método (por ejemplo, `DELETE /salud`), se responde **405** en lugar de 404. Es más preciso y ayuda a quien consume la API a entender su error.
+- Las funciones se escriben **en línea** (funciones anónimas) porque son cortas y solo se usan aquí.
+
+```go
+	api := r.Group("/api/v1")
+	// Los módulos se agregan a partir del paso 17 (inicio de sesión).
+	modulos := []modulo{}
+	for _, m := range modulos {
+		m.Registrar(api)
+	}
+```
+- Todas las rutas de negocio vivirán bajo `/api/v1`. La **versión en la ruta** permite publicar algún día una `/api/v2` sin romper a los clientes de la `v1`.
+- `/salud` queda fuera del prefijo: es de infraestructura, no de negocio.
+- Hoy la lista está vacía. En el paso 17 recibe su primer módulo.
+
+### 3.6 Pruebas
+
+- `logPrueba` escribe en `io.Discard` (un "agujero negro"): el código que registra se ejecuta, pero no ensucia la salida de las pruebas.
+- `TestRutaInexistenteYMetodoNoPermitido` verifica el 404 y el 405.
+- `TestCORS` tiene tres **subpruebas** (`t.Run`): un origen permitido recibe la cabecera, la consulta previa responde 204 y un origen no configurado no recibe permiso. `conOrigen` es una función auxiliar definida dentro de la prueba que arma la petición con su cabecera `Origin`.
+- `TestListaSeparaPorComas` comprueba que `lista` ignora espacios y valores vacíos. Prueba `lista` directamente y no `Cargar`, porque `Cargar` exigirá más variables en los pasos siguientes.
 
 ---
 
@@ -138,60 +251,58 @@ func Es(err error, tipo Tipo) bool {
 
 | Concepto | Explicación |
 |---|---|
-| Tipo definido | `type Tipo string`: un tipo nuevo con `string` por debajo. |
-| Bloque `const` | Varias constantes relacionadas en `const ( ... )`. |
-| Interfaz | Conjunto de métodos. Un tipo la **implementa automáticamente** si tiene esos métodos; no hay que declararlo (`implements` no existe en Go). |
-| `error` | Interfaz estándar: `type error interface { Error() string }`. |
-| Receptor puntero | `func (e *Error) Error()`: el método pertenece a `*Error` (puntero). |
-| Variádicos | `args ...any` recibe 0 o más argumentos; se reenvían con `args...`. |
-| `any` | Alias de `interface{}`: cualquier tipo. |
-| `errors.As` / `errors.Is` | Buscan un tipo o un valor concreto en una cadena de errores envueltos. |
-
-### La arquitectura en tres capas que se está construyendo
-
-```
-handler      (presentación: HTTP, JSON, códigos de estado)   ← traduce apperr → HTTP
-   │
-servicio     (casos de uso, permisos, reglas)                ← crea errores apperr
-   │
-repositorio  (SQL, PostgreSQL)                               ← traduce errores de PostgreSQL → apperr
-   │
-dominio      (entidades y reglas puras, sin dependencias)    ← crea errores apperr
-```
-
-`apperr` no depende de ninguna capa; todas pueden usarlo.
+| Interfaz implícita | Un tipo implementa una interfaz con solo tener sus métodos. |
+| Función anónima | `func(c *gin.Context) { ... }` escrita donde se usa. |
+| `_ =` | Descarta un valor de forma explícita. |
+| Literal de slice vacío | `[]modulo{}`: lista vacía de módulos. |
+| `io.Discard` | Destino de escritura que descarta todo. |
+| `map[string]bool` | Mapa (diccionario) de texto a booleano; un valor ausente devuelve `false`. |
+| `if inicio; condición` | Un `if` puede ejecutar una instrucción antes de evaluar la condición. |
+| `t.Run` | Subprueba con nombre propio dentro de una prueba. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
-El paquete aún no tiene consumidores; se valida compilando y con el lint:
-
 ```bash
-cd backend
-go build ./...
-go vet ./...
-```
+make pruebas                     # o: cd backend && go test ./...
+docker compose up --build -d --wait
+curl -i http://localhost:8080/no-existe
+curl -i -X DELETE http://localhost:8080/salud
+docker compose logs api | grep petición
 
-o `make lint` desde la raíz. Sus funciones se ejercitan en las pruebas de los pasos 11 en adelante.
+# CORS: con CORS_ORIGENES=http://localhost:5173 en el .env (y docker compose up -d api)
+curl -i -X OPTIONS http://localhost:8080/salud -H "Origin: http://localhost:5173" -H "Access-Control-Request-Method: GET"
+# HTTP/1.1 204 No Content
+# Access-Control-Allow-Origin: http://localhost:5173
+# Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE
+```
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 8
+## 6. Pasos para lograr esta versión desde el paso 9
 
-1. Crear `backend/internal/apperr/apperr.go` con:
-   - el tipo `Tipo` y las 7 constantes;
-   - el struct `Error` y sus métodos `Error()` y `Unwrap()`;
-   - la función privada `nuevo` y las constructoras `Validacion`, `NoAutenticado`, `Prohibido`, `NoEncontrado`, `Conflicto`, `ReglaNegocio` e `Interno`;
-   - `TipoDe` y `Es`.
-2. `make lint` (o `go vet ./...`).
-3. Commit: `git add . && git commit -m "Paso 9: errores de aplicación"`
+1. Crear `backend/internal/handler/respuestas.go` con el comentario del paquete y `RespuestaError`.
+2. En `backend/internal/handler/router.go`, quitar el comentario del paquete (ahora está en `respuestas.go`).
+3. Crear `backend/internal/handler/middleware.go` con `RegistrarPeticiones` y `CORS` (secciones 3.2 y 3.3).
+4. En `config.go`: el campo `OrigenesCORS`, su carga con `lista("CORS_ORIGENES")` y la función `lista`. En `config_test.go`, `TestListaSeparaPorComas`.
+5. En `.env.example`, después de `NGINX_PUERTO`, la variable `CORS_ORIGENES` con su comentario.
+6. Modificar `router.go`:
+   - campos `OrigenesCORS []string` y `Log *slog.Logger` en `Dependencias`;
+   - interfaz `modulo`;
+   - en `NuevoRouter`: `Use(Recovery, RegistrarPeticiones, CORS)`, `SetTrustedProxies`, `NoRoute`, `NoMethod`, `HandleMethodNotAllowed`, grupo `/api/v1` y la lista de módulos.
+7. En `router_test.go`: variable `logPrueba`, `Log: logPrueba` en `nuevoEntorno` y las pruebas `TestRutaInexistenteYMetodoNoPermitido` y `TestCORS`.
+8. En `backend/cmd/api/main.go`: `OrigenesCORS: cfg.OrigenesCORS` y `Log: log` dentro de `handler.Dependencias{...}`.
+9. `make lint pruebas` y commit: `git add . && git commit -m "Paso 10: router por módulos y middleware de registro"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- Si en entregas futuras aparece otra forma de exponer el sistema (por ejemplo, funciones serverless en la Entrega 4, o colas que reciben mensajes), los servicios seguirán devolviendo los mismos errores y solo esa nueva capa decidirá cómo presentarlos.
+- **Proxies de confianza en redes privadas:** en GCP, el balanceador de carga y las VM están en redes privadas (`10.x.x.x`), así que la API ya registrará la IP real de los usuarios sin cambios.
+- **Duración por petición en los logs:** durante las pruebas de carga se puede cruzar con lo que mide la herramienta de carga para saber si el tiempo se va en la API o en la red.
+- **Versión en la ruta (`/api/v1`):** el frontend de la Entrega 2 dependerá de esta API; si hiciera falta un cambio incompatible, puede convivir una `v2`.
+- **CORS listo para el frontend:** en la Entrega 2 basta con poner en `CORS_ORIGENES` la dirección desde la que se sirva el frontend (el servidor de desarrollo, como `http://localhost:5173`, o el bucket de Cloud Storage). En la Entrega 4, el frontend llamará a la URL de Cloud Run y se configura igual.
 
 ---
 
@@ -199,6 +310,7 @@ o `make lint` desde la raíz. Sus funciones se ejercitan en las pruebas de los p
 
 | Requisito | Cómo |
 |---|---|
-| RNF-05 Mantenibilidad | Errores con un vocabulario común entre capas. |
-| RNF-06 Consistencia | Las reglas de negocio violadas se distinguen de los datos inválidos (422 frente a 400). |
-| RNF-03 Seguridad básica | El mensaje para el cliente está separado de la causa técnica, que no se expone. |
+| RNF-05 Mantenibilidad | Módulos con registro de rutas propio; comportamiento común en middleware. |
+| RNF-01 Backend sólido | Errores uniformes en JSON; 405 cuando corresponde. |
+| Arquitectura §4 (Nginx delante de la API) | IP real del cliente a través del proxy, sin aceptar cabeceras falsas. |
+| Entregas 2 y 4: frontend conectado al backend | CORS configurable por variable de entorno. |

@@ -51,6 +51,8 @@ func ejecutar(log *slog.Logger) error {
 
 	// Capa de presentación
 	router := handler.NuevoRouter(handler.Dependencias{
+		OrigenesCORS: cfg.OrigenesCORS,
+		Log:          log,
 		Salud: map[string]handler.ComprobadorSalud{
 			"postgres": db.Ping,
 		},
