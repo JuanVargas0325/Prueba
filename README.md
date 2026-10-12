@@ -1,177 +1,150 @@
-# Paso 45 · Dominio: lotes y reportes
+# Paso 46 · Repositorio de reportes
 
-> Rama `paso-a-paso` · paso 45 de 65 · anterior: **Paso 44 · Endpoints de seguimiento** · siguiente: **Paso 46 · Repositorio de reportes**
+> Rama `paso-a-paso` · paso 46 de 65 · anterior: **Paso 45 · Dominio de lotes y reportes** · siguiente: **Paso 47 · Cola de tareas con Asynq y Redis**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Comienza el último módulo funcional: los **reportes semanales con IA**. Este paso modela sus conceptos en el dominio.
+Se creó el repositorio de lotes y reportes (tablas `lotes_reportes` y `reportes_semanales`) y la consulta que reúne los datos de la semana de una persona para su reporte.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/dominio/reporte.go` | **Nuevo.** Estados y entidades de `LoteReportes` y `ReporteSemanal`, el resultado de una generación, los filtros y los **datos de entrada** del reporte (`DatosSemanaPersona`) con sus totales. |
-| `backend/internal/dominio/semana_test.go` | **Modificado.** `TestTotalesDatosSemana`. |
+| `backend/internal/repositorio/reportes.go` | **Nuevo.** Lotes (`CrearLote`, `ExisteLoteActivo`, `ObtenerLote`, `ListarLotes`, `IniciarLote`, `MarcarLoteFallido`), reportes (`ListarPersonasParaReporte`, `CrearReportesPendientes`, `ObtenerReporte`, `ListarReportes`, `MarcarReporteEnProceso`, `CompletarReporte`, `FallarReporte`) y datos de la semana (`ObtenerDatosSemana`). |
+| `backend/internal/repositorio/comun.go` | **Modificado.** Constantes `recursoLote`, `recursoLotes`, `recursoReporte` y `recursoReportes` (el bloque queda completo). |
 
 ---
 
 ## 2. Por qué
 
-**RF-14** pide: generar los reportes **manualmente por lotes** (14.1), **uno por persona** (14.2), usando **solo** tareas, descripciones, observaciones y horas (14.3), en **PDF** (14.4), **almacenarlos** (14.5) para **descargarlos** después (14.6), **para una semana concreta** (14.7). Las reglas RN-41 a RN-46 agregan que el reporte **sintetiza, no evalúa**.
-
-Generar un reporte con IA tarda segundos o más, y un profesor puede tener muchas personas a cargo. Por eso el diseño es **asíncrono**: la API registra un **lote** y responde de inmediato; un **worker** (paso 55) genera los reportes en segundo plano y va actualizando sus estados. Para eso hacen falta estados claros.
+La generación asíncrona (pasos 48 a 55) tiene una dificultad especial: **varios workers** pueden procesar reportes del mismo lote **al mismo tiempo**, y la cola puede **reintentar** o **entregar dos veces** el mismo trabajo. El repositorio debe garantizar que, pase lo que pase:
+- no se creen reportes duplicados;
+- un reporte terminado no se cuente dos veces;
+- el lote llegue a su estado final correcto exactamente una vez.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Estados del lote
+### 3.1 Lotes
 
 ```go
-type EstadoLote string
-
-const (
-	LotePendiente            EstadoLote = "pendiente"
-	LoteEnProceso            EstadoLote = "en_proceso"
-	LoteCompletado           EstadoLote = "completado"
-	LoteCompletadoConErrores EstadoLote = "completado_con_errores"
-	LoteFallido              EstadoLote = "fallido"
-)
-
-func (e EstadoLote) EstaActivo() bool {
-	return e == LotePendiente || e == LoteEnProceso
+func (r *Reportes) ExisteLoteActivo(ctx context.Context, profesorID string, semana time.Time) (bool, error) {
+	... SELECT EXISTS (... WHERE profesor_id = $1 AND semana_inicio = $2 AND estado IN ('pendiente', 'en_proceso')) ...
 }
 ```
-
-```
-pendiente ──► en_proceso ──► completado               (todos bien)
-    │              ├──────► completado_con_errores   (algunos fallaron)
-    │              └──────► fallido                  (todos fallaron)
-    └─────────────────────► fallido                  (no se pudo ni empezar)
-```
-- `EstaActivo`: un lote que todavía se procesa. Se usa para no lanzar dos lotes de la misma semana a la vez (paso 48) y para no reprocesar uno terminado (paso 54).
-
-### 3.2 Estados del reporte
+- Para impedir que un profesor lance dos lotes de la misma semana a la vez (paso 48).
 
 ```go
-type EstadoReporte string
-
-const (
-	ReportePendiente  EstadoReporte = "pendiente"
-	ReporteEnProceso  EstadoReporte = "en_proceso"
-	ReporteCompletado EstadoReporte = "completado"
-	ReporteFallido    EstadoReporte = "fallido"
-)
-
-func (e EstadoReporte) EsFinal() bool {
-	return e == ReporteCompletado || e == ReporteFallido
-}
-```
-- `EsFinal`: un reporte terminado (bien o mal) no se vuelve a generar si la cola entrega el trabajo dos veces.
-
-### 3.3 Entidades
-
-```go
-type LoteReportes struct {
-	ID                  string
-	ProfesorID          string
-	SemanaInicio        time.Time
-	Estado              EstadoLote
-	TotalReportes       int
-	ReportesCompletados int
-	ReportesFallidos    int
-	Error               string
-	CreadoEn            time.Time
-	ActualizadoEn       time.Time
-	FinalizadoEn        *time.Time
-}
-```
-- Los contadores permiten mostrar el avance ("7 de 10 listos").
-- `FinalizadoEn *time.Time`: puntero porque **puede no existir** (un lote en proceso no tiene fecha de fin). En JSON será `null`.
-
-```go
-type ReporteSemanal struct {
-	ID            string
-	LoteID        string
-	ProfesorID    string
-	UsuarioID     string
-	Persona       string // nombre de la persona reportada
-	SemanaInicio  time.Time
-	Estado        EstadoReporte
-	Resumen       string
-	RutaPDF       string
-	TamanoBytes   int64
-	Intentos      int
-	Error         string
-	ProveedorIA   string
-	ModeloIA      string
+func (r *Reportes) IniciarLote(ctx context.Context, id string, total int) error {
+	_, err := r.db.Exec(ctx,
+		`UPDATE lotes_reportes SET
+			total_reportes = $2,
+			estado = CASE WHEN $2 = 0 THEN 'completado' ELSE 'en_proceso' END,
+			finalizado_en = CASE WHEN $2 = 0 THEN now() ELSE NULL END,
+			actualizado_en = now()
+		 WHERE id = $1 AND estado IN ('pendiente', 'en_proceso')`, id, total)
 	...
-	GeneradoEn    *time.Time
 }
 ```
-- Guarda el **resumen** generado (para mostrarlo sin abrir el PDF), la **ruta del PDF** en el almacenamiento (paso 38), los **intentos** (la cola reintenta ante errores transitorios), el **error** si falló y **qué proveedor y modelo de IA** lo generaron (trazabilidad).
+- `CASE WHEN ... THEN ... ELSE ... END` es el "if" de SQL. Un lote sin personas queda **completado** de inmediato.
+- `WHERE ... estado IN ('pendiente', 'en_proceso')`: no modifica lotes ya terminados (si el trabajo se reintenta).
+
+### 3.2 ¿A quién se le hace reporte?
 
 ```go
-type ResultadoReporte struct {
-	Resumen     string
-	RutaPDF     string
-	TamanoBytes int64
-	ProveedorIA string
-	ModeloIA    string
+func (r *Reportes) ListarPersonasParaReporte(ctx context.Context, profesorID string, inicio, fin time.Time) ([]string, error) {
+	... SELECT DISTINCT v.usuario_id::text
+	    FROM vinculaciones v JOIN espacios e ON e.id = v.espacio_id
+	    WHERE e.profesor_id = $1 AND e.fecha_inicio <= $3 AND e.fecha_cierre >= $2 ...
 }
 ```
-- Lo que se guarda cuando un reporte se genera con éxito, agrupado en un solo valor.
+- **RF-14.2:** un reporte por cada persona vinculada a algún espacio del profesor que estuvo vigente **esa semana** (intersección de fechas). `DISTINCT` evita repetir a quien está en dos espacios del mismo profesor.
+- `::text` convierte el UUID a texto en SQL.
 
-### 3.4 Los datos de entrada del reporte
+### 3.3 Crear reportes de forma idempotente
 
 ```go
-// TareaSemana es la información de una tarea que alimenta el reporte.
-// Solo contiene los insumos permitidos por RF-14.3 / RN-43.
-type TareaSemana struct {
-	Titulo        string
-	Descripcion   string
-	Estado        EstadoTarea
-	Horas         int
-	Observaciones string
-	Tardia        bool
-}
-
-type VinculacionSemana struct {
-	EspacioNombre    string
-	EspacioTipo      TipoEspacio
-	Rol              Rol
-	HorasContratadas int
-	Tareas           []TareaSemana
-}
-
-type DatosSemanaPersona struct {
-	UsuarioID     string
-	Persona       string
-	Correo        string
-	ProfesorID    string
-	Profesor      string
-	SemanaInicio  time.Time
-	Vinculaciones []VinculacionSemana
+func (r *Reportes) CrearReportesPendientes(ctx context.Context, loteID, profesorID string, semana time.Time, usuarioIDs []string) ([]string, error) {
+	if len(usuarioIDs) > 0 {
+		_, err := r.db.Exec(ctx,
+			`INSERT INTO reportes_semanales (lote_id, profesor_id, usuario_id, semana_inicio)
+			 SELECT $1, $2, u, $3 FROM unnest($4::uuid[]) AS u
+			 ON CONFLICT (lote_id, usuario_id) DO NOTHING`, ...)
+		...
+	}
+	filas, err := r.db.Query(ctx, `SELECT id::text FROM reportes_semanales WHERE lote_id = $1 ORDER BY creado_en, id`, loteID)
+	...
 }
 ```
-- **Tipos propios, no `dominio.Tarea`:** `TareaSemana` tiene **exactamente** los insumos que permite RF-14.3. Así es imposible que, por descuido, se le envíe a la IA un dato que no corresponde (por ejemplo, IDs internos). El diseño de los tipos **hace cumplir el requisito**.
-- `Persona`, `Correo` y `Profesor` se usan en el encabezado del **PDF**, pero **no se envían al modelo** (paso 51).
+- `unnest($4::uuid[])` convierte el arreglo de IDs en filas; un solo `INSERT` crea todos los reportes.
+- `ON CONFLICT (lote_id, usuario_id) DO NOTHING`: si el trabajo se ejecuta **dos veces**, la segunda no crea duplicados (usa el `UNIQUE` del paso 4). Esto es **idempotencia**: repetir la operación da el mismo resultado.
+- Devuelve **todos** los reportes del lote (también los de una ejecución anterior), para encolarlos (paso 54).
+
+### 3.4 Terminar un reporte y actualizar el lote en la misma transacción
 
 ```go
-func (d DatosSemanaPersona) SemanaFin() time.Time { return FinSemana(d.SemanaInicio) }
-func (d DatosSemanaPersona) TotalTareas() int { ... }
-func (d DatosSemanaPersona) TotalHoras() int { ... }
-func (v VinculacionSemana) HorasReportadas() int { ... }
+func (r *Reportes) CompletarReporte(ctx context.Context, id string, res dominio.ResultadoReporte) error {
+	return r.finalizarReporte(ctx,
+		`UPDATE reportes_semanales SET estado = 'completado', resumen = $2, ruta_pdf = $3, ...
+		 WHERE id = $1 AND estado NOT IN ('completado', 'fallido')
+		 RETURNING lote_id`,
+		[]any{id, res.Resumen, ...}, 1, 0)
+}
+
+func (r *Reportes) FallarReporte(ctx context.Context, id, motivo string) error {
+	return r.finalizarReporte(ctx, `UPDATE ... SET estado = 'fallido', error = $2 ... RETURNING lote_id`, ..., 0, 1)
+}
 ```
-- Totales calculados que usarán el prompt, el modo simulado y el PDF.
 
-### 3.5 Filtros
+```go
+func (r *Reportes) finalizarReporte(ctx context.Context, sqlReporte string, args []any, completados, fallidos int) error {
+	return enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
+		var loteID string
+		err := tx.QueryRow(ctx, sqlReporte, args...).Scan(&loteID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // el reporte ya estaba en un estado final: nada que hacer
+		}
+		...
+		_, err = tx.Exec(ctx,
+			`UPDATE lotes_reportes l SET
+				reportes_completados = l.reportes_completados + $2,
+				reportes_fallidos    = l.reportes_fallidos + $3,
+				estado = CASE
+					WHEN l.estado = 'en_proceso'
+					 AND l.reportes_completados + $2 + l.reportes_fallidos + $3 >= l.total_reportes THEN
+						CASE
+							WHEN l.reportes_fallidos + $3 = 0 THEN 'completado'
+							WHEN l.reportes_completados + $2 = 0 THEN 'fallido'
+							ELSE 'completado_con_errores'
+						END
+					ELSE l.estado
+				END,
+				finalizado_en = ...
+			 WHERE l.id = $1`, loteID, completados, fallidos)
+		...
+	})
+}
+```
+- **Paso 1:** cambia el estado del reporte **solo si no estaba terminado** (`estado NOT IN (...)`). Si ya lo estaba, `RETURNING` no devuelve filas → `ErrNoRows` → no hace nada. Así un trabajo repetido **no cuenta dos veces**.
+- **Paso 2:** en la misma transacción suma 1 al contador correspondiente del lote y, si ya terminaron todos, fija el estado final: **completado** (ningún fallo), **fallido** (ningún éxito) o **completado con errores**.
+- **¿Por qué no hay carreras con varios workers?** El `UPDATE` del lote **bloquea su fila** hasta el final de la transacción. Si dos workers terminan reportes del mismo lote a la vez, PostgreSQL ejecuta esas dos actualizaciones **una después de la otra**, y cada una ve los contadores ya sumados por la anterior. Es el mismo principio del paso 31, pero con el bloqueo implícito del `UPDATE`.
+- Todo el cálculo ocurre **dentro de la base de datos** (`l.reportes_completados + $2`): no se lee el valor en Go para sumarle 1 y escribirlo (eso sí tendría carreras).
+- Los mensajes de error se recortan con `recortarTexto` (paso 31).
 
-`FiltroLotes` (por profesor y semana) y `FiltroReportes` (por profesor, persona, lote y semana), ambos con `Paginacion`.
+### 3.5 Los datos de la semana para el reporte
 
-### 3.6 Prueba
-
-`TestTotalesDatosSemana`: dos vinculaciones con tareas de 2, 3 y 4 h → 3 tareas, 9 horas y la semana termina el domingo 11/10.
+```go
+func (r *Reportes) ObtenerDatosSemana(ctx context.Context, profesorID, usuarioID string, semana time.Time) (dominio.DatosSemanaPersona, error) {
+	... 1) nombre y correo de la persona y nombre del profesor ...
+	... 2) vinculaciones de la persona en espacios del profesor vigentes esa semana ...
+	... 3) tareas de esas vinculaciones en esa semana ...
+}
+```
+- **RF-14.3:** solo lee los insumos permitidos (título, descripción, estado, horas, observaciones, si fue tardía), en los tipos del paso 45.
+- **Solo los espacios de ese profesor:** si Laura trabaja con dos profesores, cada uno recibe un reporte con **su** parte (RN-03).
+- Para la tercera consulta usa `= ANY($1::uuid[])` (paso 42) y un **mapa** `idVinculación → posición` para repartir cada tarea en su vinculación en una sola pasada.
+- `type fila struct{...}` dentro de la función: un **tipo local**, visible solo ahí, para leer la consulta intermedia.
 
 ---
 
@@ -179,37 +152,49 @@ func (v VinculacionSemana) HorasReportadas() int { ... }
 
 | Concepto | Explicación |
 |---|---|
-| Máquina de estados | Valores posibles y transiciones permitidas, documentadas en el tipo. |
-| Puntero para "puede no existir" | `*time.Time` (en JSON, `null`). |
-| Tipos que hacen cumplir requisitos | `TareaSemana` solo tiene los campos permitidos para la IA. |
-| Procesamiento asíncrono | Registrar el trabajo, responder de inmediato y procesar después. |
+| Idempotencia | Repetir un trabajo no duplica ni cuenta dos veces (`ON CONFLICT DO NOTHING`, `WHERE estado NOT IN`). |
+| `CASE WHEN` | Condicionales dentro de SQL. |
+| `unnest(arreglo)` | Convierte un arreglo en filas. |
+| Bloqueo implícito del `UPDATE` | Serializa actualizaciones concurrentes de la misma fila. |
+| Aritmética en la base de datos | `x = x + 1` en SQL, nunca "leer, sumar y escribir" en la aplicación. |
+| Tipo local | `type fila struct{...}` declarado dentro de una función. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/dominio/ -v -run TestTotalesDatosSemana
+make lint
 ```
 
----
-
-## 6. Pasos para lograr esta versión desde el paso 44
-
-1. Crear `backend/internal/dominio/reporte.go` con los estados (y `EstaActivo`, `EsFinal`), `LoteReportes`, `ReporteSemanal`, `ResultadoReporte`, `FiltroLotes`, `FiltroReportes`, `TareaSemana`, `VinculacionSemana`, `DatosSemanaPersona` y los métodos de totales.
-2. En `semana_test.go`: `TestTotalesDatosSemana`.
-3. `make pruebas lint`
-4. Commit: `git add . && git commit -m "Paso 45: dominio de lotes y reportes"`
+En el paso 58, contra PostgreSQL:
+- `TestCreacionDeLoteDeReportes`: un lote con 2 personas crea 2 reportes; el lote en proceso cuenta como activo; repetir la creación **no duplica**; los datos de la semana de Laura traen 1 tarea, 3 horas, su nombre y el del profesor.
+- `TestFinalizacionDeReportes`: un reporte completado (completarlo **dos veces** no cuenta dos veces) y otro fallido dejan el lote en `completado_con_errores`, con 1 y 1 en los contadores y fecha de finalización; el reporte completado tiene 1 intento y su ruta de PDF.
 
 ---
 
-## 7. Requisitos que atiende
+## 6. Pasos para lograr esta versión desde el paso 45
+
+1. En `repositorio/comun.go`, completar el bloque con `recursoLote = "lote de reportes"`, `recursoLotes = "lotes de reportes"`, `recursoReporte = "reporte"` y `recursoReportes = "reportes"`.
+2. Crear `backend/internal/repositorio/reportes.go` con las secciones de lotes, reportes y datos de la semana.
+3. `make lint`
+4. Commit: `git add . && git commit -m "Paso 46: repositorio de reportes"`
+
+---
+
+## 7. Preparación para las próximas entregas
+
+- **Seguro con varios workers:** en la Entrega 3 se podrá escalar el número de workers (o usar más concurrencia) sin cambiar este código: la consistencia la garantiza PostgreSQL.
+- **Idempotente ante reintentos:** encaja con cualquier cola con entrega "al menos una vez" (Asynq aquí; Pub/Sub o Cloud Tasks en la Entrega 4).
+
+---
+
+## 8. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-14.1 Ejecución por lotes | `LoteReportes` con estados y contadores. |
-| RF-14.2 Un reporte por persona | `ReporteSemanal`. |
-| RF-14.3 / RN-43 Solo insumos permitidos | `TareaSemana`. |
-| RF-14.5 / RF-14.6 Almacenar y descargar | `RutaPDF`. |
-| RF-14.7 Una semana concreta | `SemanaInicio`. |
+| RF-14.1 Ejecución por lotes | Lotes con estado y contadores, sin duplicar lotes activos. |
+| RF-14.2 Un reporte por persona | `ListarPersonasParaReporte` + `CrearReportesPendientes` idempotente. |
+| RF-14.3 / RN-43 Insumos permitidos | `ObtenerDatosSemana` solo lee esos campos. |
+| RF-14.5 Almacenar | Ruta y tamaño del PDF en `CompletarReporte`. |
+| RF-14.7 Semana concreta | Todas las consultas son por semana. |

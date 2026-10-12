@@ -39,6 +39,10 @@ const (
 	recursoTareas        = "tareas"
 	recursoAdjunto       = "adjunto"
 	recursoAdjuntos      = "adjuntos"
+	recursoLote          = "lote de reportes"
+	recursoLotes         = "lotes de reportes"
+	recursoReporte       = "reporte"
+	recursoReportes      = "reportes"
 )
 
 // enTransaccion ejecuta fn dentro de una transacción: confirma si fn termina
