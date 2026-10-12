@@ -1,0 +1,21 @@
+# Secretos y configuración local
+.env
+*.env.local
+
+# Resultados de compilación y pruebas
+backend/coverage.out
+backend/bin/
+# Binarios que genera go build en la carpeta actual
+backend/api
+backend/worker
+*.test
+
+# Archivos generados localmente
+data/
+*.pdf
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
