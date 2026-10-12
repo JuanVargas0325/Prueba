@@ -1,334 +1,272 @@
-# Paso 17 · Endpoints de inicio de sesión
+# Paso 18 · Servicio de gestión de usuarios
 
-> Rama `paso-a-paso` · paso 17 de 65 · anterior: **Paso 16 · Middleware de autenticación** · siguiente: **Paso 18 · Servicio de gestión de usuarios**
+> Rama `paso-a-paso` · paso 18 de 65 · anterior: **Paso 17 · Endpoints de inicio de sesión** · siguiente: **Paso 19 · Endpoints de usuarios**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-La API tiene sus **primeros endpoints de negocio**:
-
-| Método | Ruta | Acceso | Descripción |
-|---|---|---|---|
-| POST | `/api/v1/auth/login` | público | Recibe correo y contraseña; devuelve un token JWT y los datos del usuario. |
-| GET | `/api/v1/auth/yo` | con token | Devuelve el usuario autenticado. |
+Se creó el caso de uso con el que el **administrador** gestiona usuarios: crear, listar, consultar y asignar roles.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/handler/autenticacion.go` | **Nuevo.** El primer **módulo** del handler: interfaz del servicio, formatos JSON y los endpoints `Login` y `Yo`. |
-| `backend/internal/handler/formatos.go` | **Nuevo.** Formatos JSON compartidos entre módulos; por ahora `usuarioJSON`. |
-| `backend/internal/handler/respuestas.go` | **Modificado.** Traducción de `apperr` a códigos HTTP (`responderError`) y lectura estricta de JSON (`leerJSON`). |
-| `backend/internal/handler/router.go` | **Modificado.** Rutas públicas y grupo de rutas protegidas con `Autenticar`. |
-| `backend/internal/handler/router_test.go` | **Modificado.** Gestor de tokens de prueba, `peticion` acepta un token y nueva prueba de rutas protegidas. |
-| `backend/cmd/api/main.go` | **Modificado.** Entrega el servicio de autenticación y el gestor de tokens al router. |
-
-```bash
-curl -X POST http://localhost:8080/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"correo":"admin@uniandes.edu.co","password":"cambie-esta-clave"}'
-# {"token":"eyJhbGciOi...","expira_en":"2026-10-12T08:59:00Z","usuario":{"id":"f7c5...","nombre":"Administrador",
-#  "correo":"admin@uniandes.edu.co","activo":true,"roles":["administrador"],"creado_en":"..."}}
-
-curl http://localhost:8080/api/v1/auth/yo -H "Authorization: Bearer eyJhbGciOi..."
-```
+| `backend/internal/servicio/usuarios.go` | **Nuevo.** Servicio `Usuarios` con `Crear`, `Listar`, `Obtener` y `AsignarRoles`. |
+| `backend/internal/servicio/acceso.go` | **Nuevo.** Primeras reglas de acceso compartidas: `exigirRol` y `noEncontrado`. |
+| `backend/internal/servicio/modulos_test.go` | **Nuevo.** Pruebas de los servicios de gestión (por ahora, usuarios) con un repositorio falso. |
+| `backend/internal/servicio/autenticacion_test.go` | **Modificado.** Agrega los actores de prueba (`admin`, `profesor`, `monitor`). |
 
 ---
 
 ## 2. Por qué
 
-- **RF-01.1 Inicio de sesión local.** Con este paso un usuario ya puede autenticarse y usar el token en las demás rutas.
-- **La estructura de un módulo queda fijada.** Todos los módulos siguientes (usuarios, períodos, espacios, vinculaciones, tareas, seguimiento, reportes) tendrán exactamente la misma forma (sección 3.1).
-- **Errores consistentes:** desde ahora cualquier error de un servicio se responde con el código HTTP correcto y el formato `{"error", "mensaje"}`.
+- **RF-02.1, RF-02.2, RF-02.3 y RF-15.2:** el administrador crea usuarios, les asigna uno o varios roles y consulta a todos los usuarios del sistema.
+- **Los permisos se verifican en el servicio**, no solo en el router. El router (paso 19) también los exigirá, pero si mañana se agrega otra forma de llamar al servicio, la regla sigue protegida. Es **defensa en profundidad**.
+- **Evitar inconsistencias:** quitarle a alguien el rol de monitor mientras tiene monitorías activas dejaría vinculaciones huérfanas. El servicio lo impide.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Anatomía de un módulo (`autenticacion.go`)
-
-**1) La interfaz del servicio que necesita** (declarada aquí, como en el paso 14):
+### 3.1 `acceso.go`
 
 ```go
-type ServicioAutenticacion interface {
-	IniciarSesion(ctx context.Context, correo, password string) (servicio.Sesion, error)
-	UsuarioActual(ctx context.Context, actor auth.Actor) (dominio.Usuario, error)
-}
-```
+// Reglas de visibilidad compartidas por los servicios (RF-12, RN-03 a RN-05).
+// La capa de presentación ya filtra por rol; aquí se verifica la pertenencia
+// de cada dato, para que la regla se cumpla aunque cambie la capa HTTP.
 
-**2) El struct del handler**, con su servicio y su logger:
-
-```go
-type HandlerAutenticacion struct {
-	servicio ServicioAutenticacion
-	log      *slog.Logger
-}
-```
-
-**3) Los formatos de entrada y salida** (DTO, *Data Transfer Objects*):
-
-```go
-type peticionLogin struct {
-	Correo   string `json:"correo"`
-	Password string `json:"password"`
-}
-
-type respuestaLogin struct {
-	Token    string      `json:"token"`
-	ExpiraEn time.Time   `json:"expira_en"`
-	Usuario  usuarioJSON `json:"usuario"`
-}
-```
-- `time.Time` se convierte automáticamente al formato estándar RFC 3339 (`2026-10-12T08:59:00Z`).
-
-**4) El registro de rutas:**
-
-```go
-func (h *HandlerAutenticacion) RegistrarPublicas(g *gin.RouterGroup) {
-	g.POST("/auth/login", h.Login)
-}
-
-func (h *HandlerAutenticacion) Registrar(g *gin.RouterGroup) {
-	g.GET("/auth/yo", h.Yo)
-}
-```
-- Este módulo es especial: tiene una ruta **pública** (no se puede pedir un token para obtener el token). `Registrar` es el método de la interfaz `modulo` (paso 10) y recibe el grupo protegido.
-- `h.Login` es un **método usado como valor** (como `db.Ping` en el paso 3).
-
-**5) Los endpoints:**
-
-```go
-func (h *HandlerAutenticacion) Login(c *gin.Context) {
-	var p peticionLogin
-	if err := leerJSON(c, &p); err != nil {
-		responderError(c, h.log, err)
-		return
+func exigirRol(actor auth.Actor, roles ...dominio.Rol) error {
+	if !actor.TieneAlgunRol(roles...) {
+		return apperr.Prohibido("no tiene permiso para esta operación")
 	}
-	sesion, err := h.servicio.IniciarSesion(c.Request.Context(), p.Correo, p.Password)
-	if err != nil {
-		responderError(c, h.log, err)
-		return
-	}
-	c.JSON(http.StatusOK, respuestaLogin{Token: sesion.Token, ExpiraEn: sesion.ExpiraEn, Usuario: aUsuarioJSON(sesion.Usuario)})
+	return nil
+}
+
+func noEncontrado(recurso string) error {
+	return apperr.NoEncontrado("%s no encontrado", recurso)
 }
 ```
-- El patrón de **todo** endpoint: (1) leer y validar la entrada; (2) llamar al servicio con el contexto de la petición y el actor; (3) traducir el resultado o el error a HTTP. **El handler no tiene lógica de negocio.**
-- `c.Request.Context()`: si el cliente cierra la conexión, ese contexto se cancela y las consultas a la base de datos se abortan, sin trabajar para nadie.
+- `exigirRol`: 403 si el actor no tiene ninguno de los roles.
+- `noEncontrado`: se usa **en lugar de 403** cuando el actor ni siquiera debe saber que el recurso existe. Si un monitor pide `/usuarios/{id}` de otra persona, recibe "usuario no encontrado", no "no tiene permiso" (que confirmaría que ese ID existe).
+- Este archivo crecerá con las reglas de visibilidad por profesor (paso 28).
+
+### 3.2 `usuarios.go`
+
+#### La interfaz que necesita
 
 ```go
-func (h *HandlerAutenticacion) Yo(c *gin.Context) {
-	u, err := h.servicio.UsuarioActual(c.Request.Context(), ActorDe(c))
+type RepositorioGestionUsuarios interface {
+	BuscarPorID(ctx context.Context, id string) (dominio.Usuario, error)
+	Crear(ctx context.Context, u dominio.Usuario) (dominio.Usuario, error)
+	Listar(ctx context.Context, f dominio.FiltroUsuarios) ([]dominio.Usuario, error)
+	ReemplazarRoles(ctx context.Context, usuarioID string, roles []dominio.Rol) error
+	TieneVinculacionesActivas(ctx context.Context, usuarioID string, rol dominio.Rol) (bool, error)
+	TieneEspaciosActivos(ctx context.Context, usuarioID string) (bool, error)
+}
+```
+- Es **otra** interfaz sobre el mismo repositorio del paso 13, con otros métodos. Cada servicio pide solo lo que usa.
+
+```go
+type NuevoUsuario struct {
+	Nombre   string
+	Correo   string
+	Password string
+	Roles    []dominio.Rol
+}
+```
+- Datos de entrada del caso de uso (todavía sin validar).
+
+#### `Crear`
+
+```go
+func (s *Usuarios) Crear(ctx context.Context, actor auth.Actor, n NuevoUsuario) (dominio.Usuario, error) {
+	if err := exigirRol(actor, dominio.RolAdministrador); err != nil {
+		return dominio.Usuario{}, err
+	}
+	nombre, err := dominio.Texto("el nombre", n.Nombre, true, dominio.LongitudMaxNombre)
 	...
-	c.JSON(http.StatusOK, aUsuarioJSON(u))
+	correo, err := dominio.NormalizarCorreo(n.Correo)
+	...
+	if err := dominio.ValidarPassword(n.Password); err != nil { ... }
+	roles, err := normalizarRoles(n.Roles)
+	...
+	hash, err := auth.HashPassword(n.Password)
+	if err != nil {
+		return dominio.Usuario{}, apperr.Interno(err, "no fue posible crear el usuario")
+	}
+	u, err := s.repo.Crear(ctx, dominio.Usuario{Nombre: nombre, Correo: correo, PasswordHash: hash, Activo: true, Roles: roles})
+	...
+	s.log.Info("usuario creado", "usuario_id", u.ID, "roles", roles, "por", actor.UsuarioID)
+	return u, nil
 }
 ```
-- `ActorDe(c)` toma el actor que dejó `Autenticar` (paso 16).
+- **Orden:** primero el permiso, luego las validaciones del dominio (paso 11), después el hash y por último la base de datos. Las validaciones baratas van antes que lo costoso (bcrypt).
+- Un correo repetido lo detecta el repositorio (409, paso 13).
+- El log de auditoría registra **quién** creó a quién, nunca la contraseña.
 
-### 3.2 `formatos.go`
-
-```go
-// Formatos JSON compartidos por varios módulos. Las entidades del dominio no
-// llevan etiquetas JSON: la forma de la API se define solo en esta capa.
-
-type usuarioJSON struct {
-	ID       string    `json:"id"`
-	Nombre   string    `json:"nombre"`
-	Correo   string    `json:"correo"`
-	Activo   bool      `json:"activo"`
-	Roles    []string  `json:"roles"`
-	CreadoEn time.Time `json:"creado_en"`
-}
-
-func aUsuarioJSON(u dominio.Usuario) usuarioJSON { ... }
-```
-- `usuarioJSON` **no tiene `PasswordHash`**. Como el dominio no se serializa directamente, es imposible que el hash termine en una respuesta por descuido.
-- Este archivo reúne los formatos que **varios** módulos reutilizan (por ejemplo, el usuario aparece en el login y en la gestión de usuarios del paso 19).
-
-### 3.3 `respuestas.go`: de `apperr` a HTTP
+#### `normalizarRoles`
 
 ```go
-var estadosPorTipo = map[apperr.Tipo]int{
-	apperr.TipoValidacion:    http.StatusBadRequest,          // 400
-	apperr.TipoNoAutenticado: http.StatusUnauthorized,        // 401
-	apperr.TipoProhibido:     http.StatusForbidden,           // 403
-	apperr.TipoNoEncontrado:  http.StatusNotFound,            // 404
-	apperr.TipoConflicto:     http.StatusConflict,            // 409
-	apperr.TipoReglaNegocio:  http.StatusUnprocessableEntity, // 422
-}
-
-func responderError(c *gin.Context, log *slog.Logger, err error) {
-	var e *apperr.Error
-	if errors.As(err, &e) {
-		if estado, ok := estadosPorTipo[e.Tipo]; ok {
-			c.AbortWithStatusJSON(estado, RespuestaError{Error: string(e.Tipo), Mensaje: e.Mensaje})
-			return
+func normalizarRoles(roles []dominio.Rol) ([]dominio.Rol, error) {
+	var resultado []dominio.Rol
+	for _, r := range roles {
+		if !r.EsValido() {
+			return nil, apperr.Validacion("rol inválido: %q", r)
+		}
+		if !slices.Contains(resultado, r) {
+			resultado = append(resultado, r)
 		}
 	}
-	var demasiadoGrande *http.MaxBytesError
-	if errors.As(err, &demasiadoGrande) {
-		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, RespuestaError{
-			Error: "demasiado_grande", Mensaje: "la petición supera el tamaño máximo permitido"})
-		return
+	if len(resultado) == 0 {
+		return nil, apperr.Validacion("el usuario debe tener al menos un rol")
 	}
-	log.Error("error interno", "ruta", c.FullPath(), "metodo", c.Request.Method, "error", err)
-	mensaje := "ocurrió un error inesperado"
-	if e != nil && e.Tipo == apperr.TipoInterno {
-		mensaje = e.Mensaje
-	}
-	c.AbortWithStatusJSON(http.StatusInternalServerError, RespuestaError{Error: string(apperr.TipoInterno), Mensaje: mensaje})
+	slices.Sort(resultado)
+	return resultado, nil
 }
 ```
-- **El único lugar** donde se decide el código HTTP de un error.
-- `estado, ok := mapa[clave]`: el `ok` dice si la clave existe.
-- **413 (petición demasiado grande):** si una lectura del cuerpo superó el límite (`http.MaxBytesError`). Se usará con los archivos adjuntos (paso 40).
-- **500:** cualquier otro error. Se **registra completo en el log** (con ruta y método), pero al cliente solo se le dice "ocurrió un error inesperado". Los detalles internos (consultas SQL, nombres de tablas) nunca se exponen. Si es un `apperr.Interno`, se usa su mensaje genérico.
+- Rechaza roles que no existen, **quita duplicados** (`["monitor","monitor"]` → `["monitor"]`), exige al menos uno y los **ordena** para que el resultado sea siempre igual.
+- `slices` es un paquete estándar (Go 1.21+) con funciones genéricas para listas: `Contains`, `Sort`, `Index`...
 
-### 3.4 `respuestas.go`: leer JSON de forma estricta
+#### `Listar` y `Obtener`
 
 ```go
-const maxCuerpoJSON = 1 << 20 // 1 MB
-
-func leerJSON(c *gin.Context, destino any) error {
-	return decodificarJSON(io.LimitReader(c.Request.Body, maxCuerpoJSON), destino)
+func (s *Usuarios) Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroUsuarios) ([]dominio.Usuario, error) {
+	if err := exigirRol(actor, dominio.RolAdministrador); err != nil { ... }
+	if f.Rol != "" && !f.Rol.EsValido() {
+		return nil, apperr.Validacion("rol inválido")
+	}
+	return s.repo.Listar(ctx, f)
 }
 
-func decodificarJSON(r io.Reader, destino any) error {
-	dec := json.NewDecoder(r)
-	dec.DisallowUnknownFields()
-	err := dec.Decode(destino)
-	if err == nil {
-		return nil
+func (s *Usuarios) Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Usuario, error) {
+	if !actor.EsAdministrador() && actor.UsuarioID != id {
+		return dominio.Usuario{}, noEncontrado("usuario")
 	}
-	var tipo *json.UnmarshalTypeError
+	return s.repo.BuscarPorID(ctx, id)
+}
+```
+- Listar es solo para el administrador (RF-02.3).
+- Obtener: el administrador ve a cualquiera; cualquier otro usuario solo a sí mismo; a los demás les "no existen".
+
+#### `AsignarRoles`
+
+```go
+func (s *Usuarios) AsignarRoles(ctx context.Context, actor auth.Actor, id string, roles []dominio.Rol) (dominio.Usuario, error) {
+	if err := exigirRol(actor, dominio.RolAdministrador); err != nil { ... }
+	roles, err := normalizarRoles(roles)
+	...
+	u, err := s.repo.BuscarPorID(ctx, id)
+	...
+	if id == actor.UsuarioID && !slices.Contains(roles, dominio.RolAdministrador) {
+		return u, apperr.ReglaNegocio("no puede quitarse a sí mismo el rol de administrador")
+	}
+	for _, anterior := range u.Roles {
+		if slices.Contains(roles, anterior) {
+			continue
+		}
+		if err := s.verificarRetiroDeRol(ctx, id, anterior); err != nil {
+			return u, err
+		}
+	}
+	if err := s.repo.ReemplazarRoles(ctx, id, roles); err != nil { ... }
+	...
+	return s.repo.BuscarPorID(ctx, id)
+}
+```
+- **Reemplaza** el conjunto completo de roles (RF-02.2).
+- **Protección contra quedarse sin administrador:** el administrador no puede quitarse a sí mismo su rol; de lo contrario, el sistema podría quedar sin nadie que gestione usuarios.
+- Para cada rol que se **retira**, `verificarRetiroDeRol` revisa si está en uso:
+
+```go
+func (s *Usuarios) verificarRetiroDeRol(ctx context.Context, usuarioID string, rol dominio.Rol) error {
+	var enUso bool
+	var err error
 	switch {
-	case errors.Is(err, io.EOF):
-		return apperr.Validacion("el cuerpo de la petición está vacío")
-	case errors.As(err, &tipo):
-		return apperr.Validacion("el campo %q tiene un tipo inválido (se esperaba %s)", tipo.Field, tipo.Type.String())
-	case strings.HasPrefix(err.Error(), "json: unknown field "):
-		return apperr.Validacion("campo desconocido %s", strings.TrimPrefix(err.Error(), "json: unknown field "))
-	default:
-		return apperr.Validacion("el cuerpo no es un JSON válido")
+	case rol.EsRolDeVinculacion():
+		enUso, err = s.repo.TieneVinculacionesActivas(ctx, usuarioID, rol)
+	case rol == dominio.RolProfesor:
+		enUso, err = s.repo.TieneEspaciosActivos(ctx, usuarioID)
 	}
+	...
+	if enUso {
+		return apperr.ReglaNegocio("no se puede quitar el rol %s: la persona lo usa en cursos o proyectos activos", rol.Texto())
+	}
+	return nil
 }
 ```
-- `1 << 20` es "1 desplazado 20 bits" = 1 048 576 bytes (1 MB). `io.LimitReader` corta la lectura ahí: nadie puede enviar un JSON gigante para agotar la memoria.
-- `DisallowUnknownFields()`: un campo que la API no conoce es un **error**. Si un cliente escribe `"clave"` en lugar de `"password"`, recibe "campo desconocido \"clave\"" en lugar de un login fallido sin explicación.
-- Los errores del decodificador se traducen a mensajes claros y siempre a **400**:
-  - cuerpo vacío;
-  - tipo equivocado: por ejemplo, `"horas_invertidas": 2.5` donde se espera un entero (`%q` pone el nombre entre comillas);
-  - campo desconocido;
-  - JSON mal formado.
-- `switch { case ...: }` sin expresión es un `if / else if` encadenado.
-- `decodificarJSON` está separada de `leerJSON` porque en el paso 40 se reutiliza para leer JSON que llega dentro de un formulario con archivos.
-
-```go
-func rolesTexto(roles []dominio.Rol) []string { ... }
-```
-- Convierte `[]dominio.Rol` a `[]string` para el JSON.
-
-### 3.5 `router.go`
-
-```go
-type Dependencias struct {
-	Autenticacion ServicioAutenticacion
-
-	Tokens ValidadorTokens
-	Salud  map[string]ComprobadorSalud
-	// OrigenesCORS son los orígenes de los frontends que pueden usar la API.
-	OrigenesCORS []string
-	Log          *slog.Logger
-}
-```
-
-```go
-	api := r.Group("/api/v1")
-	autenticacion := &HandlerAutenticacion{servicio: d.Autenticacion, log: d.Log}
-	autenticacion.RegistrarPublicas(api)
-
-	protegidas := api.Group("", Autenticar(d.Tokens))
-	modulos := []modulo{
-		autenticacion,
-	}
-	for _, m := range modulos {
-		m.Registrar(protegidas)
-	}
-```
-- `api.Group("", Autenticar(...))` crea un subgrupo con el **mismo prefijo** (`/api/v1`) pero con el middleware de autenticación: **toda** ruta que un módulo registre ahí exige token. Para hacer pública una ruta hay que registrarla a propósito en `api` (como `login`).
-- `*HandlerAutenticacion` cumple la interfaz `modulo` porque tiene el método `Registrar`.
-
-### 3.6 Pruebas
-
-- `nuevoEntorno` ahora crea un gestor de tokens real con un secreto de prueba.
-- `peticion(metodo, ruta, token, cuerpo)`: si `token` no está vacío, agrega `Authorization: Bearer ...`.
-- `TestRutasProtegidasExigenToken`: `/api/v1/auth/yo` sin token y con un token inválido responde 401. En los pasos siguientes la lista de rutas crecerá con cada módulo.
+- Monitor o asistente: ¿tiene vinculaciones con ese rol en espacios activos? Profesor: ¿es responsable de algún espacio activo? Si es así → **422**.
+- Al final se vuelve a leer el usuario para devolver sus roles actualizados.
 
 ---
 
-## 4. Conceptos de Go de este paso
+## 4. Las pruebas (`modulos_test.go`)
+
+```go
+func esperarTipo(t *testing.T, err error, tipo apperr.Tipo) { ... }
+```
+- Auxiliar: falla si el error no es del tipo esperado. Hace las pruebas cortas y legibles.
+
+```go
+type repoUsuariosFalso struct {
+	usuarios       map[string]dominio.Usuario
+	rolesEnUso     map[dominio.Rol]bool
+	espaciosActivo bool
+}
+```
+- Repositorio en memoria. `rolesEnUso` y `espaciosActivo` permiten simular "este rol está en uso" sin base de datos.
+
+| Prueba | Qué verifica |
+|---|---|
+| `TestCrearUsuario` | El nombre se limpia, el correo se pasa a minúsculas, los roles repetidos se quitan, la contraseña se guarda hasheada y el usuario queda activo. Seis casos inválidos: un profesor intentando crear (403), nombre vacío, correo inválido, contraseña corta, rol inexistente y sin roles (400). |
+| `TestAsignarRoles` | El administrador no puede quitarse su rol (422); no se retira un rol en uso (422); un cambio válido se aplica; no se quita el rol de profesor con espacios activos (422); un monitor no ve a otro usuario (404). |
+
+Los actores (`admin`, `profesor`, `monitor`) se declaran junto a `logPrueba` en `autenticacion_test.go`. En el paso 48 este bloque de dobles compartidos se trasladará a `reportes_test.go`.
+
+---
+
+## 5. Conceptos de Go de este paso
 
 | Concepto | Explicación |
 |---|---|
-| DTO con etiquetas JSON | Structs solo para la forma de la API, separados del dominio. |
-| `mapa[clave]` con `ok` | Saber si la clave existe. |
-| `switch` sin expresión | Cadena de condiciones. |
-| `1 << 20` | Desplazamiento de bits: 2²⁰ = 1 MB. |
-| `io.LimitReader` | Lector que no entrega más de N bytes. |
-| `%q` | Formato que pone el texto entre comillas y escapa caracteres especiales. |
+| Paquete `slices` | Funciones genéricas para listas: `slices.Contains`, `slices.Sort`. |
+| Bloque `var ( ... )` | Varias variables relacionadas en un bloque. |
+| Defensa en profundidad | La regla se aplica en el router **y** en el servicio. |
+| 404 en lugar de 403 | No revelar la existencia de recursos ajenos. |
 
 ---
 
-## 5. Cómo comprobarlo
+## 6. Cómo comprobarlo
 
 ```bash
-make pruebas
-docker compose up --build -d --wait
-
-# Login correcto (el correo admite mayúsculas)
-curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
-  -d '{"correo":"ADMIN@uniandes.edu.co","password":"cambie-esta-clave"}'
-
-# Guardar el token (Git Bash / Linux)
-TOKEN=$(curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
-  -d '{"correo":"admin@uniandes.edu.co","password":"cambie-esta-clave"}' | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
-curl -s localhost:8080/api/v1/auth/yo -H "Authorization: Bearer $TOKEN"
-
-# Errores
-curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' -d '{"correo":"admin@uniandes.edu.co","password":"otra"}'
-# {"error":"no_autenticado","mensaje":"credenciales inválidas"}                      → 401
-curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' -d '{"correo":"a","clave":"x"}'
-# {"error":"validacion","mensaje":"campo desconocido \"clave\""}                     → 400
-curl -s localhost:8080/api/v1/auth/yo
-# {"error":"no_autenticado","mensaje":"se requiere un token de acceso"}              → 401
+cd backend
+go test ./internal/servicio/ -v -run 'TestCrearUsuario|TestAsignarRoles'
 ```
 
-También se puede hacer con Postman: método POST, pestaña *Body* → *raw* → *JSON*. La colección completa llega en el paso 60.
+---
+
+## 7. Pasos para lograr esta versión desde el paso 17
+
+1. Crear `backend/internal/servicio/acceso.go` con el comentario de las reglas de visibilidad, `exigirRol` y `noEncontrado`.
+2. Crear `backend/internal/servicio/usuarios.go` con `RepositorioGestionUsuarios`, `NuevoUsuario`, `Usuarios`, `NuevoUsuarios`, `Crear`, `Listar`, `Obtener`, `AsignarRoles`, `verificarRetiroDeRol` y `normalizarRoles`.
+3. En `autenticacion_test.go`, convertir `logPrueba` en un bloque `var (...)` con `profesor`, `admin` y `monitor`.
+4. Crear `backend/internal/servicio/modulos_test.go` con `esperarTipo`, el doble `repoUsuariosFalso` y las pruebas `TestCrearUsuario` y `TestAsignarRoles`.
+5. `make pruebas lint`
+6. Commit: `git add . && git commit -m "Paso 18: servicio de gestión de usuarios"`
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 16
+## 8. Preparación para las próximas entregas
 
-1. Crear `backend/internal/handler/formatos.go` con el comentario explicativo, `usuarioJSON` y `aUsuarioJSON`.
-2. En `respuestas.go` agregar `estadosPorTipo`, `responderError`, `maxCuerpoJSON`, `leerJSON`, `decodificarJSON` y `rolesTexto` (más los imports que necesitan).
-3. Crear `backend/internal/handler/autenticacion.go` con `ServicioAutenticacion`, `HandlerAutenticacion`, `peticionLogin`, `respuestaLogin`, `RegistrarPublicas`, `Registrar`, `Login` y `Yo`.
-4. En `router.go`: campos `Autenticacion` y `Tokens` en `Dependencias`; registrar el login en `api`; crear el grupo `protegidas` con `Autenticar` y la lista de módulos con `autenticacion`.
-5. En `router_test.go`: constante `secretoPrueba`, `Tokens` en `nuevoEntorno`, parámetro `token` en `peticion`/`peticionCon` (actualizar las llamadas existentes) y `TestRutasProtegidasExigenToken`.
-6. En `main.go`: `Autenticacion: servicioAuth` y `Tokens: tokens` en `handler.Dependencias`.
-7. `make pruebas lint`, levantar con Docker Compose y probar con `curl` (sección 5).
-8. Commit: `git add . && git commit -m "Paso 17: endpoints de inicio de sesión"`
+- **Los logs de auditoría ("usuario creado ... por ...")** quedarán en Cloud Logging en la nube. Sirven para saber quién hizo cada cambio administrativo.
+- **Pendientes que el enunciado deja fuera de la Entrega 1:** reinicio de contraseñas y desactivación de usuarios. El campo `activo` y el login que ya rechaza usuarios inactivos (paso 14) dejan lista la base para agregarlos.
 
 ---
 
-## 7. Preparación para las próximas entregas
-
-- **El frontend de la Entrega 2** usará `POST /auth/login` para obtener el token y `GET /auth/yo` para saber quién inició sesión y con qué roles (para mostrar u ocultar opciones).
-- **Errores estandarizados:** el frontend podrá mostrar `mensaje` directamente al usuario y decidir con `error` (por ejemplo, redirigir al login ante `no_autenticado`).
-
----
-
-## 8. Requisitos que atiende
+## 9. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-01.1 Inicio de sesión local | `POST /api/v1/auth/login`. |
-| RF-01.2 Control de acceso | Grupo protegido con `Autenticar`; 401 sin token. |
-| RNF-03 Seguridad básica | El hash nunca se serializa; errores internos sin detalles; cuerpo limitado a 1 MB. |
+| RF-02.1 Crear usuarios | `Crear` con validaciones y contraseña hasheada. |
+| RF-02.2 Asignar roles | `AsignarRoles`, sin dejar inconsistencias. |
+| RF-02.3 Consulta global | `Listar` (solo administrador). |
+| RF-15.2 Gestión de usuarios por el administrador | Permisos exigidos en el servicio. |
+| RN-04 Cada usuario ve solo lo suyo | `Obtener` devuelve 404 para usuarios ajenos. |

@@ -13,8 +13,14 @@ import (
 	"seguimiento/internal/dominio"
 )
 
-// logPrueba descarta los logs durante las pruebas del paquete.
-var logPrueba = slog.New(slog.NewTextHandler(io.Discard, nil))
+// Dobles compartidos por las pruebas del paquete: un logger que descarta los
+// mensajes y los actores con los que se prueban los permisos.
+var (
+	logPrueba = slog.New(slog.NewTextHandler(io.Discard, nil))
+	profesor  = auth.Actor{UsuarioID: "prof-1", Roles: []dominio.Rol{dominio.RolProfesor}}
+	admin     = auth.Actor{UsuarioID: "admin-1", Roles: []dominio.Rol{dominio.RolAdministrador}}
+	monitor   = auth.Actor{UsuarioID: "mon-1", Roles: []dominio.Rol{dominio.RolMonitor}}
+)
 
 type usuariosFalsos struct {
 	porCorreo map[string]dominio.Usuario
