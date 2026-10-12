@@ -52,9 +52,10 @@ func ejecutar(log *slog.Logger) error {
 		return err
 	}
 	var (
-		usuarios = repositorio.NuevoUsuarios(db)
-		periodos = repositorio.NuevoPeriodos(db)
-		espacios = repositorio.NuevoEspacios(db)
+		usuarios      = repositorio.NuevoUsuarios(db)
+		periodos      = repositorio.NuevoPeriodos(db)
+		espacios      = repositorio.NuevoEspacios(db)
+		vinculaciones = repositorio.NuevoVinculaciones(db)
 	)
 
 	// Capa de servicio
@@ -71,6 +72,7 @@ func ejecutar(log *slog.Logger) error {
 		Usuarios:      servicio.NuevoUsuarios(usuarios, log),
 		Periodos:      servicio.NuevoPeriodos(periodos, log),
 		Espacios:      servicio.NuevoEspacios(espacios, periodos, reloj, log),
+		Vinculaciones: servicio.NuevoVinculaciones(vinculaciones, usuarios, espacios, log),
 		Tokens:        tokens,
 		OrigenesCORS:  cfg.OrigenesCORS,
 		Log:           log,

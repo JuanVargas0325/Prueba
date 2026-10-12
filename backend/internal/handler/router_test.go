@@ -154,9 +154,11 @@ func TestControlDeAccesoPorRol(t *testing.T) {
 	casos := []struct {
 		metodo, ruta, token string
 	}{
-		{http.MethodGet, "/api/v1/usuarios", monitor},   // solo administrador
-		{http.MethodPost, "/api/v1/periodos", profesor}, // solo administrador
-		{http.MethodPost, "/api/v1/espacios", monitor},  // solo profesor
+		{http.MethodGet, "/api/v1/usuarios", monitor},                // solo administrador
+		{http.MethodPost, "/api/v1/periodos", profesor},              // solo administrador
+		{http.MethodPost, "/api/v1/espacios", monitor},               // solo profesor
+		{http.MethodPost, "/api/v1/vinculaciones", monitor},          // solo profesor
+		{http.MethodPut, "/api/v1/vinculaciones/" + uuidA, profesor}, // solo administrador
 	}
 	for _, c := range casos {
 		if w := e.peticion(c.metodo, c.ruta, c.token, `{}`); w.Code != http.StatusForbidden {

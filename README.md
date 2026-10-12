@@ -1,253 +1,180 @@
-# Paso 32 · Servicio de vinculaciones
+# Paso 33 · Endpoints de vinculaciones
 
-> Rama `paso-a-paso` · paso 32 de 65 · anterior: **Paso 31 · Repositorio de vinculaciones** · siguiente: **Paso 33 · Endpoints de vinculaciones**
+> Rama `paso-a-paso` · paso 33 de 65 · anterior: **Paso 32 · Servicio de vinculaciones** · siguiente: **Paso 34 · Dominio: tareas semanales**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el caso de uso de las vinculaciones: el **profesor** vincula personas a sus cursos y proyectos, todos consultan las que pueden ver y el **administrador** rectifica errores.
+Las vinculaciones se gestionan por HTTP:
+
+| Método | Ruta | Rol | Descripción |
+|---|---|---|---|
+| POST | `/api/v1/vinculaciones` | profesor | Vincula a una persona (por `usuario_id` o `correo`) a un curso o proyecto propio, con rol y horas. Aplica las reglas de horas. |
+| GET | `/api/v1/vinculaciones` | todos | Lista las vinculaciones visibles. Filtros: `?espacio_id=`, `?usuario_id=`, `?solo_activas=true`. Para un monitor es el **listado unificado** de sus cursos y proyectos (RF-11.1). |
+| GET | `/api/v1/vinculaciones/{id}` | quien pueda verla | Detalle. |
+| PUT | `/api/v1/vinculaciones/{id}` | administrador | Rectifica rol y/o horas con un motivo obligatorio. |
+| GET | `/api/v1/vinculaciones/{id}/rectificaciones` | profesor o administrador | Historial de correcciones. |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/servicio/vinculaciones.go` | **Nuevo.** Servicio `Vinculaciones` con `Crear`, `Listar`, `Obtener`, `Rectificar` y `ListarRectificaciones`, más `buscarPersona`, `verificarPersonaVinculable` y `validarCarga`. |
-| `backend/internal/dominio/validacion.go` | **Modificado.** Constante `LongitudMaxMotivo` (1000 caracteres). |
-| `backend/internal/servicio/modulos_test.go` | **Modificado.** Repositorio falso de vinculaciones y cuatro pruebas. |
+| `backend/internal/handler/vinculaciones.go` | **Nuevo.** Módulo de vinculaciones. |
+| `backend/internal/handler/formatos.go` | **Modificado.** `espacioRef` y `vinculacionJSON` (compartidos con tareas y seguimiento). |
+| `backend/internal/handler/router.go` | **Modificado.** Servicio `Vinculaciones` y su módulo. |
+| `backend/internal/handler/router_test.go` | **Modificado.** Un monitor no vincula; un profesor no rectifica. |
+| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso y `TestVinculaciones`. |
+| `backend/cmd/api/main.go` | **Modificado.** Repositorio y servicio de vinculaciones. |
+
+Ejemplo del enunciado por HTTP (Laura tiene 12 h de asistencia y una monitoría de 3 h):
+
+```bash
+curl -s -X POST localhost:8080/api/v1/vinculaciones -H "Authorization: Bearer $TOKEN_PROFESOR" -H 'Content-Type: application/json' \
+  -d '{"espacio_id":"<curso>","usuario_id":"<laura>","rol":"monitor","horas_semanales":3}'
+# 422 {"error":"regla_negocio","mensaje":"con 12 horas como asistente graduado, las horas de monitoría
+#      no pueden superar 5 (40 % redondeado hacia arriba); quedaría con 6"}
+```
 
 ---
 
 ## 2. Por qué
 
-- **RF-04.1 a RF-04.3 / RN-10:** la vinculación es **manual** y la hace el profesor responsable del espacio, indicando rol y horas.
-- **RF-04.4 / RN-12:** las horas **no se modifican** después; solo el administrador **rectifica** (RF-04.5), con motivo.
-- **RF-05 / RN-14 a RN-19:** las reglas de horas se aplican al crear y al rectificar, de forma atómica (paso 31).
-- **RN-02:** solo se vincula como monitor o asistente graduado, y la persona debe tener ese rol asignado por el administrador.
+- **RF-04 y RF-05** quedan disponibles por la API, con las reglas de horas aplicadas de forma atómica.
+- **El profesor no tiene endpoint para cambiar horas** (RF-04.4): solo existe `PUT` para el administrador (RF-04.5).
+- **422 frente a 409:** violar una regla de horas es una **regla de negocio** (422); vincular dos veces lo mismo es un **conflicto** (409). El cliente puede distinguirlos.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Dependencias
+### 3.1 Rutas
 
 ```go
-type RepositorioVinculaciones interface {
-	Crear(ctx context.Context, v dominio.Vinculacion, validar dominio.ValidadorCarga) (dominio.Vinculacion, error)
-	Rectificar(ctx context.Context, id string, rol dominio.Rol, horas int, administradorID, motivo string,
-		validar dominio.ValidadorCarga) (dominio.Vinculacion, error)
-	Obtener(ctx context.Context, id string) (dominio.Vinculacion, error)
-	Listar(ctx context.Context, f dominio.FiltroVinculaciones) ([]dominio.Vinculacion, error)
-	ListarRectificaciones(ctx context.Context, vinculacionID string) ([]dominio.Rectificacion, error)
-}
-
-type LectorUsuarios interface {
-	BuscarPorID(ctx context.Context, id string) (dominio.Usuario, error)
-	BuscarPorCorreo(ctx context.Context, correo string) (dominio.Usuario, error)
-}
-
-type LectorEspacios interface {
-	Obtener(ctx context.Context, id string) (dominio.Espacio, error)
+func (h *HandlerVinculaciones) Registrar(g *gin.RouterGroup) {
+	r := g.Group("/vinculaciones")
+	r.GET("", h.Listar)
+	r.GET("/:id", h.Obtener)
+	r.POST("", RequiereRol(dominio.RolProfesor), h.Crear)
+	r.PUT("/:id", RequiereRol(dominio.RolAdministrador), h.Rectificar)
+	r.GET("/:id/rectificaciones", RequiereRol(dominio.RolProfesor, dominio.RolAdministrador), h.ListarRectificaciones)
 }
 ```
-- El servicio necesita tres repositorios distintos; de cada uno pide solo lo que usa.
+
+### 3.2 Peticiones
 
 ```go
-type NuevaVinculacion struct {
-	EspacioID      string
-	UsuarioID      string
-	Correo         string
-	Rol            dominio.Rol
-	HorasSemanales int
+type peticionVinculacion struct {
+	EspacioID      string      `json:"espacio_id"`
+	UsuarioID      string      `json:"usuario_id"`
+	Correo         string      `json:"correo"`
+	Rol            dominio.Rol `json:"rol"`
+	HorasSemanales int         `json:"horas_semanales"`
+}
+
+type peticionRectificacion struct {
+	Rol            *dominio.Rol `json:"rol"`
+	HorasSemanales *int         `json:"horas_semanales"`
+	Motivo         string       `json:"motivo"`
 }
 ```
-- La persona se identifica por `UsuarioID` **o** por `Correo`. Un profesor normalmente conoce el correo de su monitor, no su identificador interno.
+- `HorasSemanales int`: un valor decimal (`4.5`) se rechaza automáticamente con 400 (paso 17): las horas son enteras.
+- En la rectificación, rol y horas son **punteros** (opcionales), igual que en el servicio (paso 32).
+- `Crear` valida con `validarUUIDOpcional` que `espacio_id` y `usuario_id` sean UUID antes de llamar al servicio.
 
-### 3.2 `Crear`
+### 3.3 Formatos compartidos (`formatos.go`)
 
 ```go
-func (s *Vinculaciones) Crear(ctx context.Context, actor auth.Actor, n NuevaVinculacion) (dominio.Vinculacion, error) {
-	if err := exigirRol(actor, dominio.RolProfesor); err != nil { ... }
-	if !n.Rol.EsRolDeVinculacion() {
-		return dominio.Vinculacion{}, apperr.Validacion("rol inválido: use monitor o asistente_graduado")
-	}
-	if err := dominio.ValidarHoras(n.HorasSemanales); err != nil { ... }
+type espacioRef struct {
+	ID          string                `json:"id"`
+	Nombre      string                `json:"nombre"`
+	Tipo        dominio.TipoEspacio   `json:"tipo"`
+	Estado      dominio.EstadoEspacio `json:"estado,omitempty"`
+	FechaInicio string                `json:"fecha_inicio,omitempty"`
+	FechaCierre string                `json:"fecha_cierre,omitempty"`
+}
 
-	espacio, err := s.espacios.Obtener(ctx, n.EspacioID)
-	if apperr.Es(err, apperr.TipoNoEncontrado) {
-		return dominio.Vinculacion{}, apperr.Validacion("el curso o proyecto indicado no existe")
-	}
-	...
-	if espacio.ProfesorID != actor.UsuarioID {
-		return dominio.Vinculacion{}, apperr.Prohibido("solo el profesor responsable puede vincular personas a este %s", espacio.Tipo)
-	}
-	if err := espacio.PermiteRegistros(); err != nil { ... }
-
-	persona, err := s.buscarPersona(ctx, n.UsuarioID, n.Correo)
-	...
-	if err := verificarPersonaVinculable(persona, n.Rol); err != nil { ... }
-
-	objetivo := dominio.Vinculacion{
-		UsuarioID: persona.ID, EspacioID: espacio.ID, Rol: n.Rol, HorasSemanales: n.HorasSemanales,
-		EspacioEstado: espacio.Estado, EspacioFechaInicio: espacio.FechaInicio, EspacioFechaCierre: espacio.FechaCierre,
-	}
-	v, err := s.repo.Crear(ctx, objetivo, validarCarga)
-	...
+type vinculacionJSON struct {
+	ID             string      `json:"id"`
+	Usuario        personaRef  `json:"usuario"`
+	Espacio        espacioRef  `json:"espacio"`
+	Profesor       personaRef  `json:"profesor"`
+	Rol            dominio.Rol `json:"rol"`
+	HorasSemanales int         `json:"horas_semanales"`
+	CreadoEn       time.Time   `json:"creado_en"`
+	ActualizadoEn  time.Time   `json:"actualizado_en"`
 }
 ```
-Validaciones en orden, de la más barata a la más costosa:
-1. Solo profesores (403).
-2. Rol de vinculación (monitor o asistente) y horas positivas (400).
-3. El espacio existe (si no, 400), es **del profesor** que pide (si no, 403) y **no está cerrado** (RN-09, 422).
-4. La persona existe, está activa y **tiene el rol** (3.4).
-5. Las reglas de horas, en la transacción con bloqueo (paso 31), usando `validarCarga` (3.5).
+- Una vinculación se muestra con **a quién**, **dónde** y **con qué profesor**, en objetos anidados. Es justo lo que necesita la vista del monitor (RF-11.1: sus cursos y proyectos con rol y horas) y la del profesor (RF-10.2).
+- `espacioRef` es una referencia **resumida** a un espacio; con `omitempty` sirve tanto para respuestas cortas (solo id, nombre y tipo) como completas.
 
-`objetivo` lleva el estado y las fechas del espacio porque el repositorio los necesita para buscar las vinculaciones **simultáneas**.
-
-### 3.3 `buscarPersona`
+### 3.4 Filtros del listado
 
 ```go
-func (s *Vinculaciones) buscarPersona(ctx context.Context, usuarioID, correo string) (dominio.Usuario, error) {
-	...
-	switch {
-	case usuarioID != "":
-		persona, err = s.usuarios.BuscarPorID(ctx, usuarioID)
-	case strings.TrimSpace(correo) != "":
-		persona, err = s.usuarios.BuscarPorCorreo(ctx, correo)
-	default:
-		return persona, apperr.Validacion("indique usuario_id o correo de la persona")
-	}
-	if apperr.Es(err, apperr.TipoNoEncontrado) {
-		return persona, apperr.Validacion("la persona indicada no está registrada")
-	}
-	return persona, err
-}
+	vinculaciones, err := h.servicio.Listar(c.Request.Context(), ActorDe(c), dominio.FiltroVinculaciones{
+		EspacioID: espacioID, UsuarioID: usuarioID,
+		SoloEspaciosActivos: c.Query("solo_activas") == "true",
+		Paginacion:          consultaPaginacion(c),
+	})
 ```
-- Prioriza el ID; si no viene, usa el correo. Una persona inexistente es un **dato inválido** de la petición (400).
+- `?solo_activas=true` excluye las vinculaciones de espacios cerrados (útil para mostrar solo lo vigente).
+- `VisiblePara` no viene del cliente: lo fija el servicio (paso 32).
 
-### 3.4 `verificarPersonaVinculable`
+### 3.5 Pruebas
 
-```go
-func verificarPersonaVinculable(persona dominio.Usuario, rol dominio.Rol) error {
-	if !persona.Activo {
-		return apperr.ReglaNegocio("la persona está inactiva")
-	}
-	if !persona.TieneRol(rol) {
-		return apperr.ReglaNegocio("la persona no tiene asignado el rol %s; el administrador debe asignárselo primero", rol.Texto())
-	}
-	return nil
-}
-```
-- **Los roles globales los asigna el administrador** (RF-02.2) y los roles por vinculación los usa el profesor (RN-02). Un profesor no puede convertir a alguien en asistente graduado por su cuenta: el administrador debe haberle dado ese rol primero. El mensaje dice exactamente qué hacer.
-
-### 3.5 `validarCarga`: la regla que se envía al repositorio
-
-```go
-func validarCarga(simultaneas []dominio.Vinculacion, objetivo dominio.Vinculacion) error {
-	if objetivo.EspacioEstado != dominio.EspacioActivo {
-		return nil
-	}
-	return dominio.ValidarCargaHoraria(append(simultaneas, objetivo))
-}
-```
-- Cumple el tipo `dominio.ValidadorCarga` (paso 30), así que se puede pasar como argumento: `s.repo.Crear(ctx, objetivo, validarCarga)`. El repositorio la ejecuta **con el usuario bloqueado**.
-- Une las simultáneas con la nueva y aplica las reglas del dominio. Una vinculación de un espacio cerrado no suma carga (se puede rectificar, por ejemplo, un dato histórico).
-
-### 3.6 Consultar y rectificar
-
-```go
-func (s *Vinculaciones) Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroVinculaciones) ([]dominio.Vinculacion, error) {
-	f.VisiblePara = visiblePara(actor)
-	return s.repo.Listar(ctx, f)
-}
-
-func (s *Vinculaciones) Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Vinculacion, error) {
-	v, err := s.repo.Obtener(ctx, id)
-	...
-	if !puedeVerDeProfesor(actor, v.ProfesorID) && v.UsuarioID != actor.UsuarioID {
-		return dominio.Vinculacion{}, noEncontrado("vinculación")
-	}
-	return v, nil
-}
-```
-- Ven una vinculación: su profesor, el administrador y **la persona vinculada** (RN-04: cada monitor ve sus propias vinculaciones).
-
-```go
-func (s *Vinculaciones) Rectificar(ctx context.Context, actor auth.Actor, id string, r SolicitudRectificacion) (dominio.Vinculacion, error) {
-	if err := exigirRol(actor, dominio.RolAdministrador); err != nil { ... }
-	motivo, err := dominio.Texto("el motivo", r.Motivo, true, dominio.LongitudMaxMotivo)
-	...
-	actual, err := s.repo.Obtener(ctx, id)
-	...
-	rol, horas := actual.Rol, actual.HorasSemanales
-	if r.Rol != nil { rol = *r.Rol }
-	if r.HorasSemanales != nil { horas = *r.HorasSemanales }
-	... validar rol y horas ...
-	if rol == actual.Rol && horas == actual.HorasSemanales {
-		return actual, apperr.Validacion("la rectificación no cambia el rol ni las horas")
-	}
-	if rol != actual.Rol {
-		... la persona debe tener el nuevo rol ...
-	}
-	v, err := s.repo.Rectificar(ctx, id, rol, horas, actor.UsuarioID, motivo, validarCarga)
-	...
-}
-```
-- Solo el administrador (RF-04.4: el profesor **no** puede cambiar horas).
-- **El motivo es obligatorio**: queda en el historial. Su largo máximo es la constante `dominio.LongitudMaxMotivo` (1000), junto a los demás límites de texto en `validacion.go`: un número con nombre explica qué significa y se cambia en un solo lugar.
-- Cambios opcionales con punteros (como en el paso 23). Una rectificación que no cambia nada se rechaza.
-- `ListarRectificaciones` verifica primero que el actor pueda ver la vinculación.
+- `TestControlDeAccesoPorRol` agrega: un monitor no puede vincular; un profesor no puede rectificar (`PUT /vinculaciones/{id}`).
+- `TestVinculaciones` (handler):
+  - vincular por correo pasa correo, rol y horas al servicio (201);
+  - cuando el servicio responde una **regla de negocio**, la API responde **422**;
+  - la rectificación lleva solo las horas (el rol queda en `nil`).
 
 ---
 
-## 4. Las pruebas
-
-`repoVinculacionesFalso` **ejecuta el validador recibido** contra una lista configurable de `simultaneas`: así se prueba que el servicio entrega la regla correcta al repositorio.
-
-| Prueba | Qué verifica |
-|---|---|
-| `TestCrearVinculacion` | Vincular por correo (sin distinguir mayúsculas) y que al repositorio le llegan las fechas del espacio. 9 subpruebas de error: solo profesores, profesor no responsable, espacio cerrado (RN-09), espacio inexistente, rol inválido, horas en cero, persona sin el rol, persona inexistente y sin persona. |
-| `TestCrearVinculacionAplicaLasReglasDeHoras` | **El ejemplo del enunciado:** con 12 h de asistencia y 3 h de monitoría, otra monitoría de 3 h se rechaza (6 > 5); una de 2 h se acepta (5 ≤ 5). |
-| `TestRectificarVinculacion` | Un profesor no rectifica (403); sin motivo (400); sin cambios (400); 13 h de monitoría (422); cambiar a un rol que la persona no tiene (422); una corrección válida llega al repositorio con su motivo. |
-| `TestVisibilidadDeVinculaciones` | Los listados se filtran por el actor; otro profesor recibe 404; la persona vinculada sí ve su vinculación. |
-
----
-
-## 5. Conceptos de este paso
+## 4. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Función como argumento | `s.repo.Crear(ctx, objetivo, validarCarga)`. |
-| Identificar por ID o por correo | `switch` sin expresión para elegir la forma de búsqueda. |
-| Orden de las validaciones | De lo barato (formato) a lo costoso (transacción con bloqueo). |
+| Referencias anidadas reutilizables | `personaRef`, `espacioRef` en varias respuestas. |
+| Parámetros booleanos en la consulta | `c.Query("solo_activas") == "true"`. |
+| 409 vs 422 | Conflicto de existencia frente a regla de negocio. |
 
 ---
 
-## 6. Cómo comprobarlo
+## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/servicio/ -v -run 'Vinculacion'
+make pruebas
+docker compose up --build -d --wait
 ```
 
+Con un profesor, una persona con roles `monitor` y `asistente_graduado` (Laura), un período y tres espacios del profesor:
+
+1. Vincular a Laura como **asistente** con 12 h en el espacio 2 (por correo) → 201.
+2. Vincularla como **monitor** con 3 h en el espacio 1 → 201.
+3. Vincularla como **monitor** con 3 h en el espacio 3 → **422** (12 h de asistencia permiten 5 h de monitoría; quedaría con 6).
+4. Repetir la vinculación del paso 2 → **409** "la persona ya está vinculada como monitor en este curso o proyecto".
+5. Con el profesor, `PUT /api/v1/vinculaciones/<id>` → **403**.
+6. Con el administrador, `PUT /api/v1/vinculaciones/<id>` con `{"horas_semanales":10,"motivo":"Error de digitación"}` → 200; `GET .../rectificaciones` muestra 12 → 10 con el motivo.
+7. Con el token de Laura, `GET /api/v1/vinculaciones` → sus 2 vinculaciones.
+
 ---
 
-## 7. Pasos para lograr esta versión desde el paso 31
+## 6. Pasos para lograr esta versión desde el paso 32
 
-1. Crear `backend/internal/servicio/vinculaciones.go` con las interfaces (`RepositorioVinculaciones`, `LectorUsuarios`, `LectorEspacios`), `NuevaVinculacion`, `SolicitudRectificacion`, `Vinculaciones`, `NuevoVinculaciones`, los cinco métodos públicos y las funciones `buscarPersona`, `verificarPersonaVinculable` y `validarCarga`.
-2. En `backend/internal/dominio/validacion.go`, agregar `LongitudMaxMotivo = 1000` a las constantes de longitud.
-3. En `modulos_test.go`, después de espacios, la sección `// --- vinculaciones ---` con `repoVinculacionesFalso`, `entornoVinculaciones` y las cuatro pruebas.
-4. `make pruebas lint`
-5. Commit: `git add . && git commit -m "Paso 32: servicio de vinculaciones"`
+1. En `formatos.go`: `espacioRef`, `vinculacionJSON` y `aVinculacionJSON`.
+2. Crear `backend/internal/handler/vinculaciones.go` (interfaz, handler, `Registrar`, peticiones, `rectificacionJSON` y los cinco endpoints).
+3. En `router.go`: campo `Vinculaciones` y `&HandlerVinculaciones{...}`.
+4. En `router_test.go`: casos `POST /api/v1/vinculaciones` (monitor) y `PUT /api/v1/vinculaciones/{uuidA}` (profesor).
+5. En `handler/modulos_test.go`: `servicioVinculacionesFalso` y `TestVinculaciones`.
+6. En `main.go`: `vinculaciones = repositorio.NuevoVinculaciones(db)` y `Vinculaciones: servicio.NuevoVinculaciones(vinculaciones, usuarios, espacios, log)`.
+7. `make pruebas lint` y commit: `git add . && git commit -m "Paso 33: endpoints de vinculaciones"`
 
 ---
 
-## 8. Requisitos que atiende
+## 7. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-04.1 a RF-04.3 / RN-10 Vinculación manual por el profesor | `Crear` (solo el responsable del espacio). |
-| RF-04.4 / RN-12 Horas no modificables | No hay edición; solo `Rectificar`. |
-| RF-04.5 Rectificación | `Rectificar` (administrador, con motivo e historial). |
-| RF-05 / RN-14 a RN-19 Reglas de horas | `validarCarga` aplicada dentro de la transacción. |
-| RN-02 Rol por vinculación | `verificarPersonaVinculable`. |
-| RN-09 Espacio cerrado | `PermiteRegistros`. |
-| RN-04 Visibilidad propia | La persona ve sus vinculaciones. |
+| RF-04.1 a RF-04.3 Vincular con rol y horas | `POST /api/v1/vinculaciones`. |
+| RF-04.4 Horas no modificables por el profesor | Sin endpoint de edición para el profesor (403 en `PUT`). |
+| RF-04.5 Rectificación | `PUT /api/v1/vinculaciones/{id}` y su historial. |
+| RF-05.1 a RF-05.6 Reglas de horas | Respuesta 422 con el detalle de la regla violada. |
+| RF-10.2 / RF-11.1 Listados | `GET /api/v1/vinculaciones` según quién consulta. |

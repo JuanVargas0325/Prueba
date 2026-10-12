@@ -126,3 +126,54 @@ func TestEspacios(t *testing.T) {
 	}
 	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/espacios/"+uuidA, e.token(t, dominio.RolMonitor), ""), http.StatusNotFound)
 }
+
+type servicioVinculacionesFalso struct {
+	nueva         servicio.NuevaVinculacion
+	rectificacion servicio.SolicitudRectificacion
+}
+
+func (s *servicioVinculacionesFalso) Crear(_ context.Context, _ auth.Actor, n servicio.NuevaVinculacion) (dominio.Vinculacion, error) {
+	s.nueva = n
+	if n.HorasSemanales > 22 {
+		return dominio.Vinculacion{}, apperr.ReglaNegocio("supera las 22 horas")
+	}
+	return dominio.Vinculacion{ID: uuidA}, nil
+}
+
+func (s *servicioVinculacionesFalso) Listar(context.Context, auth.Actor, dominio.FiltroVinculaciones) ([]dominio.Vinculacion, error) {
+	return nil, nil
+}
+
+func (s *servicioVinculacionesFalso) Obtener(context.Context, auth.Actor, string) (dominio.Vinculacion, error) {
+	return dominio.Vinculacion{ID: uuidA}, nil
+}
+
+func (s *servicioVinculacionesFalso) Rectificar(_ context.Context, _ auth.Actor, _ string, r servicio.SolicitudRectificacion) (dominio.Vinculacion, error) {
+	s.rectificacion = r
+	return dominio.Vinculacion{ID: uuidA}, nil
+}
+
+func (s *servicioVinculacionesFalso) ListarRectificaciones(context.Context, auth.Actor, string) ([]dominio.Rectificacion, error) {
+	return nil, nil
+}
+
+func TestVinculaciones(t *testing.T) {
+	srv := &servicioVinculacionesFalso{}
+	e := nuevoEntorno(t, func(d *Dependencias) { d.Vinculaciones = srv })
+	profesor := e.token(t, dominio.RolProfesor)
+
+	esperarEstado(t, e.peticion(http.MethodPost, "/api/v1/vinculaciones", profesor,
+		`{"espacio_id":"`+uuidA+`","correo":"ana@uniandes.edu.co","rol":"monitor","horas_semanales":4}`), http.StatusCreated)
+	if srv.nueva.Correo != "ana@uniandes.edu.co" || srv.nueva.Rol != dominio.RolMonitor || srv.nueva.HorasSemanales != 4 {
+		t.Errorf("datos recibidos inesperados: %+v", srv.nueva)
+	}
+	// Las reglas de horas violadas responden 422.
+	esperarEstado(t, e.peticion(http.MethodPost, "/api/v1/vinculaciones", profesor,
+		`{"espacio_id":"`+uuidA+`","usuario_id":"`+uuidB+`","rol":"asistente_graduado","horas_semanales":23}`), http.StatusUnprocessableEntity)
+
+	esperarEstado(t, e.peticion(http.MethodPut, "/api/v1/vinculaciones/"+uuidA, e.token(t, dominio.RolAdministrador),
+		`{"horas_semanales":6,"motivo":"Error de digitación"}`), http.StatusOK)
+	if srv.rectificacion.HorasSemanales == nil || *srv.rectificacion.HorasSemanales != 6 || srv.rectificacion.Rol != nil {
+		t.Errorf("rectificación inesperada: %+v", srv.rectificacion)
+	}
+}

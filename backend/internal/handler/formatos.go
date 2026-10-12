@@ -27,3 +27,39 @@ type personaRef struct {
 	Nombre string `json:"nombre"`
 	Correo string `json:"correo,omitempty"`
 }
+
+type espacioRef struct {
+	ID          string                `json:"id"`
+	Nombre      string                `json:"nombre"`
+	Tipo        dominio.TipoEspacio   `json:"tipo"`
+	Estado      dominio.EstadoEspacio `json:"estado,omitempty"`
+	FechaInicio string                `json:"fecha_inicio,omitempty"`
+	FechaCierre string                `json:"fecha_cierre,omitempty"`
+}
+
+type vinculacionJSON struct {
+	ID             string      `json:"id"`
+	Usuario        personaRef  `json:"usuario"`
+	Espacio        espacioRef  `json:"espacio"`
+	Profesor       personaRef  `json:"profesor"`
+	Rol            dominio.Rol `json:"rol"`
+	HorasSemanales int         `json:"horas_semanales"`
+	CreadoEn       time.Time   `json:"creado_en"`
+	ActualizadoEn  time.Time   `json:"actualizado_en"`
+}
+
+func aVinculacionJSON(v dominio.Vinculacion) vinculacionJSON {
+	return vinculacionJSON{
+		ID:      v.ID,
+		Usuario: personaRef{ID: v.UsuarioID, Nombre: v.UsuarioNombre, Correo: v.UsuarioCorreo},
+		Espacio: espacioRef{
+			ID: v.EspacioID, Nombre: v.EspacioNombre, Tipo: v.EspacioTipo, Estado: v.EspacioEstado,
+			FechaInicio: fecha(v.EspacioFechaInicio), FechaCierre: fecha(v.EspacioFechaCierre),
+		},
+		Profesor:       personaRef{ID: v.ProfesorID, Nombre: v.ProfesorNombre},
+		Rol:            v.Rol,
+		HorasSemanales: v.HorasSemanales,
+		CreadoEn:       v.CreadoEn,
+		ActualizadoEn:  v.ActualizadoEn,
+	}
+}
