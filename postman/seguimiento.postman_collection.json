@@ -1,0 +1,2349 @@
+{
+  "info": {
+    "name": "Plataforma de seguimiento - Entrega 1",
+    "description": "Recorrido completo de la API: usuarios, períodos, cursos y proyectos, vinculaciones con reglas de horas, tareas semanales con adjuntos y tardanza, seguimiento del profesor y reportes con IA.\n\nEjecútela en orden (Runner de Postman o Newman). Crea sus propios datos con correos y códigos únicos, así que puede ejecutarse varias veces. Ajuste adminPassword al valor de ADMIN_PASSWORD del .env.\n\nNewman: newman run seguimiento.postman_collection.json --env-var adminPassword=<clave> (desde la carpeta postman/).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "adminCorreo",
+      "value": "admin@uniandes.edu.co"
+    },
+    {
+      "key": "adminPassword",
+      "value": "cambie-esta-clave"
+    },
+    {
+      "key": "password",
+      "value": "Demo12345*"
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Preparación",
+      "description": "Verifica la API y obtiene el token del administrador inicial (definido en el .env).",
+      "item": [
+        {
+          "name": "Salud de la API",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/salud"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Fechas y datos únicos de esta ejecución: la colección se puede correr varias veces.",
+                  "const fmt = d => d.toISOString().slice(0, 10);",
+                  "const sumar = (d, dias) => new Date(d.getTime() + dias * 86400000);",
+                  "// La API calcula las semanas en hora de Bogotá (UTC-5, sin horario de verano); se usa esa",
+                  "// fecha y no la UTC para que la semana pasada lo sea también para la API.",
+                  "const hoy = new Date(Date.now() - 5 * 3600000);",
+                  "pm.collectionVariables.set('sufijo', Date.now().toString(36));",
+                  "pm.collectionVariables.set('codigoPeriodo', (2100 + Math.floor(Math.random() * 7800)) + '-' + (10 + Math.floor(Math.random() * 89)));",
+                  "pm.collectionVariables.set('periodoInicio', fmt(sumar(hoy, -120)));",
+                  "pm.collectionVariables.set('periodoCierre', fmt(sumar(hoy, 120)));",
+                  "pm.collectionVariables.set('espacioInicio', fmt(sumar(hoy, -90)));",
+                  "pm.collectionVariables.set('espacioCierre', fmt(sumar(hoy, 90)));",
+                  "pm.collectionVariables.set('fueraDelPeriodo', fmt(sumar(hoy, 200)));",
+                  "pm.collectionVariables.set('semanaPasada', fmt(sumar(hoy, -7)));",
+                  "pm.collectionVariables.set('semanaFutura', fmt(sumar(hoy, 14)));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"PostgreSQL y Redis disponibles\", () => { pm.expect(r.estado).to.eql('ok'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login administrador",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correo\": \"{{adminCorreo}}\",\n  \"password\": \"{{adminPassword}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('tokenAdmin', r.token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login con contraseña incorrecta",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correo\": \"{{adminCorreo}}\",\n  \"password\": \"incorrecta\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1. Usuarios y roles (administrador)",
+      "description": "RF-02: el administrador crea usuarios y asigna roles.",
+      "item": [
+        {
+          "name": "Crear profesora",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/usuarios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"Carolina Rojas\",\n  \"correo\": \"{{correoProfesor}}\",\n  \"password\": \"{{password}}\",\n  \"roles\": [\n    \"profesor\"\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('correoProfesor', 'profesora.' + pm.collectionVariables.get('sufijo') + '@uniandes.edu.co');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"No expone la contrase\\u00f1a\", () => { pm.expect(pm.response.text()).to.not.include('password'); });",
+                  "pm.collectionVariables.set('profesorId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear monitora y asistente graduada",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/usuarios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"Laura Martínez\",\n  \"correo\": \"{{correoMonitor}}\",\n  \"password\": \"{{password}}\",\n  \"roles\": [\n    \"monitor\",\n    \"asistente_graduado\"\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('correoMonitor', 'laura.' + pm.collectionVariables.get('sufijo') + '@uniandes.edu.co');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"No expone la contrase\\u00f1a\", () => { pm.expect(pm.response.text()).to.not.include('password'); });",
+                  "pm.collectionVariables.set('monitorId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear monitor (sin rol de asistente)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/usuarios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"Pedro Sánchez\",\n  \"correo\": \"{{correoMonitor2}}\",\n  \"password\": \"{{password}}\",\n  \"roles\": [\n    \"monitor\"\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('correoMonitor2', 'pedro.' + pm.collectionVariables.get('sufijo') + '@uniandes.edu.co');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"No expone la contrase\\u00f1a\", () => { pm.expect(pm.response.text()).to.not.include('password'); });",
+                  "pm.collectionVariables.set('monitor2Id', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Correo inválido",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/usuarios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"X\",\n  \"correo\": \"no-es-un-correo\",\n  \"password\": \"{{password}}\",\n  \"roles\": [\n    \"monitor\"\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Listar monitores",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/usuarios?rol=monitor&busqueda={{sufijo}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Incluye a los dos monitores\", () => { pm.expect(r.length).to.eql(2); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login profesora",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correo\": \"{{correoProfesor}}\",\n  \"password\": \"{{password}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('tokenProfesor', r.token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login monitora",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correo\": \"{{correoMonitor}}\",\n  \"password\": \"{{password}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Tiene dos roles operativos\", () => { pm.expect(r.usuario.roles).to.include.members(['monitor', 'asistente_graduado']); });",
+                  "pm.collectionVariables.set('tokenMonitor', r.token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login monitor 2",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correo\": \"{{correoMonitor2}}\",\n  \"password\": \"{{password}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('tokenMonitor2', r.token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Usuario actual",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/yo"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Un monitor no puede crear usuarios",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/usuarios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"X\",\n  \"correo\": \"x@x.co\",\n  \"password\": \"{{password}}\",\n  \"roles\": [\n    \"monitor\"\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Períodos académicos (administrador)",
+      "description": "RF-03.2: los cursos y proyectos solo se crean en períodos activos y habilitados.",
+      "item": [
+        {
+          "name": "Crear período",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/periodos",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"codigo\": \"{{codigoPeriodo}}\",\n  \"fecha_inicio\": \"{{periodoInicio}}\",\n  \"fecha_cierre\": \"{{periodoCierre}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Habilitado para crear espacios\", () => { pm.expect(r.creacion_habilitada).to.be.true; });",
+                  "pm.collectionVariables.set('periodoId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Período duplicado",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/periodos",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"codigo\": \"{{codigoPeriodo}}\",\n  \"fecha_inicio\": \"{{periodoInicio}}\",\n  \"fecha_cierre\": \"{{periodoCierre}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 409', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Consultar períodos activos",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/periodos?estado=activo"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Cursos y proyectos (profesor)",
+      "description": "RF-03: el profesor crea cursos y proyectos dentro del período.",
+      "item": [
+        {
+          "name": "Crear curso",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tipo\": \"curso\",\n  \"nombre\": \"Desarrollo de software en la nube\",\n  \"periodo_id\": \"{{periodoId}}\",\n  \"fecha_inicio\": \"{{espacioInicio}}\",\n  \"fecha_cierre\": \"{{espacioCierre}}\",\n  \"observaciones\": \"MISW4204\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('cursoId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear proyecto",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tipo\": \"proyecto\",\n  \"nombre\": \"Plataforma de analítica académica\",\n  \"periodo_id\": \"{{periodoId}}\",\n  \"fecha_inicio\": \"{{espacioInicio}}\",\n  \"fecha_cierre\": \"{{espacioCierre}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('proyectoId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear curso adicional",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tipo\": \"curso\",\n  \"nombre\": \"Arquitectura de software\",\n  \"periodo_id\": \"{{periodoId}}\",\n  \"fecha_inicio\": \"{{espacioInicio}}\",\n  \"fecha_cierre\": \"{{espacioCierre}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('cursoExtraId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Fechas fuera del período",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tipo\": \"curso\",\n  \"nombre\": \"Fuera de rango\",\n  \"periodo_id\": \"{{periodoId}}\",\n  \"fecha_inicio\": \"{{espacioInicio}}\",\n  \"fecha_cierre\": \"{{fueraDelPeriodo}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Un monitor no puede crear cursos",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tipo\": \"curso\",\n  \"nombre\": \"X\",\n  \"periodo_id\": \"{{periodoId}}\",\n  \"fecha_inicio\": \"{{espacioInicio}}\",\n  \"fecha_cierre\": \"{{espacioCierre}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Listar mis cursos y proyectos",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios?periodo_id={{periodoId}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Tiene tres espacios\", () => { pm.expect(r.length).to.eql(3); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Vinculaciones y reglas de horas",
+      "description": "RF-04, RF-05, RN-14 a RN-19: validaciones bloqueantes de dedicación.",
+      "item": [
+        {
+          "name": "Vincular asistente graduada 12 h (por correo)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{proyectoId}}\",\n  \"correo\": \"{{correoMonitor}}\",\n  \"rol\": \"asistente_graduado\",\n  \"horas_semanales\": 12\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('vincAsistId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Vincular monitoría 5 h (40 % de 12 = 4,8 → 5)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{cursoId}}\",\n  \"usuario_id\": \"{{monitorId}}\",\n  \"rol\": \"monitor\",\n  \"horas_semanales\": 5\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('vincMonitorId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Otra monitoría supera el 40 % (RN-17)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{cursoExtraId}}\",\n  \"usuario_id\": \"{{monitorId}}\",\n  \"rol\": \"monitor\",\n  \"horas_semanales\": 1\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Explica la regla del 40 %\", () => { pm.expect(r.mensaje).to.include('40'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Asistencia que supera 22 h (RN-14)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{cursoExtraId}}\",\n  \"usuario_id\": \"{{monitorId}}\",\n  \"rol\": \"asistente_graduado\",\n  \"horas_semanales\": 11\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Explica el l\\u00edmite de 22 h\", () => { pm.expect(r.mensaje).to.include('22'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Vinculación repetida",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{cursoId}}\",\n  \"usuario_id\": \"{{monitorId}}\",\n  \"rol\": \"monitor\",\n  \"horas_semanales\": 1\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 409', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Persona sin el rol requerido",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{cursoId}}\",\n  \"usuario_id\": \"{{monitor2Id}}\",\n  \"rol\": \"asistente_graduado\",\n  \"horas_semanales\": 4\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Vincular monitor 2 (3 h)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{cursoId}}\",\n  \"usuario_id\": \"{{monitor2Id}}\",\n  \"rol\": \"monitor\",\n  \"horas_semanales\": 3\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('vincMonitor2Id', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Un monitor no puede vincular",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{cursoId}}\",\n  \"usuario_id\": \"{{monitor2Id}}\",\n  \"rol\": \"monitor\",\n  \"horas_semanales\": 1\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Monitora: listado unificado de sus cursos y proyectos (RF-11.1)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Ve solo sus dos vinculaciones\", () => { pm.expect(r.length).to.eql(2); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Monitora: sus espacios",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Ve solo los espacios donde participa\", () => { pm.expect(r.length).to.eql(2); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5. Rectificación de vinculaciones (administrador)",
+      "description": "RF-04.4 y RF-04.5: solo el administrador corrige horas; queda trazabilidad.",
+      "item": [
+        {
+          "name": "El profesor no puede modificar horas (RN-12)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones/{{vincAsistId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"horas_semanales\": 14,\n  \"motivo\": \"x\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Rectificar 12 h → 14 h",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones/{{vincAsistId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"horas_semanales\": 14,\n  \"motivo\": \"Ajuste del contrato de asistencia\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Horas corregidas\", () => { pm.expect(r.horas_semanales).to.eql(14); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Rectificar a 10 h incumpliría el 40 % (5 h de monitoría)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones/{{vincAsistId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"horas_semanales\": 10,\n  \"motivo\": \"Prueba de regla\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Historial de rectificaciones",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones/{{vincAsistId}}/rectificaciones"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Una rectificaci\\u00f3n con 12 \\u2192 14\", () => { pm.expect(r.length).to.eql(1); pm.expect(r[0].horas_anteriores).to.eql(12); pm.expect(r[0].horas_nuevas).to.eql(14); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "6. Tareas semanales (monitor o asistente)",
+      "description": "RF-06 a RF-08: registro semanal, tardanza, inmutabilidad y adjuntos.",
+      "item": [
+        {
+          "name": "Registrar tarea de la semana actual",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincMonitorId}}\",\n  \"titulo\": \"Calificación del taller de Docker\",\n  \"descripcion\": \"Revisión de 28 entregas del taller de Docker Compose.\",\n  \"estado\": \"en_desarrollo\",\n  \"horas_invertidas\": 4,\n  \"observaciones\": \"\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"No es tard\\u00eda y se puede editar\", () => { pm.expect(r.tardia).to.be.false; pm.expect(r.modificable).to.be.true; });",
+                  "pm.collectionVariables.set('tareaActualId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registrar tarea con adjunto (multipart)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "datos",
+                  "type": "text",
+                  "value": "{\"vinculacion_id\": \"{{vincAsistId}}\", \"titulo\": \"Modelo de datos del tablero\", \"descripcion\": \"Diseño del esquema de métricas.\", \"estado\": \"finalizado\", \"horas_invertidas\": 6, \"observaciones\": \"\"}"
+                },
+                {
+                  "key": "adjuntos",
+                  "type": "file",
+                  "src": "archivos/evidencia.txt"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Tiene el adjunto\", () => { pm.expect(r.cantidad_adjuntos).to.eql(1); });",
+                  "pm.collectionVariables.set('tareaAdjuntoId', r.id);",
+                  "pm.collectionVariables.set('adjuntoId', r.adjuntos[0].id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registrar reporte tardío (semana pasada)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincAsistId}}\",\n  \"titulo\": \"Integración con la API de notas\",\n  \"descripcion\": \"\",\n  \"estado\": \"en_desarrollo\",\n  \"horas_invertidas\": 5,\n  \"observaciones\": \"Pendiente de credenciales del servicio.\",\n  \"semana\": \"{{semanaPasada}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Marcado como tard\\u00edo (RN-32) y no modificable\", () => { pm.expect(r.tardia).to.be.true; pm.expect(r.modificable).to.be.false; });",
+                  "pm.collectionVariables.set('tareaTardiaId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Semana futura",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincMonitorId}}\",\n  \"titulo\": \"Futuro\",\n  \"descripcion\": \"\",\n  \"estado\": \"abierto\",\n  \"horas_invertidas\": 1,\n  \"observaciones\": \"\",\n  \"semana\": \"{{semanaFutura}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Horas no enteras (RN-24)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincMonitorId}}\",\n  \"titulo\": \"Horas decimales\",\n  \"descripcion\": \"\",\n  \"estado\": \"abierto\",\n  \"horas_invertidas\": 2.5,\n  \"observaciones\": \"\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Estado inválido (RN-27)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincMonitorId}}\",\n  \"titulo\": \"Estado raro\",\n  \"descripcion\": \"\",\n  \"estado\": \"cerrado\",\n  \"horas_invertidas\": 1,\n  \"observaciones\": \"\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Vinculación de otra persona",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor2}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincMonitorId}}\",\n  \"titulo\": \"Ajena\",\n  \"descripcion\": \"\",\n  \"estado\": \"abierto\",\n  \"horas_invertidas\": 1,\n  \"observaciones\": \"\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Un profesor no registra tareas",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincMonitorId}}\",\n  \"titulo\": \"X\",\n  \"descripcion\": \"\",\n  \"estado\": \"abierto\",\n  \"horas_invertidas\": 1,\n  \"observaciones\": \"\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Editar tarea de la semana actual (RF-06.7, RF-07.2)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas/{{tareaActualId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"titulo\": \"Calificación del taller de Docker\",\n  \"descripcion\": \"Revisión y retroalimentación de 28 entregas.\",\n  \"estado\": \"finalizado\",\n  \"horas_invertidas\": 5,\n  \"observaciones\": \"\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Estado finalizado\", () => { pm.expect(r.estado).to.eql('finalizado'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Editar un reporte tardío (RN-33)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas/{{tareaTardiaId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"titulo\": \"X\",\n  \"estado\": \"finalizado\",\n  \"horas_invertidas\": 1\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Eliminar un reporte tardío (RN-34)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas/{{tareaTardiaId}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "El profesor no edita tareas",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas/{{tareaActualId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"titulo\": \"X\",\n  \"estado\": \"finalizado\",\n  \"horas_invertidas\": 1\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registrar tarea temporal",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincMonitorId}}\",\n  \"titulo\": \"Tarea para eliminar\",\n  \"descripcion\": \"\",\n  \"estado\": \"abierto\",\n  \"horas_invertidas\": 1,\n  \"observaciones\": \"\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', () => pm.response.to.have.status(201));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('tareaTemporalId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Eliminar tarea de la semana actual (RF-06.8)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas/{{tareaTemporalId}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 204', () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Monitora: sus tareas (RF-11.2)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Tres tareas propias\", () => { pm.expect(r.length).to.eql(3); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Profesora: tareas de una persona a cargo (RF-10.5)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas?usuario_id={{monitorId}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Ve las tres tareas\", () => { pm.expect(r.length).to.eql(3); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Profesora: descargar adjunto",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas/{{tareaAdjuntoId}}/adjuntos/{{adjuntoId}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Se descarga como adjunto\", () => { pm.expect(pm.response.headers.get('Content-Disposition')).to.include('attachment'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Otro monitor no ve la tarea (RN-04)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor2}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas/{{tareaActualId}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "7. Seguimiento del profesor",
+      "description": "RF-09, RF-10 y RF-11.3: personas a cargo, detalle semanal, consolidado e historial.",
+      "item": [
+        {
+          "name": "Personas a cargo (vista principal del profesor)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/seguimiento/personas"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Dos personas\", () => { pm.expect(r.length).to.eql(2); });",
+                  "pm.test(\"Laura report\\u00f3 11 h esta semana (5 + 6)\", () => { const laura = r.find(p => p.usuario.id === pm.collectionVariables.get('monitorId')); pm.expect(laura.semana_actual.horas_reportadas).to.eql(11); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Detalle semanal de una persona (RF-10.3, RF-10.6)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/seguimiento/personas/{{monitorId}}/semanas"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Incluye la semana pasada con el reporte tard\\u00edo\", () => { const s = r.semanas.find(x => x.estado === 'con_reporte'); pm.expect(s.vinculaciones.some(v => v.tareas_tardias === 1)).to.be.true; });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Consolidado de una persona (RF-10.4)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/seguimiento/personas/{{monitorId}}/consolidado"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Una entrada por vinculaci\\u00f3n\", () => { pm.expect(r.vinculaciones.length).to.eql(2); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Monitora: su historial (RF-11.3)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/seguimiento/mi-historial"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Un monitor no ve a otra persona (RF-12)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/seguimiento/personas/{{monitor2Id}}/semanas"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Un monitor no accede a personas a cargo",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/seguimiento/personas"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "8. Reportes semanales con IA",
+      "description": "RF-14: generación asíncrona por lotes, PDF y descarga.",
+      "item": [
+        {
+          "name": "Un monitor no genera reportes",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reportes/lotes",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"semana\": \"{{semanaPasada}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 403', () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Solicitar lote de la semana pasada",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reportes/lotes",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"semana\": \"{{semanaPasada}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', () => pm.response.to.have.status(202));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.collectionVariables.set('loteId', r.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Consultar avance del lote",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reportes/lotes/{{loteId}}"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Espera a que el worker procese el lote.",
+                  "setTimeout(() => {}, 4000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Lote completado\", () => { pm.expect(r.estado).to.eql('completado'); });",
+                  "pm.test(\"Un reporte por persona\", () => { pm.expect(r.total_reportes).to.eql(2); });",
+                  "pm.collectionVariables.set('reporteId', r.reportes.find(x => x.usuario_id === pm.collectionVariables.get('monitorId')).id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Listar reportes de la semana",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reportes?semana={{semanaPasada}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Detalle del reporte con el resumen",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reportes/{{reporteId}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Tiene resumen\", () => { pm.expect(r.resumen).to.not.be.empty; });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Descargar PDF",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reportes/{{reporteId}}/pdf"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Es un PDF\", () => { pm.expect(pm.response.headers.get('Content-Type')).to.eql('application/pdf'); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "9. Cierre de cursos y de la ventana de creación",
+      "description": "RF-03.5 a RF-03.7 y RN-07 a RN-09.",
+      "item": [
+        {
+          "name": "Cerrar curso (RF-03.5)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios/{{cursoId}}/cerrar"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Queda en solo lectura\", () => { pm.expect(r.solo_lectura).to.be.true; });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registrar tarea en un curso cerrado (RF-03.7)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vinculacion_id\": \"{{vincMonitorId}}\",\n  \"titulo\": \"X\",\n  \"descripcion\": \"\",\n  \"estado\": \"abierto\",\n  \"horas_invertidas\": 1,\n  \"observaciones\": \"\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Editar tarea de un curso cerrado",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/tareas/{{tareaActualId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"titulo\": \"X\",\n  \"estado\": \"finalizado\",\n  \"horas_invertidas\": 1\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Vincular en un curso cerrado",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/vinculaciones",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"espacio_id\": \"{{cursoId}}\",\n  \"usuario_id\": \"{{monitor2Id}}\",\n  \"rol\": \"monitor\",\n  \"horas_semanales\": 1\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "El curso cerrado se sigue consultando (RF-03.6)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenMonitor}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios/{{cursoId}}"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));",
+                  "const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};",
+                  "pm.test(\"Estado cerrado\", () => { pm.expect(r.estado).to.eql('cerrado'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cerrar la ventana de creación del período",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenAdmin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/periodos/{{periodoId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"creacion_habilitada\": false\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear curso con la ventana cerrada (RN-07)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenProfesor}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/espacios",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tipo\": \"curso\",\n  \"nombre\": \"Tardío\",\n  \"periodo_id\": \"{{periodoId}}\",\n  \"fecha_inicio\": \"{{espacioInicio}}\",\n  \"fecha_cierre\": \"{{espacioCierre}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

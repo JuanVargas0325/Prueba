@@ -1,134 +1,175 @@
-# Paso 59 · Datos de demostración
+# Paso 60 · Colección de Postman (prueba de punta a punta)
 
-> Rama `paso-a-paso` · paso 59 de 65 · anterior: **Paso 58 · Pruebas de integración** · siguiente: **Paso 60 · Colección de Postman**
+> Rama `paso-a-paso` · paso 60 de 65 · anterior: **Paso 59 · Datos de demostración** · siguiente: **Paso 61 · Newman en la integración continua**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se agregó un script SQL con un **escenario de demostración** listo para usar: una profesora, tres personas a cargo, un período, un curso, un proyecto, vinculaciones y tareas repartidas en varias semanas.
+Se agregó una **colección de Postman** que recorre toda la API, del inicio de sesión a la descarga del PDF del reporte, y comprueba cada respuesta con pruebas automáticas. También se agregó `make e2e`, que la ejecuta con **Newman**, el ejecutor de colecciones de Postman por línea de comandos.
 
 | Archivo | Cambio |
 |---|---|
-| `scripts/datos_demo.sql` | **Nuevo.** Escenario de demostración idempotente. |
-| `Makefile` | **Modificado.** Objetivo `make demo`. |
+| `postman/seguimiento.postman_collection.json` | **Nuevo.** 73 peticiones en 10 carpetas, con 104 comprobaciones. |
+| `postman/archivos/evidencia.txt` | **Nuevo.** Archivo que se sube como adjunto en la petición *multipart*. |
+| `Makefile` | **Modificado.** Variables `NEWMAN_IMG` y `ADMIN_PASSWORD` y objetivo `e2e`. |
 
-| Usuario (contraseña `Demo123*`) | Rol | Situación |
-|---|---|---|
-| `profesora.rojas@uniandes.edu.co` | profesora | Responsable del curso y del proyecto. |
-| `andres.monitor@uniandes.edu.co` | monitor | 6 h; reporta algunas semanas y otras no. |
-| `laura.asistente@uniandes.edu.co` | asistente graduada y monitora | 12 h + 4 h (dentro del 40 %); tiene un reporte **tardío**. |
-| `pedro.sintareas@uniandes.edu.co` | monitor | 3 h; **nunca reporta**: todas sus semanas cerradas aparecen `sin_reporte`. |
-
-Vista de la profesora después de cargarlo:
+Resultado contra el sistema levantado con `docker compose`:
 
 ```
-Andrés Gómez   | 1 vinculación  |  6 h | semana anterior: sin_reporte
-Laura Martínez | 2 vinculaciones| 16 h | semana anterior: con_reporte
-Pedro Sánchez  | 1 vinculación  |  3 h | semana anterior: sin_reporte
+│  requests     │ 73  │ 0 │
+│  assertions   │ 104 │ 0 │
 ```
 
 ---
 
 ## 2. Por qué
 
-- **Para el video y la sustentación:** el seguimiento (paso 44) y los reportes (paso 55) solo se aprecian con **historia**: semanas con y sin reporte, tareas tardías, horas en varios espacios. Crearla a mano por la API tomaría mucho tiempo y, además, la API fecha todo "hoy" (no se puede crear una vinculación del mes pasado).
-- **Para probar a mano** cualquier funcionalidad con datos realistas, sin preparar nada.
+- **La entrega exige una colección de Postman** que demuestre el funcionamiento de la API (lineamientos de la Entrega 1).
+- Las pruebas unitarias (pasos 9 a 55) y de integración (paso 58) prueban piezas por separado. Esta colección prueba el **sistema completo, tal como lo usaría un cliente**: Nginx → API → PostgreSQL → Redis → worker → PDF. Por eso se llama prueba **de punta a punta** (*end to end*, **e2e**).
+- Es documentación ejecutable: quien abra la colección en Postman ve cada endpoint con un ejemplo real de petición.
 
 ---
 
-## 3. Explicación detallada de `datos_demo.sql`
+## 3. Explicación detallada
 
-```sql
-CREATE EXTENSION IF NOT EXISTS pgcrypto; -- solo para generar los hash bcrypt de demostración
+### 3.1 ¿Qué es Postman? ¿Qué es Newman?
 
-BEGIN;
+- **Postman** es una aplicación de escritorio para enviar peticiones HTTP a mano. Una **colección** es un archivo JSON con peticiones ordenadas en carpetas. Se importa con *File → Import*.
+- Cada petición puede tener dos scripts de JavaScript:
+  - **pre-request** (antes de enviarla): prepara datos;
+  - **tests** (después de recibir la respuesta): comprueba la respuesta con `pm.test(...)` y guarda valores para las peticiones siguientes.
+- **Newman** ejecuta la misma colección **sin interfaz gráfica**. Se usa en la terminal y en la integración continua (paso 61). Aquí se ejecuta con su imagen oficial de Docker (`postman/newman:ubuntu`), así que no hace falta instalar Node.js.
 
-INSERT INTO usuarios (id, nombre, correo, password_hash) VALUES
-  ('11111111-1111-4111-8111-111111111111', 'Carolina Rojas', 'profesora.rojas@uniandes.edu.co', crypt('Demo123*', gen_salt('bf', 10))),
-  ...
-ON CONFLICT (id) DO NOTHING;
+### 3.2 Las carpetas
+
+| Carpeta | Qué prueba |
+|---|---|
+| 0. Preparación | `/salud`, inicio de sesión del administrador y contraseña incorrecta (401). |
+| 1. Usuarios y roles | Crear profesora, monitora/asistente y monitor; correo inválido; un monitor no puede crear usuarios (403). |
+| 2. Períodos | Crear, duplicado (409) y filtro por estado. |
+| 3. Cursos y proyectos | Crear, fechas fuera del período, permisos y listado. |
+| 4. Vinculaciones | Reglas de horas: 40 % (RN-17), máximo 22 h (RN-14), repetida, rol requerido. |
+| 5. Rectificación | Solo el administrador cambia horas (RN-12) e historial. |
+| 6. Tareas | Crear (JSON y *multipart* con adjunto), tardía, futura, validaciones, editar/eliminar, visibilidad. |
+| 7. Seguimiento | Personas a cargo, detalle semanal, consolidado, historial propio y permisos. |
+| 8. Reportes con IA | Lote → espera al worker → listar → detalle → **PDF**. |
+| 9. Cierre | Curso cerrado (no admite tareas ni vinculaciones, pero se consulta) y cierre de la ventana de creación. |
+
+Cada petición comprueba **el código HTTP** y, cuando aplica, **el contenido**. Por ejemplo, el caso del 40 %:
+
+```js
+pm.test('Responde 422', () => pm.response.to.have.status(422));
+const r = (pm.response.headers.get('Content-Type') || '').includes('json') ? pm.response.json() : {};
+pm.test("Explica la regla del 40 %", () => { pm.expect(r.mensaje).to.include('40'); });
 ```
-- **`pgcrypto`** es una extensión de PostgreSQL con funciones criptográficas. `crypt('Demo123*', gen_salt('bf', 10))` genera un hash **bcrypt** (`bf` = Blowfish, costo 10): el mismo formato que usa la API (paso 12). Así se puede iniciar sesión con estos usuarios.
-- **IDs fijos y legibles** (`1111…`, `2222…`): permiten relacionar las filas en el script y reconocerlas en las pruebas.
-- **`BEGIN … COMMIT`**: todo el escenario se carga en una transacción: o se crea completo o no se crea nada.
-- **`ON CONFLICT … DO NOTHING`** en cada `INSERT`: el script es **idempotente**; ejecutarlo dos veces no duplica ni falla.
+- `pm` es el objeto de Postman disponible en los scripts. `pm.response` es la respuesta y `pm.expect` hace las comprobaciones (estilo de la librería Chai).
+- `r` solo se interpreta como JSON si la respuesta es JSON (el PDF no lo es).
 
-```sql
--- Laura: 12 h como asistente graduada y 4 h como monitora (máximo permitido: 40 % de 12 = 4,8 → 5 h).
--- Las vinculaciones se fechan al inicio del semestre para que exijan reporte desde entonces.
-INSERT INTO vinculaciones (id, usuario_id, espacio_id, rol, horas_semanales, creado_en, actualizado_en) VALUES ...
+### 3.3 Cómo pasa datos de una petición a otra
+
+```js
+pm.collectionVariables.set('profesorId', r.id);   // en "Crear profesora"
 ```
-- **Respeta las reglas de horas**: los datos de demostración son un ejemplo **válido** del negocio.
-- `creado_en` = 3 de agosto: la vigencia de cada vinculación empieza ahí (paso 30), así que las semanas cerradas sin tareas salen como `sin_reporte`.
+y luego en otra petición: `"usuario_id": "{{profesorId}}"`. Las `{{variables}}` se reemplazan antes de enviar. Así funciona la cadena de tokens (`tokenAdmin`, `tokenProfesor`, `tokenMonitor`…) e IDs.
 
-```sql
-INSERT INTO tareas (..., tardia) VALUES
-  -- Semana del 21 de septiembre
-  ...
-  -- Semana del 28 de septiembre (Laura reporta tarde; Andrés no reporta)
-  ... 'Registrada después del cierre de la semana.', true),
-  -- Semana del 5 de octubre
-  ...
+Variables propias de la colección (se pueden cambiar sin editar el archivo):
+
+| Variable | Valor por defecto | Para qué |
+|---|---|---|
+| `baseUrl` | `http://localhost:8080` | Dirección de la API. |
+| `adminCorreo` | `admin@uniandes.edu.co` | `ADMIN_EMAIL` del `.env`. |
+| `adminPassword` | `cambie-esta-clave` | `ADMIN_PASSWORD` del `.env`. |
+| `password` | `Demo12345*` | Contraseña de los usuarios que crea. |
+
+### 3.4 Se puede ejecutar muchas veces
+
+La primera petición genera **datos únicos** para cada ejecución:
+
+```js
+// La API calcula las semanas en hora de Bogotá (UTC-5, sin horario de verano); se usa esa
+// fecha y no la UTC para que la semana pasada lo sea también para la API.
+const hoy = new Date(Date.now() - 5 * 3600000);
+pm.collectionVariables.set('sufijo', Date.now().toString(36));
+pm.collectionVariables.set('codigoPeriodo', (2100 + Math.floor(Math.random() * 7800)) + '-' + ...);
+pm.collectionVariables.set('semanaPasada', fmt(sumar(hoy, -7)));
 ```
-- Las tareas están en las semanas del 21/09, 28/09 y 05/10 de 2026, con distintos estados, observaciones y dos reportes **tardíos**.
-- **Este script escribe directo en la base de datos y se salta las reglas de la API** (por ejemplo, puede crear tareas tardías o fechar vinculaciones en el pasado). Solo es para demostración; **nunca** se debe usar en producción.
+- `sufijo` se agrega a los correos (`profesora.<sufijo>@…`), así que nunca chocan con los de ejecuciones anteriores.
+- El código de período es aleatorio (`2100-10` … `9899-98`).
+- Las fechas son **relativas a hoy**, así que la colección no "caduca".
 
----
+**Detalle importante de la zona horaria (corregido en este paso):** `new Date()` en JavaScript da la hora UTC. Entre las 19:00 y las 24:00 de un domingo en Colombia, en UTC ya es **lunes**. Entonces "hoy − 7 días" caía en la semana **actual** de Bogotá y la tarea "de la semana pasada" no quedaba marcada como tardía: fallaban 6 comprobaciones. Restar 5 horas (`- 5 * 3600000` milisegundos) hace que las fechas coincidan con las que calcula la API (`APP_ZONA_HORARIA=America/Bogota`, paso 1).
 
-## 4. `make demo`
+### 3.5 La espera al worker
+
+```js
+// Espera a que el worker procese el lote.
+setTimeout(() => {}, 4000);
+```
+Generar reportes es **asíncrono** (paso 47): la API responde 202 enseguida y el worker trabaja después. Este *pre-request* espera 4 s antes de consultar el lote; Newman espera a que terminen los temporizadores pendientes. Con el proveedor de IA `simulado` sobra tiempo.
+
+### 3.6 `make e2e`
 
 ```makefile
-demo: ## Carga los datos de demostración
-	docker compose exec -T postgres psql -U $$(grep '^POSTGRES_USER=' .env | cut -d= -f2) -d $$(grep '^POSTGRES_DB=' .env | cut -d= -f2) < scripts/datos_demo.sql
+NEWMAN_IMG  := postman/newman:ubuntu
+ADMIN_PASSWORD ?= $(shell grep '^ADMIN_PASSWORD=' .env 2>/dev/null | cut -d= -f2)
+
+e2e: ## Ejecuta la colección de Postman contra el sistema levantado
+	docker run --rm -v "$(CURDIR)/postman:/etc/newman" $(NEWMAN_IMG) run seguimiento.postman_collection.json \
+		--env-var "baseUrl=http://host.docker.internal:8080" --env-var "adminPassword=$(ADMIN_PASSWORD)"
 ```
-- Ejecuta `psql` **dentro** del contenedor de PostgreSQL y le pasa el script por la entrada estándar (`<`). `-T` desactiva la terminal interactiva, necesario para redirigir un archivo.
-- Lee el usuario y la base de datos de su `.env` (`grep … | cut -d= -f2` toma lo que está después del `=`). En un `Makefile`, `$$(...)` produce `$(...)` para el shell.
+- `-v "$(CURDIR)/postman:/etc/newman"` monta la carpeta `postman/` en el contenedor; Newman busca allí la colección y el adjunto (`archivos/evidencia.txt`).
+- `host.docker.internal` es el nombre con el que un contenedor llega **al equipo anfitrión** (donde Nginx publica el puerto 8080). En Linux puede requerir `--add-host=host.docker.internal:host-gateway`.
+- `?=` asigna solo si la variable no viene de fuera: `make e2e ADMIN_PASSWORD=otra` la reemplaza.
+- `$(shell …)` ejecuta un comando al leer el Makefile y toma su salida (aquí, la clave del `.env`).
 
 ---
 
-## 5. Cómo comprobarlo
+## 4. Cómo comprobarlo
 
 ```bash
 docker compose up --build -d --wait
-make demo
-# o: docker compose exec -T postgres psql -U seguimiento -d seguimiento < scripts/datos_demo.sql
-
-# Iniciar sesión como la profesora y ver a sus personas
-TOKEN=$(curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
-  -d '{"correo":"profesora.rojas@uniandes.edu.co","password":"Demo123*"}' | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
-curl -s localhost:8080/api/v1/seguimiento/personas -H "Authorization: Bearer $TOKEN"
+make e2e
 ```
 
-Ideas para la demostración:
-- detalle semanal de Pedro (todo `sin_reporte`) y de Laura (con su tarea tardía);
-- un lote de reportes de la semana del 28/09 y la descarga de los PDF;
-- intentar vincular a Laura a otra monitoría de 2 h: se rechaza (4 + 2 = 6 > 5 h).
+Sin `make` (por ejemplo en Git Bash de Windows):
 
-Ejecutar `make demo` otra vez no cambia nada (idempotente).
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W)/postman:/etc/newman" postman/newman:ubuntu \
+  run seguimiento.postman_collection.json \
+  --env-var "baseUrl=http://host.docker.internal:8080" --env-var "adminPassword=cambie-esta-clave"
+```
+(`MSYS_NO_PATHCONV=1` evita que Git Bash convierta `/etc/newman` en una ruta de Windows; `pwd -W` da la ruta en formato Windows que entiende Docker Desktop.)
 
----
+En Postman: *Import* → el archivo `.json` → *Run collection*. Si cambió `ADMIN_PASSWORD`, edite la variable `adminPassword` de la colección.
 
-## 6. Pasos para lograr esta versión desde el paso 58
-
-1. Crear `scripts/datos_demo.sql` (sección 3).
-2. En el `Makefile`: el objetivo `demo` y agregarlo a `.PHONY`.
-3. `make demo` sobre el sistema levantado.
-4. Commit: `git add . && git commit -m "Paso 59: datos de demostración"`
+Debe terminar con **0 fallos**.
 
 ---
 
-## 7. Preparación para las próximas entregas
+## 5. Pasos para lograr esta versión desde el paso 59
 
-- Sirve igual contra la base de datos de la nube (Entrega 2): basta con ejecutarlo con `psql` contra Cloud SQL para tener datos con los cuales probar el frontend.
-- Si las fechas de la demostración quedan muy atrás, se pueden ajustar las de las tareas y las vinculaciones; las reglas de semanas se calculan sobre la fecha real del sistema.
+1. Crear `postman/archivos/evidencia.txt` con una línea de texto.
+2. Crear `postman/seguimiento.postman_collection.json`. Se puede construir en Postman (carpetas, peticiones, scripts) y exportar con *Export → Collection v2.1*. Aquí se copia la versión del repositorio.
+3. En el `Makefile`: las variables `NEWMAN_IMG` y `ADMIN_PASSWORD` al inicio, `e2e` en `.PHONY` y el objetivo `e2e` al final.
+4. `docker compose up --build -d --wait` y `make e2e`.
+5. Commit: `git add . && git commit -m "Paso 60: colección de Postman"`
 
 ---
 
-## 8. Requisitos que atiende
+## 6. Preparación para las próximas entregas
+
+- **Prueba de humo del despliegue en la nube:** la misma colección sirve contra la URL del balanceador de carga cambiando solo `baseUrl`:
+  `newman run seguimiento.postman_collection.json --env-var baseUrl=http://<ip-del-balanceador> --env-var adminPassword=...`
+  Si pasa, el despliegue funciona de punta a punta.
+- Al agregar endpoints en futuras entregas, conviene agregar su petición aquí: el paso 61 hace que la integración continua la ejecute en cada push.
+
+---
+
+## 7. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| Sustentación en video (lineamientos §3) | Escenario listo para mostrar las funcionalidades. |
-| RF-09 / RF-10 | Datos con semanas con reporte, sin reporte y tardías. |
-| RF-05 | Vinculaciones que respetan las reglas de horas. |
+| Colección de Postman (entregables de la Entrega 1) | La colección completa. |
+| RF-01 a RF-12 | Al menos una petición de éxito y otra de error por funcionalidad. |
+| Reglas de negocio (RN-04, RN-07, RN-12, RN-14, RN-17, RN-24, RN-27, RN-32 a RN-34) | Casos con nombre de la regla. |

@@ -3,9 +3,11 @@
 
 GO_IMG      := golang:1.26
 LINT_IMG    := golangci/golangci-lint:latest
+NEWMAN_IMG  := postman/newman:ubuntu
 DOCKER_GO   := docker run --rm -v "$(CURDIR)/backend:/src" -v gomod:/go/pkg/mod -v gocache:/root/.cache/go-build -w /src
+ADMIN_PASSWORD ?= $(shell grep '^ADMIN_PASSWORD=' .env 2>/dev/null | cut -d= -f2)
 
-.PHONY: ayuda arriba abajo logs demo pruebas pruebas-integracion lint formato
+.PHONY: ayuda arriba abajo logs demo pruebas pruebas-integracion lint formato e2e
 
 ayuda: ## Muestra esta ayuda
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-22s %s\n", $$1, $$2}'
@@ -38,3 +40,7 @@ lint: ## Formato y análisis estático (golangci-lint)
 
 formato: ## Aplica gofmt a todo el código
 	$(DOCKER_GO) $(GO_IMG) gofmt -w .
+
+e2e: ## Ejecuta la colección de Postman contra el sistema levantado
+	docker run --rm -v "$(CURDIR)/postman:/etc/newman" $(NEWMAN_IMG) run seguimiento.postman_collection.json \
+		--env-var "baseUrl=http://host.docker.internal:8080" --env-var "adminPassword=$(ADMIN_PASSWORD)"
