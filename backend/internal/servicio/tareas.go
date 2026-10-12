@@ -303,10 +303,3 @@ func espacioDe(v dominio.Vinculacion) dominio.Espacio {
 		FechaInicio: v.EspacioFechaInicio, FechaCierre: v.EspacioFechaCierre, ProfesorID: v.ProfesorID,
 	}
 }
-
-// Almacenamiento guarda y recupera archivos binarios.
-type Almacenamiento interface {
-	Guardar(ctx context.Context, ruta string, contenido io.Reader) (int64, error)
-	Abrir(ctx context.Context, ruta string) (io.ReadCloser, error)
-	Eliminar(ctx context.Context, ruta string) error
-}
