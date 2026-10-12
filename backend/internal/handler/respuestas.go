@@ -13,9 +13,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"seguimiento/internal/apperr"
 	"seguimiento/internal/dominio"
@@ -90,6 +92,23 @@ func decodificarJSON(r io.Reader, destino any) error {
 	}
 }
 
+// parametroUUID lee un parámetro de ruta y valida que sea un UUID.
+func parametroUUID(c *gin.Context, nombre string) (string, error) {
+	valor := c.Param(nombre)
+	if _, err := uuid.Parse(valor); err != nil {
+		return "", apperr.Validacion("%s debe ser un identificador válido", nombre)
+	}
+	return valor, nil
+}
+
+// consultaPaginacion lee limite y desplazamiento. Los valores fuera de rango
+// los normaliza el repositorio.
+func consultaPaginacion(c *gin.Context) dominio.Paginacion {
+	limite, _ := strconv.Atoi(c.Query("limite"))
+	desplazamiento, _ := strconv.Atoi(c.Query("desplazamiento"))
+	return dominio.Paginacion{Limite: max(limite, 0), Desplazamiento: max(desplazamiento, 0)}
+}
+
 // --- formatos de salida comunes ------------------------------------------------
 
 // rolesTexto convierte los roles a cadenas para el JSON.
@@ -99,4 +118,13 @@ func rolesTexto(roles []dominio.Rol) []string {
 		resultado = append(resultado, string(r))
 	}
 	return resultado
+}
+
+// convertir aplica una función de conversión a cada elemento.
+func convertir[E, S any](entrada []E, f func(E) S) []S {
+	salida := make([]S, 0, len(entrada))
+	for _, e := range entrada {
+		salida = append(salida, f(e))
+	}
+	return salida
 }

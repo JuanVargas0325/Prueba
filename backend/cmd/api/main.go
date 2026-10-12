@@ -63,6 +63,7 @@ func ejecutar(log *slog.Logger) error {
 	// Capa de presentación
 	router := handler.NuevoRouter(handler.Dependencias{
 		Autenticacion: servicioAuth,
+		Usuarios:      servicio.NuevoUsuarios(usuarios, log),
 		Tokens:        tokens,
 		OrigenesCORS:  cfg.OrigenesCORS,
 		Log:           log,

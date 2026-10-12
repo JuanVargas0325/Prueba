@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"seguimiento/internal/auth"
+	"seguimiento/internal/dominio"
 )
 
 // Utilidades compartidas por las pruebas de todos los módulos del handler.
@@ -22,23 +23,35 @@ const secretoPrueba = "secreto-de-prueba-con-mas-de-32-caracteres"
 
 var logPrueba = slog.New(slog.NewTextHandler(io.Discard, nil))
 
-// entorno arma un router con las dependencias que cada prueba configure.
+// entorno arma un router con los servicios falsos que cada prueba configure.
 type entorno struct {
 	router *gin.Engine
+	tokens *auth.GestorTokens
 }
 
 func nuevoEntorno(t *testing.T, configurar func(*Dependencias)) entorno {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
+	tokens := auth.NuevoGestorTokens(secretoPrueba, time.Hour)
 	d := Dependencias{
-		Tokens: auth.NuevoGestorTokens(secretoPrueba, time.Hour),
+		Tokens: tokens,
 		Salud:  map[string]ComprobadorSalud{"postgres": func(context.Context) error { return nil }},
 		Log:    logPrueba,
 	}
 	if configurar != nil {
 		configurar(&d)
 	}
-	return entorno{router: NuevoRouter(d)}
+	return entorno{router: NuevoRouter(d), tokens: tokens}
+}
+
+// token emite un token para el usuario "usuario-1" con los roles dados.
+func (e entorno) token(t *testing.T, roles ...dominio.Rol) string {
+	t.Helper()
+	token, _, err := e.tokens.Generar(dominio.Usuario{ID: "usuario-1", Roles: roles})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
 }
 
 func (e entorno) peticion(metodo, ruta, token, cuerpo string) *httptest.ResponseRecorder {
@@ -63,6 +76,10 @@ func esperarEstado(t *testing.T, w *httptest.ResponseRecorder, estado int) {
 	}
 }
 
+const (
+	uuidA = "6f1c2a8e-1a7d-4b8e-9c55-0d6c5c1f7a01"
+)
+
 // --- router -----------------------------------------------------------------------
 
 func TestSaludResponde200(t *testing.T) {
@@ -79,18 +96,12 @@ func TestSaludResponde503SiUnaDependenciaFalla(t *testing.T) {
 
 func TestRutasProtegidasExigenToken(t *testing.T) {
 	e := nuevoEntorno(t, nil)
-	for _, ruta := range []string{"/api/v1/auth/yo"} {
+	for _, ruta := range []string{"/api/v1/usuarios", "/api/v1/auth/yo"} {
 		if w := e.peticion(http.MethodGet, ruta, "", ""); w.Code != http.StatusUnauthorized {
 			t.Errorf("%s sin token: estado = %d", ruta, w.Code)
 		}
 	}
 	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/auth/yo", "token-invalido", ""), http.StatusUnauthorized)
-}
-
-func TestRutaInexistenteYMetodoNoPermitido(t *testing.T) {
-	e := nuevoEntorno(t, nil)
-	esperarEstado(t, e.peticion(http.MethodGet, "/no-existe", "", ""), http.StatusNotFound)
-	esperarEstado(t, e.peticion(http.MethodDelete, "/salud", "", ""), http.StatusMethodNotAllowed)
 }
 
 func TestCORS(t *testing.T) {
@@ -127,4 +138,25 @@ func TestCORS(t *testing.T) {
 			t.Error("no debería permitir un origen que no está configurado")
 		}
 	})
+}
+
+func TestRutaInexistenteYMetodoNoPermitido(t *testing.T) {
+	e := nuevoEntorno(t, nil)
+	esperarEstado(t, e.peticion(http.MethodGet, "/no-existe", "", ""), http.StatusNotFound)
+	esperarEstado(t, e.peticion(http.MethodDelete, "/salud", "", ""), http.StatusMethodNotAllowed)
+}
+
+func TestControlDeAccesoPorRol(t *testing.T) {
+	e := nuevoEntorno(t, nil)
+	monitor := e.token(t, dominio.RolMonitor)
+	casos := []struct {
+		metodo, ruta, token string
+	}{
+		{http.MethodGet, "/api/v1/usuarios", monitor}, // solo administrador
+	}
+	for _, c := range casos {
+		if w := e.peticion(c.metodo, c.ruta, c.token, `{}`); w.Code != http.StatusForbidden {
+			t.Errorf("%s %s: estado = %d, se esperaba 403", c.metodo, c.ruta, w.Code)
+		}
+	}
 }

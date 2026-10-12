@@ -1,272 +1,229 @@
-# Paso 18 · Servicio de gestión de usuarios
+# Paso 19 · Endpoints de usuarios
 
-> Rama `paso-a-paso` · paso 18 de 65 · anterior: **Paso 17 · Endpoints de inicio de sesión** · siguiente: **Paso 19 · Endpoints de usuarios**
+> Rama `paso-a-paso` · paso 19 de 65 · anterior: **Paso 18 · Servicio de gestión de usuarios** · siguiente: **Paso 20 · Dominio: fechas y semanas**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el caso de uso con el que el **administrador** gestiona usuarios: crear, listar, consultar y asignar roles.
+El administrador ya puede gestionar usuarios por HTTP:
+
+| Método | Ruta | Rol | Descripción |
+|---|---|---|---|
+| POST | `/api/v1/usuarios` | administrador | Crea un usuario con sus roles (201 + cabecera `Location`). |
+| GET | `/api/v1/usuarios` | administrador | Lista usuarios. Filtros: `?rol=`, `?busqueda=`, `?limite=`, `?desplazamiento=`. |
+| GET | `/api/v1/usuarios/{id}` | administrador | Detalle de un usuario. |
+| PUT | `/api/v1/usuarios/{id}/roles` | administrador | Reemplaza sus roles. |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/servicio/usuarios.go` | **Nuevo.** Servicio `Usuarios` con `Crear`, `Listar`, `Obtener` y `AsignarRoles`. |
-| `backend/internal/servicio/acceso.go` | **Nuevo.** Primeras reglas de acceso compartidas: `exigirRol` y `noEncontrado`. |
-| `backend/internal/servicio/modulos_test.go` | **Nuevo.** Pruebas de los servicios de gestión (por ahora, usuarios) con un repositorio falso. |
-| `backend/internal/servicio/autenticacion_test.go` | **Modificado.** Agrega los actores de prueba (`admin`, `profesor`, `monitor`). |
+| `backend/go.mod`, `go.sum` | Nueva dependencia `github.com/google/uuid v1.6.0` (validar identificadores). |
+| `backend/internal/handler/usuarios.go` | **Nuevo.** Módulo de usuarios. |
+| `backend/internal/handler/respuestas.go` | **Modificado.** `parametroUUID`, `consultaPaginacion` y la función genérica `convertir`. |
+| `backend/internal/handler/router.go` | **Modificado.** Servicio `Usuarios` en `Dependencias` y el módulo en la lista. |
+| `backend/internal/handler/router_test.go` | **Modificado.** El entorno guarda el gestor de tokens y emite tokens por rol (`e.token`); prueba de control de acceso por rol. |
+| `backend/internal/handler/modulos_test.go` | **Nuevo.** Pruebas de los módulos; la primera, del módulo de usuarios. |
+| `backend/cmd/api/main.go` | **Modificado.** Crea el servicio de usuarios. |
 
 ---
 
 ## 2. Por qué
 
-- **RF-02.1, RF-02.2, RF-02.3 y RF-15.2:** el administrador crea usuarios, les asigna uno o varios roles y consulta a todos los usuarios del sistema.
-- **Los permisos se verifican en el servicio**, no solo en el router. El router (paso 19) también los exigirá, pero si mañana se agrega otra forma de llamar al servicio, la regla sigue protegida. Es **defensa en profundidad**.
-- **Evitar inconsistencias:** quitarle a alguien el rol de monitor mientras tiene monitorías activas dejaría vinculaciones huérfanas. El servicio lo impide.
+- **RF-02.1 a RF-02.3 y RF-15.2** quedan accesibles para el administrador.
+- **Validar los identificadores en la entrada:** si alguien pide `/usuarios/123`, la base de datos fallaría al convertir `123` a UUID. Es mejor responder **400** con un mensaje claro antes de llegar a la base de datos.
+- **REST:** se usan los verbos y códigos estándar. `POST` crea y responde **201 Created** con la cabecera `Location` (dónde quedó el recurso); `PUT` reemplaza (los roles se envían completos).
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 `acceso.go`
+### 3.1 `usuarios.go` (handler)
 
 ```go
-// Reglas de visibilidad compartidas por los servicios (RF-12, RN-03 a RN-05).
-// La capa de presentación ya filtra por rol; aquí se verifica la pertenencia
-// de cada dato, para que la regla se cumpla aunque cambie la capa HTTP.
-
-func exigirRol(actor auth.Actor, roles ...dominio.Rol) error {
-	if !actor.TieneAlgunRol(roles...) {
-		return apperr.Prohibido("no tiene permiso para esta operación")
-	}
-	return nil
+type ServicioUsuarios interface {
+	Crear(ctx context.Context, actor auth.Actor, n servicio.NuevoUsuario) (dominio.Usuario, error)
+	Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroUsuarios) ([]dominio.Usuario, error)
+	Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Usuario, error)
+	AsignarRoles(ctx context.Context, actor auth.Actor, id string, roles []dominio.Rol) (dominio.Usuario, error)
 }
 
-func noEncontrado(recurso string) error {
-	return apperr.NoEncontrado("%s no encontrado", recurso)
+type HandlerUsuarios struct {
+	servicio ServicioUsuarios
+	log      *slog.Logger
+}
+
+func (h *HandlerUsuarios) Registrar(g *gin.RouterGroup) {
+	r := g.Group("/usuarios", RequiereRol(dominio.RolAdministrador))
+	r.POST("", h.Crear)
+	r.GET("", h.Listar)
+	r.GET("/:id", h.Obtener)
+	r.PUT("/:id/roles", h.AsignarRoles)
 }
 ```
-- `exigirRol`: 403 si el actor no tiene ninguno de los roles.
-- `noEncontrado`: se usa **en lugar de 403** cuando el actor ni siquiera debe saber que el recurso existe. Si un monitor pide `/usuarios/{id}` de otra persona, recibe "usuario no encontrado", no "no tiene permiso" (que confirmaría que ese ID existe).
-- Este archivo crecerá con las reglas de visibilidad por profesor (paso 28).
-
-### 3.2 `usuarios.go`
-
-#### La interfaz que necesita
+- La misma anatomía del paso 17. Aquí **todo el grupo** exige el rol de administrador.
+- `/:id` es un **parámetro de ruta**: en `/usuarios/6f1c...`, `id` vale `6f1c...`.
 
 ```go
-type RepositorioGestionUsuarios interface {
-	BuscarPorID(ctx context.Context, id string) (dominio.Usuario, error)
-	Crear(ctx context.Context, u dominio.Usuario) (dominio.Usuario, error)
-	Listar(ctx context.Context, f dominio.FiltroUsuarios) ([]dominio.Usuario, error)
-	ReemplazarRoles(ctx context.Context, usuarioID string, roles []dominio.Rol) error
-	TieneVinculacionesActivas(ctx context.Context, usuarioID string, rol dominio.Rol) (bool, error)
-	TieneEspaciosActivos(ctx context.Context, usuarioID string) (bool, error)
+type peticionUsuario struct {
+	Nombre   string        `json:"nombre"`
+	Correo   string        `json:"correo"`
+	Password string        `json:"password"`
+	Roles    []dominio.Rol `json:"roles"`
 }
 ```
-- Es **otra** interfaz sobre el mismo repositorio del paso 13, con otros métodos. Cada servicio pide solo lo que usa.
+- `[]dominio.Rol` se lee directamente del JSON (`["monitor","asistente_graduado"]`), porque `Rol` está basado en `string`. Que cada rol sea válido lo verifica el servicio.
 
 ```go
-type NuevoUsuario struct {
-	Nombre   string
-	Correo   string
-	Password string
-	Roles    []dominio.Rol
+func (h *HandlerUsuarios) Crear(c *gin.Context) {
+	var p peticionUsuario
+	if err := leerJSON(c, &p); err != nil { ... }
+	u, err := h.servicio.Crear(c.Request.Context(), ActorDe(c), servicio.NuevoUsuario{...})
+	if err != nil { ... }
+	c.Header("Location", "/api/v1/usuarios/"+u.ID)
+	c.JSON(http.StatusCreated, aUsuarioJSON(u))
 }
 ```
-- Datos de entrada del caso de uso (todavía sin validar).
-
-#### `Crear`
 
 ```go
-func (s *Usuarios) Crear(ctx context.Context, actor auth.Actor, n NuevoUsuario) (dominio.Usuario, error) {
-	if err := exigirRol(actor, dominio.RolAdministrador); err != nil {
-		return dominio.Usuario{}, err
-	}
-	nombre, err := dominio.Texto("el nombre", n.Nombre, true, dominio.LongitudMaxNombre)
+func (h *HandlerUsuarios) Listar(c *gin.Context) {
+	usuarios, err := h.servicio.Listar(c.Request.Context(), ActorDe(c), dominio.FiltroUsuarios{
+		Rol:        dominio.Rol(c.Query("rol")),
+		Busqueda:   c.Query("busqueda"),
+		Paginacion: consultaPaginacion(c),
+	})
 	...
-	correo, err := dominio.NormalizarCorreo(n.Correo)
-	...
-	if err := dominio.ValidarPassword(n.Password); err != nil { ... }
-	roles, err := normalizarRoles(n.Roles)
-	...
-	hash, err := auth.HashPassword(n.Password)
-	if err != nil {
-		return dominio.Usuario{}, apperr.Interno(err, "no fue posible crear el usuario")
-	}
-	u, err := s.repo.Crear(ctx, dominio.Usuario{Nombre: nombre, Correo: correo, PasswordHash: hash, Activo: true, Roles: roles})
-	...
-	s.log.Info("usuario creado", "usuario_id", u.ID, "roles", roles, "por", actor.UsuarioID)
-	return u, nil
+	c.JSON(http.StatusOK, convertir(usuarios, aUsuarioJSON))
 }
 ```
-- **Orden:** primero el permiso, luego las validaciones del dominio (paso 11), después el hash y por último la base de datos. Las validaciones baratas van antes que lo costoso (bcrypt).
-- Un correo repetido lo detecta el repositorio (409, paso 13).
-- El log de auditoría registra **quién** creó a quién, nunca la contraseña.
+- `c.Query("rol")` lee un parámetro de la consulta (`?rol=monitor`); devuelve `""` si no viene.
 
-#### `normalizarRoles`
+### 3.2 `respuestas.go`: nuevas utilidades
 
 ```go
-func normalizarRoles(roles []dominio.Rol) ([]dominio.Rol, error) {
-	var resultado []dominio.Rol
-	for _, r := range roles {
-		if !r.EsValido() {
-			return nil, apperr.Validacion("rol inválido: %q", r)
-		}
-		if !slices.Contains(resultado, r) {
-			resultado = append(resultado, r)
-		}
+func parametroUUID(c *gin.Context, nombre string) (string, error) {
+	valor := c.Param(nombre)
+	if _, err := uuid.Parse(valor); err != nil {
+		return "", apperr.Validacion("%s debe ser un identificador válido", nombre)
 	}
-	if len(resultado) == 0 {
-		return nil, apperr.Validacion("el usuario debe tener al menos un rol")
-	}
-	slices.Sort(resultado)
-	return resultado, nil
+	return valor, nil
 }
 ```
-- Rechaza roles que no existen, **quita duplicados** (`["monitor","monitor"]` → `["monitor"]`), exige al menos uno y los **ordena** para que el resultado sea siempre igual.
-- `slices` es un paquete estándar (Go 1.21+) con funciones genéricas para listas: `Contains`, `Sort`, `Index`...
-
-#### `Listar` y `Obtener`
+- Lee un parámetro de ruta y verifica que sea un UUID.
 
 ```go
-func (s *Usuarios) Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroUsuarios) ([]dominio.Usuario, error) {
-	if err := exigirRol(actor, dominio.RolAdministrador); err != nil { ... }
-	if f.Rol != "" && !f.Rol.EsValido() {
-		return nil, apperr.Validacion("rol inválido")
-	}
-	return s.repo.Listar(ctx, f)
-}
-
-func (s *Usuarios) Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Usuario, error) {
-	if !actor.EsAdministrador() && actor.UsuarioID != id {
-		return dominio.Usuario{}, noEncontrado("usuario")
-	}
-	return s.repo.BuscarPorID(ctx, id)
+func consultaPaginacion(c *gin.Context) dominio.Paginacion {
+	limite, _ := strconv.Atoi(c.Query("limite"))
+	desplazamiento, _ := strconv.Atoi(c.Query("desplazamiento"))
+	return dominio.Paginacion{Limite: max(limite, 0), Desplazamiento: max(desplazamiento, 0)}
 }
 ```
-- Listar es solo para el administrador (RF-02.3).
-- Obtener: el administrador ve a cualquiera; cualquier otro usuario solo a sí mismo; a los demás les "no existen".
-
-#### `AsignarRoles`
+- `strconv.Atoi` convierte texto a número. Si el texto no es un número, devuelve 0 (y se ignora el error con `_`).
+- `max(x, 0)` (función incorporada desde Go 1.21) evita negativos. Así nadie puede enviar `limite=-1` y obtener el `SinPaginar` interno (paso 11). El máximo de 200 lo aplica el repositorio.
 
 ```go
-func (s *Usuarios) AsignarRoles(ctx context.Context, actor auth.Actor, id string, roles []dominio.Rol) (dominio.Usuario, error) {
-	if err := exigirRol(actor, dominio.RolAdministrador); err != nil { ... }
-	roles, err := normalizarRoles(roles)
-	...
-	u, err := s.repo.BuscarPorID(ctx, id)
-	...
-	if id == actor.UsuarioID && !slices.Contains(roles, dominio.RolAdministrador) {
-		return u, apperr.ReglaNegocio("no puede quitarse a sí mismo el rol de administrador")
+func convertir[E, S any](entrada []E, f func(E) S) []S {
+	salida := make([]S, 0, len(entrada))
+	for _, e := range entrada {
+		salida = append(salida, f(e))
 	}
-	for _, anterior := range u.Roles {
-		if slices.Contains(roles, anterior) {
-			continue
-		}
-		if err := s.verificarRetiroDeRol(ctx, id, anterior); err != nil {
-			return u, err
-		}
-	}
-	if err := s.repo.ReemplazarRoles(ctx, id, roles); err != nil { ... }
-	...
-	return s.repo.BuscarPorID(ctx, id)
+	return salida
 }
 ```
-- **Reemplaza** el conjunto completo de roles (RF-02.2).
-- **Protección contra quedarse sin administrador:** el administrador no puede quitarse a sí mismo su rol; de lo contrario, el sistema podría quedar sin nadie que gestione usuarios.
-- Para cada rol que se **retira**, `verificarRetiroDeRol` revisa si está en uso:
+- **Genérica con dos tipos**: convierte una lista de `E` (por ejemplo `dominio.Usuario`) en una lista de `S` (`usuarioJSON`) aplicando `f` a cada elemento. Se usará en todos los listados.
+- `make([]S, 0, len(entrada))` crea una lista vacía con **capacidad** reservada: `append` no tendrá que redimensionarla.
+- Siempre devuelve una lista (nunca `nil`), así el JSON es `[]` y no `null`.
+
+### 3.3 `router.go`
 
 ```go
-func (s *Usuarios) verificarRetiroDeRol(ctx context.Context, usuarioID string, rol dominio.Rol) error {
-	var enUso bool
-	var err error
-	switch {
-	case rol.EsRolDeVinculacion():
-		enUso, err = s.repo.TieneVinculacionesActivas(ctx, usuarioID, rol)
-	case rol == dominio.RolProfesor:
-		enUso, err = s.repo.TieneEspaciosActivos(ctx, usuarioID)
-	}
+type Dependencias struct {
+	Autenticacion ServicioAutenticacion
+	Usuarios      ServicioUsuarios
 	...
-	if enUso {
-		return apperr.ReglaNegocio("no se puede quitar el rol %s: la persona lo usa en cursos o proyectos activos", rol.Texto())
-	}
-	return nil
 }
+...
+	modulos := []modulo{
+		autenticacion,
+		&HandlerUsuarios{servicio: d.Usuarios, log: d.Log},
+	}
 ```
-- Monitor o asistente: ¿tiene vinculaciones con ese rol en espacios activos? Profesor: ¿es responsable de algún espacio activo? Si es así → **422**.
-- Al final se vuelve a leer el usuario para devolver sus roles actualizados.
+- Agregar un módulo = un campo en `Dependencias` + una línea en la lista. Ese será el patrón en cada paso de endpoints.
+
+### 3.4 Pruebas
+
+En `router_test.go`:
+- `entorno` guarda el gestor de tokens y `e.token(t, dominio.RolMonitor)` emite un token para el usuario ficticio `usuario-1` con los roles pedidos.
+- `uuidA` es un UUID fijo para las rutas de prueba.
+- `TestRutasProtegidasExigenToken` incluye `/api/v1/usuarios`.
+- **`TestControlDeAccesoPorRol`** (nueva): una tabla de casos *(método, ruta, token)* que deben responder **403**. Hoy: un monitor no puede listar usuarios. Cada módulo agregará sus casos.
+
+En `modulos_test.go` (nuevo):
+- `servicioUsuariosFalso`: servicio falso que guarda lo que recibió y devuelve un usuario **con un hash ficticio**.
+- `TestCrearUsuarioNoExponeElHash`: la respuesta de crear usuario **no** contiene ni `password` ni el hash; el servicio recibió los roles y la contraseña; y asignar roles responde 200.
 
 ---
 
-## 4. Las pruebas (`modulos_test.go`)
-
-```go
-func esperarTipo(t *testing.T, err error, tipo apperr.Tipo) { ... }
-```
-- Auxiliar: falla si el error no es del tipo esperado. Hace las pruebas cortas y legibles.
-
-```go
-type repoUsuariosFalso struct {
-	usuarios       map[string]dominio.Usuario
-	rolesEnUso     map[dominio.Rol]bool
-	espaciosActivo bool
-}
-```
-- Repositorio en memoria. `rolesEnUso` y `espaciosActivo` permiten simular "este rol está en uso" sin base de datos.
-
-| Prueba | Qué verifica |
-|---|---|
-| `TestCrearUsuario` | El nombre se limpia, el correo se pasa a minúsculas, los roles repetidos se quitan, la contraseña se guarda hasheada y el usuario queda activo. Seis casos inválidos: un profesor intentando crear (403), nombre vacío, correo inválido, contraseña corta, rol inexistente y sin roles (400). |
-| `TestAsignarRoles` | El administrador no puede quitarse su rol (422); no se retira un rol en uso (422); un cambio válido se aplica; no se quita el rol de profesor con espacios activos (422); un monitor no ve a otro usuario (404). |
-
-Los actores (`admin`, `profesor`, `monitor`) se declaran junto a `logPrueba` en `autenticacion_test.go`. En el paso 48 este bloque de dobles compartidos se trasladará a `reportes_test.go`.
-
----
-
-## 5. Conceptos de Go de este paso
+## 4. Conceptos de Go de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Paquete `slices` | Funciones genéricas para listas: `slices.Contains`, `slices.Sort`. |
-| Bloque `var ( ... )` | Varias variables relacionadas en un bloque. |
-| Defensa en profundidad | La regla se aplica en el router **y** en el servicio. |
-| 404 en lugar de 403 | No revelar la existencia de recursos ajenos. |
+| Parámetros de ruta | `/:id` en Gin; se leen con `c.Param("id")`. |
+| Parámetros de consulta | `?rol=x`; se leen con `c.Query("rol")`. |
+| Genéricos con varios tipos | `func convertir[E, S any](...)`. |
+| `make` con capacidad | `make([]T, 0, n)` reserva espacio para `n` elementos. |
+| `max` / `min` | Funciones incorporadas (Go 1.21+). |
+| `strconv.Atoi` | Texto → entero. |
 
 ---
 
-## 6. Cómo comprobarlo
+## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/servicio/ -v -run 'TestCrearUsuario|TestAsignarRoles'
+make pruebas
+docker compose up --build -d --wait
+TOKEN=...   # token del administrador (paso 17)
+
+curl -i -X POST localhost:8080/api/v1/usuarios -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"nombre":"Laura Martínez","correo":"Laura@uniandes.edu.co","password":"Clave123*","roles":["monitor","monitor","asistente_graduado"]}'
+# 201 Created · Location: /api/v1/usuarios/<id> · correo en minúsculas · roles sin repetir
+
+curl -s "localhost:8080/api/v1/usuarios?rol=monitor&busqueda=lau" -H "Authorization: Bearer $TOKEN"
+curl -s -X PUT localhost:8080/api/v1/usuarios/<id>/roles -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"roles":["monitor"]}'
+
+# Mismo correo otra vez → 409 conflicto
+# Con el token de Laura: GET /api/v1/usuarios → 403 prohibido
+# GET /api/v1/usuarios/no-uuid → 400 "id debe ser un identificador válido"
 ```
 
 ---
 
-## 7. Pasos para lograr esta versión desde el paso 17
+## 6. Pasos para lograr esta versión desde el paso 18
 
-1. Crear `backend/internal/servicio/acceso.go` con el comentario de las reglas de visibilidad, `exigirRol` y `noEncontrado`.
-2. Crear `backend/internal/servicio/usuarios.go` con `RepositorioGestionUsuarios`, `NuevoUsuario`, `Usuarios`, `NuevoUsuarios`, `Crear`, `Listar`, `Obtener`, `AsignarRoles`, `verificarRetiroDeRol` y `normalizarRoles`.
-3. En `autenticacion_test.go`, convertir `logPrueba` en un bloque `var (...)` con `profesor`, `admin` y `monitor`.
-4. Crear `backend/internal/servicio/modulos_test.go` con `esperarTipo`, el doble `repoUsuariosFalso` y las pruebas `TestCrearUsuario` y `TestAsignarRoles`.
-5. `make pruebas lint`
-6. Commit: `git add . && git commit -m "Paso 18: servicio de gestión de usuarios"`
-
----
-
-## 8. Preparación para las próximas entregas
-
-- **Los logs de auditoría ("usuario creado ... por ...")** quedarán en Cloud Logging en la nube. Sirven para saber quién hizo cada cambio administrativo.
-- **Pendientes que el enunciado deja fuera de la Entrega 1:** reinicio de contraseñas y desactivación de usuarios. El campo `activo` y el login que ya rechaza usuarios inactivos (paso 14) dejan lista la base para agregarlos.
+1. `go get github.com/google/uuid@v1.6.0 && go mod tidy` (desde `backend/`).
+2. En `respuestas.go` agregar `parametroUUID`, `consultaPaginacion` y `convertir`.
+3. Crear `backend/internal/handler/usuarios.go` (interfaz, handler, `Registrar`, `peticionUsuario`, `peticionRoles` y los cuatro endpoints).
+4. En `router.go`: campo `Usuarios ServicioUsuarios` y `&HandlerUsuarios{...}` en la lista de módulos.
+5. En `router_test.go`: campo `tokens` en `entorno`, método `token`, constante `uuidA`, `/api/v1/usuarios` en la prueba de rutas protegidas y la nueva `TestControlDeAccesoPorRol`.
+6. Crear `backend/internal/handler/modulos_test.go` con `servicioUsuariosFalso` y `TestCrearUsuarioNoExponeElHash`.
+7. En `main.go`: `Usuarios: servicio.NuevoUsuarios(usuarios, log)`.
+8. `make pruebas lint`, probar con `curl` y commit: `git add . && git commit -m "Paso 19: endpoints de usuarios"`
 
 ---
 
-## 9. Requisitos que atiende
+## 7. Preparación para las próximas entregas
+
+- **`Location` en los 201** y listados paginados son convenciones que el frontend (Entrega 2) puede aprovechar directamente.
+- **La tabla de `TestControlDeAccesoPorRol`** documenta, en forma ejecutable, quién puede hacer qué. Cualquier cambio de permisos que la rompa se detecta en CI.
+
+---
+
+## 8. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-02.1 Crear usuarios | `Crear` con validaciones y contraseña hasheada. |
-| RF-02.2 Asignar roles | `AsignarRoles`, sin dejar inconsistencias. |
-| RF-02.3 Consulta global | `Listar` (solo administrador). |
-| RF-15.2 Gestión de usuarios por el administrador | Permisos exigidos en el servicio. |
-| RN-04 Cada usuario ve solo lo suyo | `Obtener` devuelve 404 para usuarios ajenos. |
+| RF-02.1 Crear usuarios | `POST /api/v1/usuarios`. |
+| RF-02.2 Asignar roles | `PUT /api/v1/usuarios/{id}/roles`. |
+| RF-02.3 Consulta global | `GET /api/v1/usuarios` con filtros y paginación. |
+| RF-01.2 Control de acceso por rol | Grupo exclusivo del administrador, probado en `TestControlDeAccesoPorRol`. |
+| RF-15.2 Administración | Todo el módulo es del administrador. |
