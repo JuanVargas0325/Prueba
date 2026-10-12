@@ -1,0 +1,65 @@
+# Integración continua: se ejecuta en cada push y en cada pull request.
+#  1. calidad: formato (gofmt), análisis estático (golangci-lint, incluye go vet).
+#  2. pruebas: pruebas unitarias con detector de condiciones de carrera y cobertura.
+#
+# En pasos posteriores se agregan PostgreSQL para las pruebas de integración (paso 58),
+# la prueba de punta a punta con Newman (paso 61) y el análisis con SonarQube (paso 62).
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  calidad:
+    name: Formato y análisis estático
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Verificar formato (gofmt)
+        working-directory: backend
+        run: |
+          sin_formato=$(gofmt -l .)
+          if [ -n "$sin_formato" ]; then
+            echo "Archivos sin formato (ejecute gofmt -w .):"
+            echo "$sin_formato"
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          working-directory: backend
+
+  pruebas:
+    name: Pruebas unitarias
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Pruebas con cobertura
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Resumen de cobertura
+        run: go tool cover -func=coverage.out | tail -n 1
