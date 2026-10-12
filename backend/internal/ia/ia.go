@@ -14,7 +14,7 @@ import (
 	"seguimiento/internal/dominio"
 )
 
-// Proveedores admitidos en LLM_PROVEEDOR. Anthropic se agrega en el paso 53.
+// Proveedores admitidos en LLM_PROVEEDOR.
 const (
 	// ProveedorSimulado no llama a ningún modelo: genera un resumen
 	// determinístico. Sirve para desarrollar y probar sin credenciales.
@@ -22,6 +22,8 @@ const (
 	// ProveedorOpenAI usa la API de Chat Completions de OpenAI o de cualquier
 	// servicio compatible (Gemini, Groq, OpenRouter, Ollama, LM Studio...).
 	ProveedorOpenAI = "openai"
+	// ProveedorAnthropic usa la API de mensajes de Anthropic (Claude).
+	ProveedorAnthropic = "anthropic"
 )
 
 // Resumidor redacta el resumen del trabajo semanal de una persona.
@@ -52,9 +54,11 @@ func Nuevo(cfg Config) (Resumidor, error) {
 		return NuevoSimulado(), nil
 	case ProveedorOpenAI:
 		return NuevoOpenAI(cfg, &http.Client{Timeout: cfg.Timeout})
+	case ProveedorAnthropic:
+		return NuevoAnthropic(cfg)
 	default:
-		return nil, fmt.Errorf("LLM_PROVEEDOR %q no soportado (use %s o %s)",
-			cfg.Proveedor, ProveedorSimulado, ProveedorOpenAI)
+		return nil, fmt.Errorf("LLM_PROVEEDOR %q no soportado (use %s, %s o %s)",
+			cfg.Proveedor, ProveedorSimulado, ProveedorOpenAI, ProveedorAnthropic)
 	}
 }
 

@@ -140,12 +140,66 @@ func TestOpenAIRespuestaVaciaEsReintentable(t *testing.T) {
 	}
 }
 
+func TestAnthropicEnviaPeticionYLeeRespuesta(t *testing.T) {
+	var cuerpo map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("ruta inesperada: %s", r.URL.Path)
+		}
+		if r.Header.Get("X-Api-Key") != "clave-prueba" {
+			t.Errorf("cabecera x-api-key inesperada")
+		}
+		_ = json.NewDecoder(r.Body).Decode(&cuerpo)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5",
+			"content":[{"type":"text","text":"Resumen de Claude."}],
+			"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`))
+	}))
+	defer srv.Close()
+
+	a, err := NuevoAnthropic(Config{URLBase: srv.URL, APIKey: "clave-prueba", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Modelo() != ModeloAnthropicPorDefecto {
+		t.Errorf("modelo por defecto = %s", a.Modelo())
+	}
+	resumen, err := a.Resumir(context.Background(), datosPrueba())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumen != "Resumen de Claude." {
+		t.Errorf("resumen = %q", resumen)
+	}
+	if cuerpo["model"] != ModeloAnthropicPorDefecto || cuerpo["system"] == nil {
+		t.Errorf("petición inesperada: %v", cuerpo)
+	}
+}
+
+func TestAnthropicErrorDeAutenticacionNoEsReintentable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`))
+	}))
+	defer srv.Close()
+
+	a, _ := NuevoAnthropic(Config{URLBase: srv.URL, APIKey: "mala", Timeout: 5 * time.Second})
+	_, err := a.Resumir(context.Background(), datosPrueba())
+	if err == nil || EsReintentable(err) || !EsErrorDeIA(err) {
+		t.Fatalf("se esperaba un error de IA no reintentable, se obtuvo %v", err)
+	}
+}
+
 func TestNuevoValidaConfiguracion(t *testing.T) {
 	if r, err := Nuevo(Config{}); err != nil || r.Proveedor() != ProveedorSimulado {
 		t.Errorf("sin proveedor debería usarse el simulado: %v", err)
 	}
 	if _, err := Nuevo(Config{Proveedor: "openai"}); err == nil {
 		t.Error("openai sin modelo debería fallar")
+	}
+	if _, err := Nuevo(Config{Proveedor: "anthropic"}); err == nil {
+		t.Error("anthropic sin API key debería fallar")
 	}
 	if _, err := Nuevo(Config{Proveedor: "otro"}); err == nil {
 		t.Error("un proveedor desconocido debería fallar")

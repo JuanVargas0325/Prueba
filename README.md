@@ -1,177 +1,137 @@
-# Paso 52 · IA: proveedor compatible con OpenAI
+# Paso 53 · IA: proveedor Anthropic (Claude)
 
-> Rama `paso-a-paso` · paso 52 de 65 · anterior: **Paso 51 · Interfaz de IA, modo simulado y prompt** · siguiente: **Paso 53 · IA: proveedor Anthropic (Claude)**
+> Rama `paso-a-paso` · paso 53 de 65 · anterior: **Paso 52 · Proveedor compatible con OpenAI** · siguiente: **Paso 54 · Generación asíncrona de reportes**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se agregó un proveedor real de IA que habla el protocolo **Chat Completions de OpenAI**, el formato que hoy entienden casi todos los servicios de modelos.
+Se agregó un tercer proveedor de IA: **Claude**, de Anthropic, usando su **SDK oficial para Go**.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/ia/openai.go` | **Nuevo.** `OpenAI` con `NuevoOpenAI` y `Resumir`: arma la petición HTTP, la envía y clasifica los errores. |
-| `backend/internal/ia/ia.go` | **Modificado.** Constante `ProveedorOpenAI`, el `case` en `Nuevo` y las auxiliares `estadoReintentable` y `limpiarResumen`. |
-| `backend/internal/ia/ia_test.go` | **Modificado.** Tres pruebas con un **servidor HTTP falso** y la validación de `openai` sin modelo. |
-| `.env.example` | **Modificado.** Explicación de `openai` y ejemplos para Gemini, OpenAI y Groq. |
+| `backend/go.mod`, `go.sum` | Nueva dependencia `github.com/anthropics/anthropic-sdk-go v1.80.0`. Con ella, `go.mod` y `go.sum` quedan **idénticos a los de la versión final**. |
+| `backend/internal/ia/anthropic.go` | **Nuevo.** `Anthropic` con `NuevoAnthropic` y `Resumir`. |
+| `backend/internal/ia/ia.go` | **Modificado.** Constante `ProveedorAnthropic` y su `case` en `Nuevo`. |
+| `backend/internal/ia/ia_test.go` | **Modificado.** Dos pruebas con un servidor falso que imita la API de Anthropic y la validación de la clave obligatoria. |
+| `.env.example` | **Modificado.** Opción `anthropic` y su ejemplo. |
 
 ---
 
 ## 2. Por qué
 
-- **Un solo cliente, muchos proveedores.** OpenAI, **Gemini** (Google AI Studio), **Groq**, **OpenRouter**, **Ollama** (modelo local, paso 57) y LM Studio exponen la misma API `/chat/completions`. Con este cliente el equipo puede elegir cualquiera cambiando `LLM_URL_BASE`, `LLM_API_KEY` y `LLM_MODELO`.
-- **Sin dependencias extra:** se usa `net/http` de la librería estándar; no hace falta el SDK de cada proveedor.
-- **Errores clasificados:** distinguir "reintentar más tarde" (límite de uso, caída) de "no va a funcionar" (clave inválida) evita gastar reintentos inútiles.
+- La API de Anthropic **no** es compatible con el formato de OpenAI (usa `/v1/messages`, otra autenticación y otra forma de respuesta), así que necesita su propio cliente.
+- **SDK oficial en lugar de HTTP a mano:** el SDK mantiene al día los tipos de la API, maneja los detalles del protocolo y expone errores tipados (`*anthropic.Error` con el código HTTP). Es la forma recomendada por el proveedor.
+- Da al equipo otra opción de modelo en la nube, intercambiable por variables de entorno como las demás.
 
 ---
 
-## 3. Explicación detallada
+## 3. Explicación detallada de `anthropic.go`
 
-### 3.1 Construcción y validación
+### 3.1 Construcción
 
 ```go
-const URLBaseOpenAIPorDefecto = "https://api.openai.com/v1"
+const (
+	// ModeloAnthropicPorDefecto se usa cuando LLM_MODELO está vacío.
+	ModeloAnthropicPorDefecto = "claude-opus-5-5"
+	maxTokensAnthropic        = 16000
+)
 
-func NuevoOpenAI(cfg Config, client *http.Client) (*OpenAI, error) {
-	if cfg.Modelo == "" {
-		return nil, errors.New("LLM_MODELO es obligatorio con el proveedor openai")
+func NuevoAnthropic(cfg Config) (*Anthropic, error) {
+	if cfg.APIKey == "" {
+		return nil, errors.New("LLM_API_KEY es obligatorio con el proveedor anthropic")
 	}
-	base := strings.TrimRight(cfg.URLBase, "/")
-	if base == "" {
-		base = URLBaseOpenAIPorDefecto
+	opciones := []option.RequestOption{
+		option.WithAPIKey(cfg.APIKey),
+		option.WithRequestTimeout(cfg.Timeout),
+		// Los reintentos los gestiona la cola de tareas (Asynq).
+		option.WithMaxRetries(0),
 	}
-	if client == nil {
-		client = &http.Client{Timeout: cfg.Timeout}
+	if cfg.URLBase != "" {
+		opciones = append(opciones, option.WithBaseURL(cfg.URLBase))
 	}
-	return &OpenAI{cfg: cfg, url: base + "/chat/completions", client: client}, nil
+	modelo := cfg.Modelo
+	if modelo == "" {
+		modelo = ModeloAnthropicPorDefecto
+	}
+	maxTokens := int64(cfg.MaxTokens)
+	if maxTokens <= 0 {
+		maxTokens = maxTokensAnthropic
+	}
+	return &Anthropic{client: anthropic.NewClient(opciones...), modelo: modelo, maxTokens: maxTokens}, nil
 }
 ```
-- El **modelo es obligatorio**: cada servicio tiene los suyos y no hay uno por defecto que sirva para todos.
-- `TrimRight(..., "/")` evita una URL con doble barra si `LLM_URL_BASE` termina en `/`.
-- El `http.Client` tiene un **tiempo máximo** (`LLM_TIMEOUT`, 2 min por defecto): una llamada colgada no bloquea el worker.
-- El cliente HTTP se recibe como parámetro: las pruebas pasan `nil` y apuntan la URL a un servidor falso.
+- **La clave es obligatoria**; el modelo no (por defecto, `claude-opus-5-5`).
+- **`WithMaxRetries(0)`:** el SDK reintenta por su cuenta si no se le indica lo contrario. Aquí los reintentos ya los hace la cola (paso 47) con su propia espera; si ambos reintentaran, una falla generaría hasta 3 × 3 llamadas. **Una sola capa decide los reintentos.**
+- `WithBaseURL` permite apuntar a otra URL: lo usan las pruebas (servidor falso) y serviría para un proxy corporativo.
+- `max_tokens` es **obligatorio** en la API de Anthropic. Se usa 16 000 por defecto: el resumen es corto (máximo 250 palabras según las instrucciones), pero un límite holgado evita que la respuesta se corte.
+- `option.RequestOption` es otro ejemplo de **opciones funcionales** (como las de JWT en el paso 12).
 
-### 3.2 La petición
-
-```go
-type mensajeChat struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type peticionChat struct {
-	Model       string        `json:"model"`
-	Messages    []mensajeChat `json:"messages"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
-}
-```
+### 3.2 `Resumir`
 
 ```go
-	cuerpo, err := json.Marshal(peticionChat{
-		Model: o.cfg.Modelo,
-		Messages: []mensajeChat{
-			{Role: "system", Content: InstruccionesSistema},
-			{Role: "user", Content: ConstruirMensajeUsuario(datos)},
+func (a *Anthropic) Resumir(ctx context.Context, datos dominio.DatosSemanaPersona) (string, error) {
+	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     a.modelo,
+		MaxTokens: a.maxTokens,
+		System:    []anthropic.TextBlockParam{{Text: InstruccionesSistema}},
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(ConstruirMensajeUsuario(datos))),
 		},
-		MaxTokens:   o.cfg.MaxTokens,
-		Temperature: o.cfg.Temperatura,
 	})
-	...
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.url, bytes.NewReader(cuerpo))
-	req.Header.Set("Content-Type", "application/json")
-	if o.cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+o.cfg.APIKey)
-	}
-	resp, err := o.client.Do(req)
 ```
-- Dos mensajes: el de **sistema** (las reglas, paso 51) y el de **usuario** (los datos de la semana).
-- `omitempty` en `max_tokens` y `temperature`: si no se configuran, **no se envían** y el proveedor usa sus valores por defecto (algunos modelos rechazan ciertos valores).
-- La clave va en la cabecera `Authorization: Bearer`. Si está vacía no se envía (Ollama local no la necesita).
-- `NewRequestWithContext(ctx, ...)`: si la cola cancela el trabajo por tiempo agotado (paso 47), la llamada HTTP se aborta.
-
-### 3.3 La respuesta y los errores
+- El **mismo prompt** del paso 51: las instrucciones van en `System` y los datos en el mensaje del usuario. Las reglas de privacidad y de "no evaluar" son idénticas para todos los proveedores.
 
 ```go
-	defer func() { _ = resp.Body.Close() }()
-	contenido, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	...
-	var r respuestaChat
-	_ = json.Unmarshal(contenido, &r)
-
-	if resp.StatusCode != http.StatusOK {
-		mensaje := strings.TrimSpace(string(contenido))
-		if r.Error != nil && r.Error.Message != "" {
-			mensaje = r.Error.Message
+	if err != nil {
+		var apiErr *anthropic.Error
+		if errors.As(err, &apiErr) {
+			return "", &ErrorProveedor{
+				Proveedor:    ProveedorAnthropic,
+				Estado:       apiErr.StatusCode,
+				Mensaje:      apiErr.Error(),
+				Reintentable: estadoReintentable(apiErr.StatusCode),
+			}
 		}
-		if len(mensaje) > 500 {
-			mensaje = mensaje[:500]
-		}
-		return "", &ErrorProveedor{
-			Proveedor:    ProveedorOpenAI,
-			Estado:       resp.StatusCode,
-			Mensaje:      mensaje,
-			Reintentable: estadoReintentable(resp.StatusCode),
-		}
+		return "", fmt.Errorf("llamando a Anthropic: %w", err)
 	}
-	if len(r.Choices) == 0 {
-		return "", &ErrorProveedor{Proveedor: ProveedorOpenAI, Mensaje: "respuesta sin opciones", Reintentable: true}
-	}
-	return limpiarResumen(ProveedorOpenAI, r.Choices[0].Message.Content)
 ```
-- La respuesta se lee con un **límite de 4 MB** (`4<<20`): un servidor que respondiera algo gigante no agota la memoria.
-- Se cierra el cuerpo con `defer` (obligatorio en Go para liberar la conexión).
-- Si el código no es 200, se arma un `ErrorProveedor` con el mensaje del proveedor (recortado a 500 caracteres) para guardarlo en el reporte fallido.
-- Un error de **red** (no se pudo conectar) se devuelve envuelto con `%w`; como no es `ErrorProveedor`, se considera reintentable (paso 51).
+- El SDK devuelve un `*anthropic.Error` con el código HTTP; se convierte al `ErrorProveedor` común con la **misma clasificación** del paso 52 (401 no reintentable, 429/5xx sí). Los errores de red se envuelven y son reintentables.
 
 ```go
-func estadoReintentable(estado int) bool {
-	return estado == http.StatusRequestTimeout ||
-		estado == http.StatusConflict ||
-		estado == http.StatusTooManyRequests ||
-		estado >= http.StatusInternalServerError
+	if resp.StopReason == anthropic.StopReasonRefusal {
+		return "", &ErrorProveedor{Proveedor: ProveedorAnthropic, Mensaje: "el modelo rechazó la solicitud"}
+	}
+
+	var texto strings.Builder
+	for _, bloque := range resp.Content {
+		if t, ok := bloque.AsAny().(anthropic.TextBlock); ok {
+			texto.WriteString(t.Text)
+		}
+	}
+	return limpiarResumen(ProveedorAnthropic, texto.String())
 }
 ```
-
-| Código | Significado | ¿Reintentar? |
-|---|---|---|
-| 400 | Petición inválida (por ejemplo, modelo inexistente) | No |
-| 401 / 403 | Clave inválida o sin permiso | No |
-| 408 / 409 | Tiempo agotado o conflicto temporal | Sí |
-| 429 | Límite de uso alcanzado | Sí (más tarde) |
-| 5xx | Falla del servidor del proveedor | Sí |
-
-```go
-func limpiarResumen(proveedor, texto string) (string, error) {
-	texto = strings.TrimSpace(texto)
-	if texto == "" {
-		return "", &ErrorProveedor{Proveedor: proveedor, Mensaje: "el modelo devolvió un resumen vacío", Reintentable: true}
-	}
-	return texto, nil
-}
-```
-- Un resumen vacío no sirve para el PDF: se trata como fallo transitorio (otra llamada puede funcionar).
+- Si el modelo **se niega** a responder (`StopReasonRefusal`), es un error **no reintentable** (`Reintentable` queda en su valor cero, `false`): repetir la misma petición daría lo mismo.
+- La respuesta llega como una lista de **bloques de contenido** de distintos tipos. Se juntan solo los de **texto**, con una **aserción de tipo** (paso 16) sobre `bloque.AsAny()`.
 
 ---
 
-## 4. Las pruebas: un servidor HTTP falso
+## 4. Las pruebas
+
+El servidor falso (`httptest`) responde exactamente como la API de Anthropic:
 
 ```go
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		... verifica la ruta y la cabecera, guarda la petición ...
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"  Resumen de prueba.  "}}]}`))
-	}))
-	defer srv.Close()
-	o, err := NuevoOpenAI(Config{URLBase: srv.URL + "/v1/", APIKey: "clave-prueba", Modelo: "modelo-x", ...}, nil)
+	_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5",
+		"content":[{"type":"text","text":"Resumen de Claude."}],
+		"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`))
 ```
-- `httptest.NewServer` levanta un servidor **real** en un puerto local, solo durante la prueba. Así se prueba el cliente HTTP completo (serialización, cabeceras, lectura) **sin internet y sin gastar dinero**.
 
 | Prueba | Qué verifica |
 |---|---|
-| `TestOpenAIEnviaPeticionYLeeRespuesta` | Ruta `/v1/chat/completions` (con la barra final de la URL bien manejada), cabecera `Bearer`, modelo, dos mensajes (`system` primero), resumen sin espacios sobrantes y que `temperature` y `max_tokens` **no** se envían si no se configuran. |
-| `TestOpenAIClasificaErrores` | 401 y 400 → no reintentables; 429 y 503 → reintentables; el mensaje del proveedor se conserva. |
-| `TestOpenAIRespuestaVaciaEsReintentable` | Un contenido vacío es un error reintentable. |
-| `TestNuevoValidaConfiguracion` | `openai` sin modelo es un error; `OpenAI` (mayúsculas) con modelo se crea. |
+| `TestAnthropicEnviaPeticionYLeeRespuesta` | Ruta `/v1/messages`, cabecera `X-Api-Key`, modelo por defecto, que se envían las instrucciones de sistema y que el texto de la respuesta es el resumen. |
+| `TestAnthropicErrorDeAutenticacionNoEsReintentable` | Un 401 (`authentication_error`) es un error de IA **no reintentable**. |
+| `TestNuevoValidaConfiguracion` | `anthropic` sin clave es un error de configuración. |
 
 ---
 
@@ -179,11 +139,10 @@ func limpiarResumen(proveedor, texto string) (string, error) {
 
 | Concepto | Explicación |
 |---|---|
-| `net/http` como cliente | `http.NewRequestWithContext` + `client.Do(req)`. |
-| Cerrar el cuerpo | `defer resp.Body.Close()` libera la conexión. |
-| `httptest.NewServer` | Servidor HTTP temporal para probar clientes. |
-| `omitempty` en peticiones | No enviar campos no configurados. |
-| API compatible | Un mismo protocolo implementado por varios proveedores. |
+| SDK oficial | Librería del proveedor que encapsula su API. |
+| Una sola capa de reintentos | Desactivar los del SDK porque ya los maneja la cola. |
+| Bloques de contenido | La respuesta de Claude es una lista de bloques tipados; se toman los de texto. |
+| Rechazo del modelo | Resultado válido de la API que se trata como error permanente. |
 
 ---
 
@@ -194,40 +153,32 @@ cd backend
 go test ./internal/ia/ -v
 ```
 
-Con una cuenta real (por ejemplo, Gemini de Google AI Studio, que tiene capa gratuita), en su `.env`:
+Con una clave real, en su `.env`:
 
 ```dotenv
-LLM_PROVEEDOR=openai
-LLM_URL_BASE=https://generativelanguage.googleapis.com/v1beta/openai
-LLM_API_KEY=<su clave>
-LLM_MODELO=<un modelo Gemini disponible en su cuenta>
+LLM_PROVEEDOR=anthropic
+LLM_API_KEY=<su clave de console.anthropic.com>
+# LLM_MODELO=claude-opus-5-5   (opcional)
 ```
 
-El worker que usará esta configuración llega en el paso 55.
+---
+
+## 7. Pasos para lograr esta versión desde el paso 52
+
+1. `go get github.com/anthropics/anthropic-sdk-go@v1.80.0 && go mod tidy` (desde `backend/`).
+2. Crear `backend/internal/ia/anthropic.go` (`ModeloAnthropicPorDefecto`, `maxTokensAnthropic`, `Anthropic`, `NuevoAnthropic`, `Proveedor`, `Modelo`, `Resumir`).
+3. En `ia.go`: constante `ProveedorAnthropic` y `case ProveedorAnthropic: return NuevoAnthropic(cfg)`, y el mensaje de error con los tres proveedores.
+4. En `ia_test.go`: las dos pruebas de Anthropic y la validación de la clave.
+5. En `.env.example`: la línea de `anthropic` y su ejemplo.
+6. `make pruebas lint`
+7. Commit: `git add . && git commit -m "Paso 53: proveedor de IA Anthropic"`
 
 ---
 
-## 7. Pasos para lograr esta versión desde el paso 51
-
-1. Crear `backend/internal/ia/openai.go` (`URLBaseOpenAIPorDefecto`, `OpenAI`, `NuevoOpenAI`, `Proveedor`, `Modelo`, los tipos `mensajeChat`, `peticionChat`, `respuestaChat` y `Resumir`).
-2. En `ia.go`: constante `ProveedorOpenAI`, `case ProveedorOpenAI` en `Nuevo` (con `&http.Client{Timeout: cfg.Timeout}`), `estadoReintentable` y `limpiarResumen`.
-3. En `ia_test.go`: las tres pruebas de OpenAI y las dos verificaciones nuevas en `TestNuevoValidaConfiguracion`.
-4. En `.env.example`: la línea de `openai` y los ejemplos de Gemini, OpenAI y Groq.
-5. `make pruebas lint`
-6. Commit: `git add . && git commit -m "Paso 52: proveedor de IA compatible con OpenAI"`
-
----
-
-## 8. Preparación para las próximas entregas
-
-- **Vertex AI (GCP)** también ofrece un punto de acceso compatible con OpenAI para los modelos Gemini. Si el curso pide usar servicios del proveedor de nube para la IA, bastará con cambiar `LLM_URL_BASE` y la clave.
-
----
-
-## 9. Requisitos que atiende
+## 8. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-14 Resumen con IA | Proveedor real configurable por variables. |
-| Stack: LLM en la nube o local | El mismo cliente sirve para servicios en la nube y para Ollama. |
-| RNF-01 Backend sólido | Tiempo máximo, límite de respuesta y errores clasificados. |
+| RF-14 Resumen con IA | Tercer proveedor real, intercambiable por variables. |
+| RN-43 / RN-46 | Mismo prompt (insumos permitidos, sin evaluación). |
+| RNF-01 Backend sólido | Tiempo máximo, errores clasificados y reintentos solo en la cola. |
