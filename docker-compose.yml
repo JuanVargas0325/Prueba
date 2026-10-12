@@ -5,6 +5,7 @@
 #
 # Perfiles opcionales:
 #   docker compose --profile monitoreo up -d   -> Asynqmon (panel de la cola) en http://localhost:8081
+#   docker compose --profile ollama up -d      -> modelo de IA local con Ollama
 
 name: seguimiento
 
@@ -103,7 +104,14 @@ services:
     depends_on:
       - redis
 
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    volumes:
+      - modelos-ollama:/root/.ollama
+
 volumes:
   datos-postgres:
   datos-redis:
   archivos:
+  modelos-ollama:
