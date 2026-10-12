@@ -1,146 +1,125 @@
-# Paso 15 · Administrador inicial al arrancar
+# Paso 16 · Middleware de autenticación y roles
 
-> Rama `paso-a-paso` · paso 15 de 65 · anterior: **Paso 14 · Servicio de autenticación** · siguiente: **Paso 16 · Middleware de autenticación y roles**
+> Rama `paso-a-paso` · paso 16 de 65 · anterior: **Paso 15 · Administrador inicial** · siguiente: **Paso 17 · Endpoints de inicio de sesión**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Las piezas de los pasos 12 a 14 se conectan en `main`. Al arrancar, la API crea el **primer administrador** con los datos del `.env`, si todavía no existe.
+Se agregaron al paquete `handler` los **guardianes** de las rutas protegidas:
+
+| Middleware / función | Qué hace |
+|---|---|
+| `Autenticar(tokens)` | Exige un token `Bearer` válido. Si falta o es inválido responde **401**; si es válido, guarda el `Actor` en la petición. |
+| `RequiereRol(roles...)` | Deja pasar solo si el actor tiene **alguno** de los roles indicados. Si no, responde **403**. |
+| `ActorDe(c)` | Recupera el actor autenticado dentro de un handler. |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/config/config.go` | **Modificado.** Nuevas secciones `JWT` (secreto y expiración) y `AdminInicial` (nombre, correo y contraseña), y función `duracion`. |
-| `backend/internal/config/config_test.go` | **Modificado.** Pruebas del secreto obligatorio, del valor por defecto de la expiración y de formatos inválidos. |
-| `backend/cmd/api/main.go` | **Modificado.** Crea el repositorio de usuarios, el gestor de tokens y el servicio de autenticación, y llama a `AsegurarAdministrador`. |
-| `.env.example` | **Modificado.** Nueva sección `Autenticación`. |
+| `backend/internal/handler/middleware.go` | **Modificado.** Se agregan `ValidadorTokens`, `Autenticar`, `RequiereRol` y `ActorDe`. |
 
-Al levantar el sistema por primera vez:
-
-```json
-{"level":"INFO","msg":"administrador inicial creado","servicio":"api","correo":"admin@uniandes.edu.co"}
-```
+En este paso todavía no hay rutas protegidas. En el paso 17 se usan por primera vez y se prueban.
 
 ---
 
 ## 2. Por qué
 
-- Para crear usuarios (paso 19) hace falta un administrador, y para tener un administrador hace falta crearlo. Hacerlo automáticamente al arrancar evita pasos manuales en la base de datos.
-- El **secreto de los JWT** es lo único que impide falsificar tokens. Por eso es **obligatorio** y debe ser largo: si alguien lo adivinara, podría fabricarse un token de administrador.
-- La expiración de los tokens se configura (8 horas por defecto, una jornada de trabajo).
+- **RF-01.2 Control de acceso por rol:** cada endpoint debe estar disponible solo para ciertos roles (por ejemplo, crear usuarios solo para el administrador; registrar tareas solo para monitores y asistentes).
+- **Un middleware, no código repetido:** si cada handler verificara el token por su cuenta, bastaría con olvidarlo en uno para abrir un agujero de seguridad. Con un middleware aplicado a un **grupo de rutas**, todas quedan protegidas por defecto.
+- **Dos niveles distintos:**
+  - **401 No autenticado:** "no sé quién eres" (sin token, token vencido o falsificado);
+  - **403 Prohibido:** "sé quién eres, pero tu rol no puede hacer esto".
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 `config.go`
+### 3.1 La interfaz `ValidadorTokens`
 
 ```go
-type Config struct {
-	Entorno     string // desarrollo | produccion
-	PuertoHTTP  string
-	BaseDatos   string // URL de conexión a PostgreSQL
-	ZonaHoraria *time.Location
-
-	JWT   JWT
-	Admin AdminInicial
-}
-
-type JWT struct {
-	Secreto    string
-	Expiracion time.Duration
-}
-
-// AdminInicial es el administrador que se crea al arrancar si aún no existe.
-type AdminInicial struct {
-	Nombre   string
-	Correo   string
-	Password string
+type ValidadorTokens interface {
+	Validar(token string) (auth.Actor, error)
 }
 ```
-- La configuración se organiza en **sub-structs** por tema. Se lee `cfg.JWT.Secreto`, `cfg.Admin.Correo`...
-- Un campo puede llamarse igual que su tipo (`JWT JWT`): el primero es el nombre del campo y el segundo el tipo.
+- El middleware solo necesita **validar** tokens. `*auth.GestorTokens` (paso 12) cumple esta interfaz. En las pruebas se puede usar el gestor real con un secreto de prueba.
+
+### 3.2 `Autenticar`
 
 ```go
-	c.JWT = JWT{
-		Secreto:    os.Getenv("JWT_SECRETO"),
-		Expiracion: duracion("JWT_EXPIRACION", 8*time.Hour, &errs),
-	}
-	if len(c.JWT.Secreto) < 32 {
-		errs = append(errs, errors.New("JWT_SECRETO es obligatorio y debe tener al menos 32 caracteres"))
-	}
-```
-- 32 caracteres es un mínimo razonable para la firma HS256. Se recomienda generarlo al azar: `openssl rand -base64 48`.
-- No se aplica `TrimSpace` al secreto ni a la contraseña: los espacios podrían ser parte del valor.
+const claveActor = "actor"
 
-```go
-	c.Admin = AdminInicial{
-		Nombre:   texto("ADMIN_NOMBRE", "Administrador"),
-		Correo:   strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_CORREO"))),
-		Password: os.Getenv("ADMIN_PASSWORD"),
+func Autenticar(tokens ValidadorTokens) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		cabecera := c.GetHeader("Authorization")
+		token, ok := strings.CutPrefix(cabecera, "Bearer ")
+		if !ok || strings.TrimSpace(token) == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, RespuestaError{Error: "no_autenticado", Mensaje: "se requiere un token de acceso"})
+			return
+		}
+		actor, err := tokens.Validar(strings.TrimSpace(token))
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, RespuestaError{Error: "no_autenticado", Mensaje: "token inválido o expirado"})
+			return
+		}
+		c.Set(claveActor, actor)
+		c.Next()
 	}
-```
-- El correo se normaliza a minúsculas, igual que en el dominio (paso 11).
-- Correo y contraseña **no** son obligatorios aquí: si faltan, el servicio solo advierte (paso 14). Eso permite, por ejemplo, ejecutar el worker sin estos datos.
-
-```go
-func duracion(clave string, porDefecto time.Duration, errs *[]error) time.Duration {
-	v := strings.TrimSpace(os.Getenv(clave))
-	if v == "" {
-		return porDefecto
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		*errs = append(*errs, fmt.Errorf("%s debe ser una duración como 30s o 2m: %w", clave, err))
-		return porDefecto
-	}
-	return d
 }
 ```
-- Lee duraciones en el formato de Go: `30s`, `2m`, `8h`, `1h30m`.
-- `errs *[]error` es un **puntero a la lista de errores** de `Cargar`. Así la función puede **agregar** su error a esa lista (`*errs = append(*errs, ...)`): `append` puede crear una lista nueva, y con el puntero se actualiza la variable original. Se llama con `&errs`.
-- Si el valor es inválido, registra el error y devuelve el valor por defecto, para seguir validando las demás variables y reportarlas todas juntas.
+- El cliente envía el token en la cabecera estándar: `Authorization: Bearer eyJhbGciOi...`. *Bearer* ("portador") significa "quien porta este token tiene acceso".
+- `strings.CutPrefix(cabecera, "Bearer ")` quita el prefijo y devuelve `ok = false` si la cabecera no empieza así.
+- `c.AbortWithStatusJSON(...)` responde de inmediato y **corta la cadena**: el handler de la ruta nunca se ejecuta.
+- Si el token es válido, `c.Set(claveActor, actor)` guarda el actor en el **contexto de la petición** (un pequeño diccionario que vive mientras dura la petición) y `c.Next()` continúa.
+- El formato de error es el mismo `RespuestaError` del paso 10.
 
-### 3.2 `main.go`: el punto de ensamblaje
+### 3.3 `RequiereRol`
 
 ```go
-	usuarios := repositorio.NuevoUsuarios(db)
-
-	// Capa de servicio
-	tokens := auth.NuevoGestorTokens(cfg.JWT.Secreto, cfg.JWT.Expiracion)
-	servicioAuth := servicio.NuevaAutenticacion(usuarios, tokens, log)
-	if err := servicioAuth.AsegurarAdministrador(ctx, cfg.Admin.Nombre, cfg.Admin.Correo, cfg.Admin.Password); err != nil {
-		return err
+func RequiereRol(roles ...dominio.Rol) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !ActorDe(c).TieneAlgunRol(roles...) {
+			c.AbortWithStatusJSON(http.StatusForbidden, RespuestaError{Error: "prohibido", Mensaje: "no tiene permiso para esta operación"})
+			return
+		}
+		c.Next()
 	}
+}
+```
+- Siempre se usa **después** de `Autenticar` (necesita el actor).
+- Se aplicará por ruta o por grupo, por ejemplo:
+  ```go
+  r := g.Group("/usuarios", RequiereRol(dominio.RolAdministrador))   // todo el grupo
+  r.POST("", RequiereRol(dominio.RolProfesor), h.Crear)               // solo una ruta
+  ```
+
+### 3.4 `ActorDe`
+
+```go
+func ActorDe(c *gin.Context) auth.Actor {
+	if v, ok := c.Get(claveActor); ok {
+		if actor, ok := v.(auth.Actor); ok {
+			return actor
+		}
+	}
+	return auth.Actor{}
+}
+```
+- `c.Get` devuelve un valor de tipo `any` (puede ser cualquier cosa). `v.(auth.Actor)` es una **aserción de tipo**: "afirmo que `v` es un `auth.Actor`". La forma con dos resultados (`actor, ok := ...`) no entra en pánico si no lo es; devuelve `ok = false`.
+- Si no hay actor (ruta pública), devuelve un actor vacío, sin roles. Así `RequiereRol` simplemente niega el acceso.
+
+### 3.5 ¿Cómo se usan juntos? (vista previa del paso 17)
+
+```go
+api := r.Group("/api/v1")
+api.POST("/auth/login", ...)                                    // pública
+protegidas := api.Group("", Autenticar(d.Tokens))               // todo lo de aquí exige token
+protegidas.GET("/usuarios", RequiereRol(dominio.RolAdministrador), ...)
 ```
 
-- `main` es el **único lugar** que conoce las implementaciones concretas y las conecta: el repositorio de PostgreSQL se entrega al servicio como su `RepositorioUsuarios` y el `*auth.GestorTokens` como su `EmisorTokens`. A esto se le llama **composición** o *composition root*.
-- Las capas de abajo no se conocen entre sí: el servicio no sabe que hay PostgreSQL y el repositorio no sabe que existe un servicio.
-- Si la creación falla (por ejemplo, la base de datos rechaza la operación), la API no arranca: es preferible un error claro al inicio que un sistema sin administrador.
-
-### 3.3 `.env.example`
-
-```dotenv
-# --- Autenticación ----------------------------------------------------------------
-# Mínimo 32 caracteres. Genere uno con: openssl rand -base64 48
-JWT_SECRETO=reemplace-este-valor-por-un-secreto-aleatorio-largo
-JWT_EXPIRACION=8h
-
-# Administrador inicial: se crea al arrancar la API si aún no existe.
-ADMIN_NOMBRE=Administrador
-ADMIN_CORREO=admin@uniandes.edu.co
-ADMIN_PASSWORD=cambie-esta-clave
 ```
-- **Cambie `JWT_SECRETO` y `ADMIN_PASSWORD` en su `.env`.** Los valores del ejemplo son públicos (están en el repositorio).
-- Cambiar `ADMIN_PASSWORD` **después** de creado el administrador no cambia su contraseña: `AsegurarAdministrador` solo crea, nunca modifica. Para empezar de cero: `docker compose down -v`.
-
-### 3.4 Pruebas de configuración
-
-| Prueba | Qué verifica |
-|---|---|
-| `TestCargarConstruyeLaURLDesdeVariablesDePostgres` | Ahora define `JWT_SECRETO` (obligatorio) y comprueba que la expiración por defecto es 8 h. |
-| `TestCargarExigeSecretoYBaseDeDatos` | Sin base de datos y con un secreto corto, el error menciona **ambos** problemas a la vez. |
-| `TestCargarValidaFormatos` | Una zona horaria y una duración inválidas se reportan juntas. |
+petición ─► Recovery ─► RegistrarPeticiones ─► Autenticar ─► RequiereRol ─► handler
+                                                  │ 401           │ 403
+```
 
 ---
 
@@ -148,45 +127,41 @@ ADMIN_PASSWORD=cambie-esta-clave
 
 | Concepto | Explicación |
 |---|---|
-| Sub-structs | Agrupar configuración por tema: `cfg.JWT.Secreto`. |
-| Puntero a slice | `errs *[]error` permite que otra función agregue elementos a la lista original. |
-| `time.ParseDuration` | Interpreta textos como `8h` o `90s`. |
-| Composition root | `main` crea las implementaciones concretas y las conecta mediante interfaces. |
+| Aserción de tipo | `x.(T)` obtiene el valor concreto de una interfaz; con `v, ok := x.(T)` no hay pánico si no coincide. |
+| `strings.CutPrefix` | Quita un prefijo e indica si estaba presente. |
+| Contexto de Gin | `c.Set` / `c.Get` guardan datos durante una petición. |
+| Middleware que corta | `AbortWithStatusJSON` responde y detiene la cadena. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
+En este paso solo se puede compilar y pasar el lint:
+
 ```bash
-cp .env.example .env          # o agregue la sección Autenticación a su .env
-docker compose up --build -d --wait
-docker compose logs api | grep administrador
-docker compose exec postgres psql -U seguimiento -d seguimiento \
-  -c "SELECT u.correo, r.rol, left(u.password_hash, 7) AS hash FROM usuarios u JOIN usuario_roles r ON r.usuario_id = u.id"
-#         correo         |      rol      |  hash
-#  admin@uniandes.edu.co | administrador | $2a$10$     ← bcrypt, costo 10
-docker compose restart api    # no se crea un segundo administrador
+make lint
 ```
 
-Si `JWT_SECRETO` es corto, la API no arranca: `docker compose logs api` muestra el motivo.
+Las pruebas que ejercitan estos middleware llegan en el paso 17 (`TestRutasProtegidasExigenToken`), cuando exista la primera ruta protegida.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 14
+## 6. Pasos para lograr esta versión desde el paso 15
 
-1. `config.go`: agregar los structs `JWT` y `AdminInicial`, los campos `JWT` y `Admin` en `Config`, su carga en `Cargar()` y la función `duracion`.
-2. `config_test.go`: constante `secretoValido` y las tres pruebas de la sección 3.4.
-3. `main.go`: imports `auth`, `repositorio` y `servicio`; crear `usuarios`, `tokens` y `servicioAuth`; llamar a `AsegurarAdministrador`.
-4. `.env.example`: agregar la sección `Autenticación` (y copiarla a su `.env` con valores propios).
-5. `make pruebas lint` y `docker compose up --build -d --wait`.
-6. Commit: `git add . && git commit -m "Paso 15: administrador inicial al arrancar"`
+1. En `backend/internal/handler/middleware.go` agregar:
+   - imports `net/http`, `strings`, `seguimiento/internal/auth` y `seguimiento/internal/dominio`;
+   - la constante `claveActor`;
+   - la interfaz `ValidadorTokens`;
+   - las funciones `Autenticar`, `RequiereRol` y `ActorDe` (sección 3).
+2. `make lint`
+3. Commit: `git add . && git commit -m "Paso 16: middleware de autenticación y roles"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- **Secretos por variables de entorno:** en la nube, `JWT_SECRETO` y `ADMIN_PASSWORD` irán a un gestor de secretos (Secret Manager de GCP) que los inyecta como variables. El código no cambia.
-- **Todas las instancias deben compartir el mismo `JWT_SECRETO`** para validar los tokens que emiten las demás (Entrega 3).
+- **La validación del token no consulta la base de datos**, así que no agrega carga por petición; escala con el número de instancias (Entrega 3).
+- **El frontend de la Entrega 2** solo tendrá que guardar el token del inicio de sesión y enviarlo en la cabecera `Authorization` de cada petición.
 
 ---
 
@@ -194,6 +169,6 @@ Si `JWT_SECRETO` es corto, la API no arranca: `docker compose logs api` muestra 
 
 | Requisito | Cómo |
 |---|---|
-| RF-15.2 / RF-02 Administración de usuarios | Siempre existe un administrador para crear los demás usuarios. |
-| RNF-03 Seguridad básica | Secreto JWT obligatorio y largo; contraseña del administrador con bcrypt. |
-| Lineamientos 10 | Credenciales iniciales por variables de entorno. |
+| RF-01.2 Control de acceso por rol | `RequiereRol` protege rutas por rol (403). |
+| RNF-03 Autenticación local | `Autenticar` exige un JWT válido (401). |
+| RN-03 a RN-05 Visibilidad | El `Actor` queda disponible para que los servicios filtren la información. |
