@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -101,6 +102,15 @@ func parametroUUID(c *gin.Context, nombre string) (string, error) {
 	return valor, nil
 }
 
+// parsearFecha interpreta un campo de fecha con formato AAAA-MM-DD.
+func parsearFecha(campo, texto string) (time.Time, error) {
+	f, err := dominio.ParsearFecha(texto)
+	if err != nil {
+		return f, apperr.Validacion("%s debe ser una fecha con formato AAAA-MM-DD", campo)
+	}
+	return f, nil
+}
+
 // consultaPaginacion lee limite y desplazamiento. Los valores fuera de rango
 // los normaliza el repositorio.
 func consultaPaginacion(c *gin.Context) dominio.Paginacion {
@@ -110,6 +120,9 @@ func consultaPaginacion(c *gin.Context) dominio.Paginacion {
 }
 
 // --- formatos de salida comunes ------------------------------------------------
+
+// fecha formatea una fecha sin hora.
+func fecha(t time.Time) string { return t.Format(dominio.FormatoFecha) }
 
 // rolesTexto convierte los roles a cadenas para el JSON.
 func rolesTexto(roles []dominio.Rol) []string {

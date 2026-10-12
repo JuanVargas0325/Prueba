@@ -1,165 +1,185 @@
-# Paso 23 · Servicio de períodos
+# Paso 24 · Endpoints de períodos
 
-> Rama `paso-a-paso` · paso 23 de 65 · anterior: **Paso 22 · Repositorio de períodos** · siguiente: **Paso 24 · Endpoints de períodos**
+> Rama `paso-a-paso` · paso 24 de 65 · anterior: **Paso 23 · Servicio de períodos** · siguiente: **Paso 25 · Dominio: cursos y proyectos**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el caso de uso de los períodos académicos: el **administrador** los crea y los actualiza (cerrar o reabrir; abrir o cerrar la ventana de creación) y **cualquier usuario autenticado** puede consultarlos.
+Los períodos académicos se gestionan por HTTP:
+
+| Método | Ruta | Rol | Descripción |
+|---|---|---|---|
+| POST | `/api/v1/periodos` | administrador | Crea un período. La ventana de creación queda **habilitada** salvo que se envíe `"creacion_habilitada": false`. |
+| GET | `/api/v1/periodos` | todos | Lista los períodos (filtro `?estado=activo|cerrado`). |
+| GET | `/api/v1/periodos/{id}` | todos | Detalle de un período. |
+| PATCH | `/api/v1/periodos/{id}` | administrador | Cambia `estado` y/o `creacion_habilitada`. |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/servicio/periodos.go` | **Nuevo.** Servicio `Periodos` con `Crear`, `Listar`, `Obtener` y `Actualizar`. |
-| `backend/internal/servicio/modulos_test.go` | **Modificado.** Auxiliar `fechaP`, repositorio falso de períodos y `TestPeriodos`. |
+| `backend/internal/handler/periodos.go` | **Nuevo.** Módulo de períodos. |
+| `backend/internal/handler/respuestas.go` | **Modificado.** `parsearFecha` (entrada `AAAA-MM-DD`) y `fecha` (salida `AAAA-MM-DD`). |
+| `backend/internal/handler/router.go` | **Modificado.** Servicio `Periodos` y su módulo. |
+| `backend/internal/handler/router_test.go` | **Modificado.** Un profesor no puede crear períodos (403). |
+| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso de períodos y `TestPeriodos`. |
+| `backend/cmd/api/main.go` | **Modificado.** Repositorio y servicio de períodos. |
+
+```bash
+curl -X POST localhost:8080/api/v1/periodos -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"codigo":"2026-20","fecha_inicio":"2026-08-01","fecha_cierre":"2026-12-15"}'
+# {"id":"7665...","codigo":"2026-20","fecha_inicio":"2026-08-01","fecha_cierre":"2026-12-15",
+#  "estado":"activo","creacion_habilitada":true,"creado_en":"..."}
+```
 
 ---
 
 ## 2. Por qué
 
-- **RF-03.2** exige que los períodos se gestionen de forma explícita (código, fechas, estado). Alguien tiene que crearlos: el administrador, que es quien gestiona la estructura académica.
-- Los profesores necesitan **consultarlos** para elegir en qué período crean un curso (paso 28), por eso la lectura está abierta a todos los usuarios autenticados.
-- **RN-07:** la ventana de creación se controla con `CreacionHabilitada`.
+- **RF-03.2** queda disponible: el administrador define los períodos y abre o cierra la ventana de creación (RN-07); los profesores los consultan.
+- **`PATCH` y no `PUT`:** `PATCH` es el verbo HTTP para **actualizaciones parciales** (se envía solo lo que cambia). Encaja con los punteros opcionales del servicio (paso 23).
+- **Rutas con roles distintos dentro del mismo grupo:** consultar es para todos, modificar solo para el administrador.
 
 ---
 
-## 3. Explicación detallada de `periodos.go`
+## 3. Explicación detallada
+
+### 3.1 Registro de rutas con permisos por ruta
 
 ```go
-type RepositorioPeriodos interface {
-	Crear(ctx context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error)
-	Obtener(ctx context.Context, id string) (dominio.PeriodoAcademico, error)
-	Listar(ctx context.Context, f dominio.FiltroPeriodos) ([]dominio.PeriodoAcademico, error)
-	Actualizar(ctx context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error)
-}
-
-type NuevoPeriodo struct {
-	Codigo             string
-	FechaInicio        time.Time
-	FechaCierre        time.Time
-	CreacionHabilitada bool
-}
-
-type CambiosPeriodo struct {
-	Estado             *dominio.EstadoPeriodo
-	CreacionHabilitada *bool
+func (h *HandlerPeriodos) Registrar(g *gin.RouterGroup) {
+	r := g.Group("/periodos")
+	r.GET("", h.Listar)
+	r.GET("/:id", h.Obtener)
+	r.POST("", RequiereRol(dominio.RolAdministrador), h.Crear)
+	r.PATCH("/:id", RequiereRol(dominio.RolAdministrador), h.Actualizar)
 }
 ```
-- `CambiosPeriodo` usa **punteros** para expresar "opcional": `nil` significa "no cambiar ese campo". Sin punteros no se podría distinguir entre "no envió `creacion_habilitada`" y "envió `false`", porque el valor cero de un `bool` es `false`. Es la forma habitual en Go de modelar actualizaciones parciales (como un `PATCH` HTTP).
+- A diferencia de usuarios (todo el grupo protegido por rol), aquí `RequiereRol` se pasa **por ruta**: Gin ejecuta los handlers en orden, primero el middleware y después el endpoint.
 
-### `Crear`
+### 3.2 Formatos
 
 ```go
-func (s *Periodos) Crear(ctx context.Context, actor auth.Actor, n NuevoPeriodo) (dominio.PeriodoAcademico, error) {
-	if err := exigirRol(actor, dominio.RolAdministrador); err != nil {
-		return dominio.PeriodoAcademico{}, err
-	}
-	p := dominio.PeriodoAcademico{
-		Codigo:             strings.TrimSpace(n.Codigo),
-		FechaInicio:        n.FechaInicio,
-		FechaCierre:        n.FechaCierre,
-		Estado:             dominio.PeriodoActivo,
-		CreacionHabilitada: n.CreacionHabilitada,
-	}
-	if err := dominio.ValidarCodigoPeriodo(p.Codigo); err != nil { ... }
-	if err := p.ValidarFechas(); err != nil { ... }
-	creado, err := s.repo.Crear(ctx, p)
-	...
+type periodoJSON struct {
+	ID                 string                `json:"id"`
+	Codigo             string                `json:"codigo"`
+	FechaInicio        string                `json:"fecha_inicio"`
+	FechaCierre        string                `json:"fecha_cierre"`
+	Estado             dominio.EstadoPeriodo `json:"estado"`
+	CreacionHabilitada bool                  `json:"creacion_habilitada"`
+	CreadoEn           time.Time             `json:"creado_en"`
 }
 ```
-- Todo período nace **activo**. Las validaciones son las del dominio (paso 21).
-
-### `Listar` y `Obtener`
+- Las fechas de calendario salen como **texto `AAAA-MM-DD`** (`"2026-08-01"`), no como fecha y hora (`2026-08-01T00:00:00Z`). Así el cliente no tiene que adivinar la zona horaria de un día.
+- `creado_en` sí es un instante, por eso conserva la fecha y hora completas.
 
 ```go
-func (s *Periodos) Listar(ctx context.Context, _ auth.Actor, f dominio.FiltroPeriodos) ([]dominio.PeriodoAcademico, error) {
-	if f.Estado != "" && !f.Estado.EsValido() {
-		return nil, apperr.Validacion("estado inválido: use activo o cerrado")
-	}
-	return s.repo.Listar(ctx, f)
+type peticionPeriodo struct {
+	Codigo             string `json:"codigo"`
+	FechaInicio        string `json:"fecha_inicio"`
+	FechaCierre        string `json:"fecha_cierre"`
+	CreacionHabilitada *bool  `json:"creacion_habilitada"`
 }
 ```
-- No exigen rol: el actor se recibe por **uniformidad** con el resto de servicios (todos reciben el actor), pero no se usa (`_`).
-
-### `Actualizar`
+- Las fechas llegan como texto y se validan con `parsearFecha`.
+- `CreacionHabilitada *bool`: un puntero para saber si el campo **vino** en el JSON. En `Crear`:
+  ```go
+  habilitada := p.CreacionHabilitada == nil || *p.CreacionHabilitada
+  ```
+  Si no se envía, la ventana queda **abierta** (lo habitual al crear un período al inicio del semestre).
 
 ```go
-func (s *Periodos) Actualizar(ctx context.Context, actor auth.Actor, id string, c CambiosPeriodo) (dominio.PeriodoAcademico, error) {
-	if err := exigirRol(actor, dominio.RolAdministrador); err != nil { ... }
-	if c.Estado == nil && c.CreacionHabilitada == nil {
-		return dominio.PeriodoAcademico{}, apperr.Validacion("indique estado o creacion_habilitada")
-	}
-	p, err := s.repo.Obtener(ctx, id)
-	...
-	if c.Estado != nil {
-		if !c.Estado.EsValido() { ... }
-		p.Estado = *c.Estado
-	}
-	if c.CreacionHabilitada != nil {
-		p.CreacionHabilitada = *c.CreacionHabilitada
-	}
-	if p.Estado == dominio.PeriodoCerrado {
-		p.CreacionHabilitada = false
-	}
-	actualizado, err := s.repo.Actualizar(ctx, p)
-	...
+type peticionCambiosPeriodo struct {
+	Estado             *dominio.EstadoPeriodo `json:"estado"`
+	CreacionHabilitada *bool                  `json:"creacion_habilitada"`
 }
 ```
-- Patrón **leer → modificar → guardar**: se obtiene el período, se aplican solo los cambios enviados y se guarda.
-- `*c.Estado` **desreferencia** el puntero: obtiene el valor al que apunta.
-- **Regla de consistencia:** un período **cerrado** no puede tener la ventana de creación abierta; al cerrarlo, se cierra también la ventana.
+- Para el `PATCH`, ambos son opcionales y se pasan tal cual al servicio (`nil` = sin cambio).
+
+### 3.3 `respuestas.go`: fechas
+
+```go
+func parsearFecha(campo, texto string) (time.Time, error) {
+	f, err := dominio.ParsearFecha(texto)
+	if err != nil {
+		return f, apperr.Validacion("%s debe ser una fecha con formato AAAA-MM-DD", campo)
+	}
+	return f, nil
+}
+
+func fecha(t time.Time) string { return t.Format(dominio.FormatoFecha) }
+```
+- `parsearFecha` usa el dominio (paso 20) y produce un error que **nombra el campo**: "fecha_inicio debe ser una fecha con formato AAAA-MM-DD".
+- `fecha` hace lo inverso para las respuestas.
+
+### 3.4 `main.go`
+
+```go
+	var (
+		usuarios = repositorio.NuevoUsuarios(db)
+		periodos = repositorio.NuevoPeriodos(db)
+	)
+```
+- Un bloque `var (...)` agrupa los repositorios; crecerá con cada módulo.
+
+### 3.5 Pruebas
+
+- `TestControlDeAccesoPorRol` agrega: un profesor **no** puede crear períodos (403).
+- `TestPeriodos` (handler), con un servicio falso que guarda lo recibido:
+  - crear sin `creacion_habilitada` → el servicio recibe `true` y la respuesta trae `"fecha_inicio":"2026-08-01"`;
+  - una fecha `1/8/2026` → 400;
+  - `PATCH` con `{"creacion_habilitada": false}` → el servicio recibe ese cambio y `Estado` en `nil`;
+  - un monitor puede **listar** períodos (200).
 
 ---
 
-## 4. Las pruebas
-
-```go
-func fechaP(t *testing.T, texto string) time.Time { ... }
-```
-- Auxiliar para escribir fechas legibles (como `fecha` en el dominio, paso 20).
-
-`repoPeriodosFalso` guarda los períodos en un mapa. `TestPeriodos` verifica:
-- el administrador crea un período, que queda **activo**;
-- un profesor no puede crear (403);
-- código `2026` (sin `-NN`) → 400;
-- cierre anterior al inicio → 400;
-- **cerrar el período deshabilita la creación**;
-- una actualización sin cambios → 400.
-
----
-
-## 5. Conceptos de Go de este paso
+## 4. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Punteros como "opcional" | `*bool` distingue "no enviado" (`nil`) de `false`. |
-| Desreferenciar | `*p` obtiene el valor apuntado por `p`. |
-| Leer-modificar-guardar | Patrón para actualizaciones parciales. |
+| `PATCH` | Actualización parcial: solo los campos enviados. |
+| Middleware por ruta | `r.POST("", RequiereRol(...), h.Crear)`. |
+| Fechas como texto | Los días de calendario viajan como `AAAA-MM-DD`. |
+| `nil \|\| *p` | Valor por defecto cuando un campo opcional no llegó. |
 
 ---
 
-## 6. Cómo comprobarlo
+## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/servicio/ -v -run TestPeriodos
+make pruebas
+docker compose up --build -d --wait
+# TOKEN = token del administrador
+
+curl -s -X POST localhost:8080/api/v1/periodos -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"codigo":"2026-20","fecha_inicio":"2026-08-01","fecha_cierre":"2026-12-15"}'      # 201
+# repetir → 409 "ya existe el período 2026-20"
+# "fecha_inicio":"1/8/2026" → 400 "fecha_inicio debe ser una fecha con formato AAAA-MM-DD"
+
+curl -s -X PATCH localhost:8080/api/v1/periodos/<id> -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"estado":"cerrado"}'
+# "estado":"cerrado","creacion_habilitada":false   ← cerrar también cierra la ventana
+
+curl -s "localhost:8080/api/v1/periodos?estado=activo" -H "Authorization: Bearer $TOKEN"     # []
 ```
 
 ---
 
-## 7. Pasos para lograr esta versión desde el paso 22
+## 6. Pasos para lograr esta versión desde el paso 23
 
-1. Crear `backend/internal/servicio/periodos.go` con `RepositorioPeriodos`, `NuevoPeriodo`, `CambiosPeriodo`, `Periodos`, `NuevoPeriodos`, `Crear`, `Listar`, `Obtener` y `Actualizar`.
-2. En `modulos_test.go`: agregar `fechaP` (debajo de `esperarTipo`) y, después de la sección de usuarios, la sección `// --- períodos ---` con `repoPeriodosFalso` y `TestPeriodos`.
-3. `make pruebas lint`
-4. Commit: `git add . && git commit -m "Paso 23: servicio de períodos"`
+1. En `respuestas.go`: `parsearFecha` y `fecha`.
+2. Crear `backend/internal/handler/periodos.go` (interfaz, handler, `Registrar`, `periodoJSON`, `aPeriodoJSON`, peticiones y los cuatro endpoints).
+3. En `router.go`: campo `Periodos ServicioPeriodos` y `&HandlerPeriodos{...}` en la lista de módulos.
+4. En `router_test.go`: variable `profesor` y el caso `POST /api/v1/periodos` en `TestControlDeAccesoPorRol`.
+5. En `handler/modulos_test.go`: `servicioPeriodosFalso` y `TestPeriodos`.
+6. En `main.go`: bloque `var (...)` con `periodos = repositorio.NuevoPeriodos(db)` y `Periodos: servicio.NuevoPeriodos(periodos, log)`.
+7. `make pruebas lint` y commit: `git add . && git commit -m "Paso 24: endpoints de períodos"`
 
 ---
 
-## 8. Requisitos que atiende
+## 7. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-03.2 Períodos académicos | Creación y consulta con código, fechas y estado. |
-| RN-07 Ventana de creación | `CreacionHabilitada`, que se cierra junto con el período. |
-| RF-15 Administración | Solo el administrador crea y modifica períodos. |
+| RF-03.2 Períodos académicos | CRUD de períodos con código, fechas y estado. |
+| RN-07 Ventana de creación | `creacion_habilitada` modificable por el administrador. |
+| RF-01.2 Control de acceso | Lectura para todos; escritura solo administrador (probado). |

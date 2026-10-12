@@ -149,10 +149,12 @@ func TestRutaInexistenteYMetodoNoPermitido(t *testing.T) {
 func TestControlDeAccesoPorRol(t *testing.T) {
 	e := nuevoEntorno(t, nil)
 	monitor := e.token(t, dominio.RolMonitor)
+	profesor := e.token(t, dominio.RolProfesor)
 	casos := []struct {
 		metodo, ruta, token string
 	}{
-		{http.MethodGet, "/api/v1/usuarios", monitor}, // solo administrador
+		{http.MethodGet, "/api/v1/usuarios", monitor},   // solo administrador
+		{http.MethodPost, "/api/v1/periodos", profesor}, // solo administrador
 	}
 	for _, c := range casos {
 		if w := e.peticion(c.metodo, c.ruta, c.token, `{}`); w.Code != http.StatusForbidden {

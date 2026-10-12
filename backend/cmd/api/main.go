@@ -51,7 +51,10 @@ func ejecutar(log *slog.Logger) error {
 	if err := basedatos.Migrar(ctx, db, log); err != nil {
 		return err
 	}
-	usuarios := repositorio.NuevoUsuarios(db)
+	var (
+		usuarios = repositorio.NuevoUsuarios(db)
+		periodos = repositorio.NuevoPeriodos(db)
+	)
 
 	// Capa de servicio
 	tokens := auth.NuevoGestorTokens(cfg.JWT.Secreto, cfg.JWT.Expiracion)
@@ -64,6 +67,7 @@ func ejecutar(log *slog.Logger) error {
 	router := handler.NuevoRouter(handler.Dependencias{
 		Autenticacion: servicioAuth,
 		Usuarios:      servicio.NuevoUsuarios(usuarios, log),
+		Periodos:      servicio.NuevoPeriodos(periodos, log),
 		Tokens:        tokens,
 		OrigenesCORS:  cfg.OrigenesCORS,
 		Log:           log,

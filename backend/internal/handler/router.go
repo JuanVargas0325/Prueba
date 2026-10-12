@@ -17,6 +17,7 @@ type ComprobadorSalud func(ctx context.Context) error
 type Dependencias struct {
 	Autenticacion ServicioAutenticacion
 	Usuarios      ServicioUsuarios
+	Periodos      ServicioPeriodos
 
 	Tokens ValidadorTokens
 	Salud  map[string]ComprobadorSalud
@@ -56,6 +57,7 @@ func NuevoRouter(d Dependencias) *gin.Engine {
 	modulos := []modulo{
 		autenticacion,
 		&HandlerUsuarios{servicio: d.Usuarios, log: d.Log},
+		&HandlerPeriodos{servicio: d.Periodos, log: d.Log},
 	}
 	for _, m := range modulos {
 		m.Registrar(protegidas)
