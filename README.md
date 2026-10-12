@@ -1,169 +1,189 @@
-# Paso 37 · Endpoints de tareas
+# Paso 38 · Almacenamiento local de archivos
 
-> Rama `paso-a-paso` · paso 37 de 65 · anterior: **Paso 36 · Servicio de tareas** · siguiente: **Paso 38 · Almacenamiento local de archivos**
+> Rama `paso-a-paso` · paso 38 de 65 · anterior: **Paso 37 · Endpoints de tareas** · siguiente: **Paso 39 · Adjuntos en el servicio de tareas**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-El registro semanal de tareas queda disponible por HTTP (con JSON; los archivos adjuntos llegan en el paso 40):
-
-| Método | Ruta | Rol | Descripción |
-|---|---|---|---|
-| POST | `/api/v1/tareas` | monitor o asistente | Registra una tarea. `semana` (cualquier fecha de la semana) es opcional: sin ella se usa la semana en curso. |
-| GET | `/api/v1/tareas` | todos | Lista las tareas visibles. Filtros: `?semana=`, `?vinculacion_id=`, `?espacio_id=`, `?usuario_id=`. |
-| GET | `/api/v1/tareas/{id}` | quien pueda verla | Detalle. |
-| PUT | `/api/v1/tareas/{id}` | monitor o asistente (dueño) | Reemplaza los datos editables mientras la semana está activa. |
-| DELETE | `/api/v1/tareas/{id}` | monitor o asistente (dueño) | Elimina la tarea (204). |
+Se creó el paquete que **guarda archivos** (adjuntos de tareas y, más adelante, los PDF de los reportes) en una carpeta que vive en un **volumen de Docker**.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/handler/tareas.go` | **Nuevo.** Módulo de tareas. |
-| `backend/internal/handler/respuestas.go` | **Modificado.** `consultaFecha` y `consultaSemana`. |
-| `backend/internal/handler/router.go` | **Modificado.** Servicio `Tareas` y su módulo. |
-| `backend/internal/handler/router_test.go` | **Modificado.** `/api/v1/tareas` exige token; un profesor no registra tareas (403). |
-| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso de tareas y cuatro pruebas. |
-| `backend/cmd/api/main.go` | **Modificado.** Repositorio y servicio de tareas. |
-
-```bash
-curl -s -X POST localhost:8080/api/v1/tareas -H "Authorization: Bearer $TOKEN_MONITOR" -H 'Content-Type: application/json' \
-  -d '{"vinculacion_id":"<id>","titulo":"Calificar taller 2","estado":"en_desarrollo","horas_invertidas":3}'
-# {"id":"...","vinculacion_id":"...","usuario":{...},"espacio":{...},"rol":"monitor",
-#  "semana_inicio":"2026-10-05","semana_fin":"2026-10-11","titulo":"Calificar taller 2",
-#  "estado":"en_desarrollo","horas_invertidas":3,"observaciones":"","tardia":false,"modificable":true,...}
-```
+| `backend/internal/almacenamiento/local.go` | **Nuevo.** `Local` con `Guardar`, `Abrir` y `Eliminar`, protegido contra rutas maliciosas. |
+| `backend/internal/almacenamiento/almacenamiento.go` | **Nuevo.** `Config` (tipo y ruta), la interfaz `Archivos` y `Nuevo`, que crea el almacenamiento según la configuración. |
+| `backend/internal/almacenamiento/local_test.go` | **Nuevo.** Pruebas de guardar, abrir y eliminar, de rechazo de rutas fuera de la carpeta raíz y de `Nuevo`. |
+| `backend/internal/config/config.go` | **Modificado.** `Almacenamiento` (`ALMACENAMIENTO_TIPO`, por defecto `local`, y `ALMACENAMIENTO_RUTA`, por defecto `/data`), `MaxAdjuntoMB` (`ADJUNTO_MAX_MB`, por defecto 10) y la función `entero`. |
+| `backend/internal/config/config_test.go` | **Modificado.** Valores por defecto y formato inválido de `ADJUNTO_MAX_MB`. |
+| `backend/Dockerfile` | **Modificado.** Crea `/data`, se lo asigna al usuario `app` y lo declara como `VOLUME`. |
+| `docker-compose.yml` | **Modificado.** Volumen con nombre `archivos` montado en `/data` de la API. |
+| `.env.example` | **Modificado.** Nueva sección `Archivos`. |
 
 ---
 
 ## 2. Por qué
 
-- **RF-06 a RF-08** quedan disponibles: registrar, consultar, editar y eliminar tareas con las reglas de semana activa, tardanza e inmutabilidad.
-- **Solo monitores y asistentes registran tareas** (`dominio.RolesOperativos`, paso 11). El profesor las **consulta** (RF-10.5).
-- **`semana_inicio`, `semana_fin`, `tardia` y `modificable` en cada respuesta:** el cliente sabe a qué semana pertenece la tarea, si fue un reporte tardío y si todavía puede editarla, sin calcular nada.
+- **RF-06.4 / RN-23:** las tareas pueden llevar **archivos de evidencia**.
+- **RF-14.4 y RF-14.5:** los reportes se generan en **PDF** y se **almacenan** para descargarlos después.
+- **¿Por qué no en la base de datos?** Guardar archivos binarios en PostgreSQL agranda la base de datos, hace lentos los respaldos y ocupa conexiones durante las descargas. Lo habitual es guardar el archivo en un almacenamiento de archivos y en la base de datos **solo sus metadatos** (nombre, tipo, tamaño, ruta), como ya prevé la tabla `tarea_adjuntos` (paso 4).
+- **¿Por qué un volumen?** Un contenedor pierde todo lo que escribe en su propio sistema de archivos cuando se recrea. Un volumen persiste. En el paso 55 el worker montará el **mismo** volumen: él escribirá los PDF y la API los servirá.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Rutas
+### 3.1 `local.go`
 
 ```go
-func (h *HandlerTareas) Registrar(g *gin.RouterGroup) {
-	operativos := RequiereRol(dominio.RolesOperativos...)
-	r := g.Group("/tareas")
-	r.GET("", h.Listar)
-	r.GET("/:id", h.Obtener)
-	r.POST("", operativos, h.Crear)
-	r.PUT("/:id", operativos, h.Actualizar)
-	r.DELETE("/:id", operativos, h.Eliminar)
+// Package almacenamiento guarda los archivos binarios (PDF de reportes y
+// adjuntos de tareas). En la Entrega 1 se usa un volumen de Docker montado en
+// el contenedor; en entregas posteriores puede añadirse una implementación
+// sobre Cloud Storage que cumpla la misma interfaz del servicio.
+package almacenamiento
+
+type Local struct {
+	raiz string
 }
-```
-- `dominio.RolesOperativos...` **desempaca** la lista `[monitor, asistente_graduado]` como argumentos de `RequiereRol`.
-- El middleware se guarda en una variable (`operativos`) para reutilizarlo en varias rutas.
 
-### 3.2 Formato de salida
-
-```go
-type tareaJSON struct {
-	ID              string              `json:"id"`
-	VinculacionID   string              `json:"vinculacion_id"`
-	Usuario         personaRef          `json:"usuario"`
-	Espacio         espacioRef          `json:"espacio"`
-	Rol             dominio.Rol         `json:"rol"`
-	SemanaInicio    string              `json:"semana_inicio"`
-	SemanaFin       string              `json:"semana_fin"`
+func NuevoLocal(raiz string) (*Local, error) {
+	abs, err := filepath.Abs(raiz)
 	...
-	Tardia          bool                `json:"tardia"`
-	Modificable     bool                `json:"modificable"`
+	if err := os.MkdirAll(abs, 0o750); err != nil { ... }
+	return &Local{raiz: abs}, nil
+}
+```
+- Convierte la raíz en ruta absoluta y la crea si no existe. `0o750` son los permisos en notación octal: el dueño lee, escribe y entra; el grupo lee y entra; el resto, nada.
+
+#### Seguridad: que nadie escriba fuera de la raíz
+
+```go
+func (l *Local) rutaSegura(ruta string) (string, error) {
+	limpia := filepath.Clean(filepath.FromSlash(strings.TrimSpace(ruta)))
+	if limpia == "." || filepath.IsAbs(limpia) || limpia == ".." ||
+		strings.HasPrefix(limpia, ".."+string(filepath.Separator)) {
+		return "", apperr.Validacion("ruta de archivo inválida")
+	}
+	return filepath.Join(l.raiz, limpia), nil
+}
+```
+- Las rutas internas usan `/` (`adjuntos/<tarea>/<archivo>.pdf`). `filepath.Clean` resuelve `a/../b` → `b`.
+- Se rechazan: rutas vacías, absolutas (`/etc/passwd`) y las que **suben** de nivel (`../fuera.pdf`, `a/../../fuera.pdf`). Es la protección contra el ataque de **recorrido de directorios** (*path traversal*), que podría sobrescribir archivos del sistema.
+- Las rutas las arma el servidor (paso 39), no el usuario; aun así se valida: defensa en profundidad.
+
+#### Guardar de forma atómica
+
+```go
+func (l *Local) Guardar(_ context.Context, ruta string, contenido io.Reader) (int64, error) {
+	destino, err := l.rutaSegura(ruta)
 	...
+	if err := os.MkdirAll(filepath.Dir(destino), 0o750); err != nil { ... }
+	tmp, err := os.CreateTemp(filepath.Dir(destino), ".tmp-*")
+	...
+	defer func() { _ = os.Remove(tmp.Name()) }()
+
+	n, err := io.Copy(tmp, contenido)
+	...
+	if err := tmp.Close(); err != nil { ... }
+	if err := os.Rename(tmp.Name(), destino); err != nil { ... }
+	return n, nil
+}
+```
+- Recibe un `io.Reader`: el contenido llega **por partes**, sin cargar el archivo completo en memoria (importante con archivos de varios MB).
+- Escribe primero en un **archivo temporal** y al final lo **renombra** al destino. El renombrado es atómico: nadie puede ver un archivo a medio escribir, y si algo falla a la mitad, el destino no queda corrupto.
+- `defer func() { _ = os.Remove(tmp.Name()) }()`: si algo falla antes del renombrado, el temporal se borra. Después del renombrado el temporal ya no existe y el `Remove` simplemente falla en silencio (`_ =` ignora el error a propósito).
+- Devuelve los **bytes escritos**, con los que el servicio controla el tamaño máximo (paso 39).
+
+```go
+func (l *Local) Abrir(_ context.Context, ruta string) (io.ReadCloser, error) {
+	...
+	f, err := os.Open(origen)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, apperr.NoEncontrado("el archivo no existe")
+	}
+	...
+	return f, nil
 }
 
-func (h *HandlerTareas) aTareaJSON(actor auth.Actor, t dominio.Tarea) tareaJSON {
-	return tareaJSON{
-		...
-		SemanaInicio: fecha(t.SemanaInicio), SemanaFin: fecha(dominio.FinSemana(t.SemanaInicio)),
-		...
-		Modificable: h.servicio.Modificable(actor, t),
-		...
+func (l *Local) Eliminar(_ context.Context, ruta string) error {
+	...
+	if err := os.Remove(objetivo); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("eliminando archivo: %w", err)
+	}
+	return nil
+}
+```
+- `Abrir` devuelve un `io.ReadCloser` (algo que se lee y **se debe cerrar**); quien lo pide es responsable de cerrarlo.
+- `Eliminar` no falla si el archivo ya no existe: el resultado deseado ("que no esté") ya se cumple. Esto se llama **idempotencia**.
+- Los métodos reciben `context.Context` aunque el disco local no lo use (`_`): así su forma coincidirá con la interfaz `Almacenamiento` del servicio (paso 39), que una implementación en la nube sí necesitará.
+
+### 3.2 `almacenamiento.go` · elegir el almacenamiento en un solo lugar
+
+```go
+const TipoLocal = "local"
+
+type Config struct {
+	Tipo string // ALMACENAMIENTO_TIPO
+	Ruta string // ALMACENAMIENTO_RUTA: carpeta raíz del almacenamiento local
+}
+
+type Archivos interface {
+	Guardar(ctx context.Context, ruta string, contenido io.Reader) (int64, error)
+	Abrir(ctx context.Context, ruta string) (io.ReadCloser, error)
+	Eliminar(ctx context.Context, ruta string) error
+}
+
+func Nuevo(c Config) (Archivos, error) {
+	switch c.Tipo {
+	case TipoLocal:
+		local, err := NuevoLocal(c.Ruta)
+		if err != nil {
+			return nil, err
+		}
+		return local, nil
+	default:
+		return nil, fmt.Errorf("ALMACENAMIENTO_TIPO %q no es válido (use %q)", c.Tipo, TipoLocal)
 	}
 }
 ```
-- `aTareaJSON` es un **método** del handler (no una función suelta como en otros módulos) porque necesita el servicio para calcular `modificable` **según quién pregunta**: la misma tarea es modificable para su dueña y no para el profesor.
+- **Por qué existe.** La API (paso 39) y el worker (paso 55) necesitan un almacenamiento. Si cada uno llamara directamente a `NuevoLocal`, al agregar Cloud Storage en la Entrega 2 habría que cambiar ambos. Con `Nuevo`, ambos piden "el almacenamiento configurado" y la decisión vive en **un solo `switch`**: agregar Cloud Storage será un archivo nuevo (`gcs.go`) más un `case` aquí.
+- **`Archivos` es una interfaz**: los tres métodos que tiene cualquier almacenamiento. `Nuevo` debe devolver una interfaz porque, según la configuración, entregará tipos distintos (`*Local` hoy, el de Cloud Storage después). `*Local` la cumple sin declararlo, porque tiene esos tres métodos (interfaz implícita, paso 10).
+- **¿Por qué `local, err := ...; return local, nil` y no `return NuevoLocal(c.Ruta)`?** Es una trampa conocida de Go: si `NuevoLocal` falla devuelve un `*Local` nulo, y al convertirlo en interfaz **la interfaz no es `nil`** (lleva dentro el tipo `*Local`). Devolver `nil` explícitamente en el error evita esa confusión.
+- Un tipo desconocido es un error de arranque con un mensaje que dice qué valor usar.
 
-### 3.3 Peticiones
-
-```go
-// peticionTarea crea una tarea. semana es cualquier fecha (AAAA-MM-DD) de la
-// semana reportada; si se omite, se usa la semana en curso.
-type peticionTarea struct {
-	VinculacionID   string              `json:"vinculacion_id"`
-	Semana          string              `json:"semana"`
-	Titulo          string              `json:"titulo"`
-	Descripcion     string              `json:"descripcion"`
-	Estado          dominio.EstadoTarea `json:"estado"`
-	HorasInvertidas int                 `json:"horas_invertidas"`
-	Observaciones   string              `json:"observaciones"`
-}
-
-type peticionActualizarTarea struct { ... los cinco campos editables ... }
-
-func (p peticionActualizarTarea) datos() dominio.DatosTarea { ... }
-```
-- `HorasInvertidas int`: `"horas_invertidas": 2.5` → **400** "el campo \"horas_invertidas\" tiene un tipo inválido (se esperaba int)" (RN-24).
-- La actualización **no** tiene `semana` ni `vinculacion_id`: no se pueden cambiar (RN-26).
-- `datos()` convierte la petición en `dominio.DatosTarea`. `Crear` también la reutiliza para los campos comunes.
+### 3.3 Configuración
 
 ```go
-	var semana time.Time // vacía = semana en curso, la decide el servicio
-	if p.Semana != "" {
-		if semana, err = parsearFecha("semana", p.Semana); err != nil { ... }
+	c.Almacenamiento = almacenamiento.Config{
+		Tipo: texto("ALMACENAMIENTO_TIPO", almacenamiento.TipoLocal),
+		Ruta: texto("ALMACENAMIENTO_RUTA", "/data"),
 	}
+	c.MaxAdjuntoMB = entero("ADJUNTO_MAX_MB", 10, &errs)
 ```
-- Si no se envía la semana, se pasa el **valor cero** al servicio (paso 36).
+- Igual que `ia.Config` más adelante (paso 51), cada paquete define **su** configuración y `config` solo la llena desde las variables de entorno.
+- `entero` es como `duracion` (paso 15) pero con `strconv.Atoi`. `ADJUNTO_MAX_MB=diez` produce un error de configuración.
 
-### 3.4 Listado con semana normalizada
+### 3.4 Docker
 
-```go
-func consultaFecha(c *gin.Context, nombre string) (*time.Time, error) { ... }
-
-func consultaSemana(c *gin.Context, nombre string) (*time.Time, error) {
-	f, err := consultaFecha(c, nombre)
-	if f == nil || err != nil {
-		return nil, err
-	}
-	semana := dominio.InicioSemana(*f)
-	return &semana, nil
-}
+```dockerfile
+ && mkdir -p /data \
+ && chown app:app /data
+# /data es el punto de montaje del volumen de archivos (PDF y adjuntos).
+VOLUME ["/data"]
 ```
-- `?semana=2026-10-08` (un jueves) se convierte en el lunes `2026-10-05`. El cliente puede mandar cualquier día.
-- Devuelven **punteros**: `nil` = filtro no indicado.
+- El proceso corre como `app` (no `root`, paso 5), así que la carpeta debe pertenecerle para poder escribir. Cuando Docker monta un volumen nuevo y vacío en `/data`, copia el dueño y los permisos de esa carpeta de la imagen.
 
-```go
-	f := dominio.FiltroTareas{SemanaInicio: semana, Paginacion: consultaPaginacion(c)}
-	for nombre, destino := range map[string]*string{"vinculacion_id": &f.VinculacionID, "espacio_id": &f.EspacioID, "usuario_id": &f.UsuarioID} {
-		if *destino, err = consultaUUID(c, nombre); err != nil { ... }
-	}
+```yaml
+  api:
+    environment:
+      POSTGRES_HOST: postgres
+      ALMACENAMIENTO_RUTA: /data
+    volumes:
+      - archivos:/data
+...
+volumes:
+  datos-postgres:
+  archivos:
 ```
-- Un **mapa de punteros** para leer tres filtros iguales sin repetir el mismo bloque tres veces: para cada nombre de parámetro, se escribe su valor validado en el campo correspondiente del filtro.
-
-### 3.5 Eliminar
-
-```go
-	c.Status(http.StatusNoContent)
-```
-- **204 No Content**: se eliminó y no hay nada que devolver.
-
-### 3.6 Pruebas
-
-- `TestRutasProtegidasExigenToken` incluye `/api/v1/tareas`; `TestControlDeAccesoPorRol`, que un profesor no registra tareas.
-- En `modulos_test.go`:
-
-| Prueba | Qué verifica |
-|---|---|
-| `TestCrearTareaConJSON` | Los datos llegan al servicio (vinculación, semana del 07/10, horas, estado) y la respuesta trae `semana_inicio` 05/10, `semana_fin` 11/10 y `modificable`. |
-| `TestCrearTareaSinSemanaUsaLaSemanaEnCurso` | Sin semana, el servicio recibe el valor cero. |
-| `TestCrearTareaRechazaHorasNoEnterasYCamposDesconocidos` | Horas `2.5`, campo desconocido, vinculación que no es UUID y fecha `07/10/2026` → 400. |
-| `TestListarActualizarYEliminarTareas` | `?semana=2026-10-08` llega como el lunes 05/10, con la vinculación y el límite; la actualización llega al servicio; eliminar responde 204. |
 
 ---
 
@@ -171,47 +191,62 @@ func consultaSemana(c *gin.Context, nombre string) (*time.Time, error) {
 
 | Concepto | Explicación |
 |---|---|
-| `lista...` en una llamada | Pasa los elementos de una lista como argumentos separados. |
-| Método de conversión | `h.aTareaJSON(actor, t)` usa el servicio para un campo que depende del actor. |
-| Mapa de punteros | Leer varios filtros con el mismo código. |
-| 204 No Content | Éxito sin cuerpo de respuesta. |
+| `io.Reader` / `io.ReadCloser` | Interfaces para leer datos por partes (y cerrarlos). |
+| `io.Copy` | Copia de un lector a un escritor sin cargar todo en memoria. |
+| Escritura atómica | Temporal + `os.Rename`. |
+| Path traversal | Ataque con `../` para salir de una carpeta; se evita con `filepath.Clean` y validaciones. |
+| Permisos octales | `0o750`. |
+| Idempotencia | Repetir la operación produce el mismo resultado (eliminar algo que ya no existe no falla). |
+| `VOLUME` | Declara en la imagen una carpeta pensada para un volumen. |
+| Función fábrica | Función (`Nuevo`) que decide qué implementación crear según la configuración. |
+| Interfaz con valor `nil` | Una interfaz que contiene un puntero nulo no es `nil`; por eso se devuelve `nil` explícito. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-make pruebas
+cd backend && go test ./internal/almacenamiento/ -v
+# TestGuardarAbrirYEliminar, TestRutasFueraDeLaRaizSonRechazadas, TestNuevoEligeElTipo
+
 docker compose up --build -d --wait
+docker compose exec api sh -c 'ls -ld /data && touch /data/prueba && echo ok'
+# drwxr-xr-x 2 app app ... /data   ok
+docker volume ls | grep archivos
 ```
 
-Con un profesor, Laura vinculada como monitora (paso 33) y su token:
-1. Crear una tarea sin `semana` → `semana_inicio` = lunes de esta semana, `tardia: false`, `modificable: true`.
-2. Crear otra con `"semana":"<una fecha de la semana pasada>"` → `tardia: true`, `modificable: false`.
-3. `PUT` sobre la tardía → **422** "los reportes tardíos no pueden modificarse ni eliminarse".
-4. Con el token del profesor: `POST /api/v1/tareas` → **403**; `GET /api/v1/tareas?usuario_id=<laura>` → las 2 tareas.
-5. `"horas_invertidas": 2.5` → **400**; una semana futura → **400**.
-6. `DELETE /api/v1/tareas/<la de esta semana>` con el token de Laura → **204**.
+`local_test.go` usa `t.TempDir()`, una carpeta temporal que Go borra al terminar la prueba.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 36
+## 6. Pasos para lograr esta versión desde el paso 37
 
-1. En `respuestas.go`: `consultaFecha` y `consultaSemana`.
-2. Crear `backend/internal/handler/tareas.go` con `ServicioTareas` (sin adjuntos), `HandlerTareas`, `Registrar`, `tareaJSON`, `aTareaJSON`, las peticiones y los cinco endpoints.
-3. En `router.go`: campo `Tareas` y `&HandlerTareas{servicio: d.Tareas, log: d.Log}`.
-4. En `router_test.go`: `/api/v1/tareas` en la lista de rutas protegidas (y el token inválido sobre esa ruta) y el caso del profesor.
-5. En `handler/modulos_test.go`: `servicioTareasFalso`, `tareaFalsa`, `entornoTareas` y las cuatro pruebas.
-6. En `main.go`: `tareas = repositorio.NuevoTareas(db)` y `Tareas: servicio.NuevoTareas(tareas, vinculaciones, reloj, log)`.
-7. `make pruebas lint` y commit: `git add . && git commit -m "Paso 37: endpoints de tareas"`
+1. Crear `backend/internal/almacenamiento/local.go` (`Local`, `NuevoLocal`, `rutaSegura`, `Guardar`, `Abrir`, `Eliminar`) y `local_test.go`.
+2. Crear `backend/internal/almacenamiento/almacenamiento.go` (`TipoLocal`, `Config`, `Archivos`, `Nuevo`) y su prueba `TestNuevoEligeElTipo` en `local_test.go`.
+3. En `config.go`: campos `Almacenamiento` y `MaxAdjuntoMB`, su carga, la función `entero` y los imports `strconv` y `seguimiento/internal/almacenamiento`. En `config_test.go`, los nuevos valores por defecto y `ADJUNTO_MAX_MB=diez`.
+4. En `backend/Dockerfile`, etapa `base`: crear `/data`, `chown app:app /data` y `VOLUME ["/data"]`.
+5. En `docker-compose.yml`: en `api`, `ALMACENAMIENTO_RUTA: /data` y el volumen `archivos:/data`; declarar `archivos` en `volumes`.
+6. En `.env.example` (y su `.env`): la sección `Archivos` con `ALMACENAMIENTO_TIPO`, `ALMACENAMIENTO_RUTA` y `ADJUNTO_MAX_MB`.
+7. `make pruebas lint`, `docker compose up --build -d --wait` y commit: `git add . && git commit -m "Paso 38: almacenamiento local de archivos"`
 
 ---
 
-## 7. Requisitos que atiende
+## 7. Preparación para las próximas entregas
+
+- **Este es el punto de extensión para la nube.** La Entrega 2 exige guardar los PDF y los adjuntos en un bucket de **Cloud Storage**, y en la Entrega 3, con varias instancias de la API, un volumen local ya no serviría (cada máquina tendría sus propios archivos). Para agregarlo basta con:
+  1. crear `almacenamiento/gcs.go` con los mismos tres métodos (`Guardar`, `Abrir`, `Eliminar`);
+  2. agregar un `case` en `Nuevo` (por ejemplo `ALMACENAMIENTO_TIPO=gcs`) y una variable con el nombre del bucket.
+
+  Ni los servicios ni los `main` cambian. Está registrado en la deuda técnica (DT-02).
+- Los métodos ya reciben `context.Context`, que las llamadas de red a Cloud Storage necesitarán para sus tiempos máximos.
+
+---
+
+## 8. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-06.1 a RF-06.3, RF-06.5, RF-06.6 | `POST /api/v1/tareas` con datos validados y horas enteras. |
-| RF-06.7 / RF-06.8 | `PUT` y `DELETE` sobre tareas propias y modificables. |
-| RF-08.1 a RF-08.5 | Semana normalizada, pasadas permitidas (tardías), futuras rechazadas, tardías inmutables. |
-| RF-10.5 / RF-11.2 / RF-12 | `GET /api/v1/tareas` según quién consulta. |
+| RF-06.4 / RN-23 Evidencias | Base para guardar los adjuntos (paso 39). |
+| RF-14.5 Almacenar los PDF | El mismo almacenamiento guardará los reportes (paso 54). |
+| Stack: volúmenes de archivos | Volumen `archivos` en Docker Compose. |
+| RNF-03 Seguridad básica | Protección contra recorrido de directorios; escritura atómica. |

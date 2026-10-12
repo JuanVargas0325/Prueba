@@ -18,7 +18,11 @@ FROM debian:bookworm-slim AS base
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tzdata wget \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+ && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app \
+ && mkdir -p /data \
+ && chown app:app /data
+# /data es el punto de montaje del volumen de archivos (PDF y adjuntos).
+VOLUME ["/data"]
 USER app
 
 # --- API ---------------------------------------------------------------------

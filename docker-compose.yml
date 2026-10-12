@@ -33,6 +33,9 @@ services:
     env_file: .env
     environment:
       POSTGRES_HOST: postgres
+      ALMACENAMIENTO_RUTA: /data
+    volumes:
+      - archivos:/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -52,3 +55,4 @@ services:
 
 volumes:
   datos-postgres:
+  archivos:

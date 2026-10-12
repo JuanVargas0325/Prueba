@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"seguimiento/internal/almacenamiento"
 )
 
 const secretoValido = "un-secreto-de-prueba-con-mas-de-32-caracteres"
@@ -26,7 +28,7 @@ func TestCargarConstruyeLaURLDesdeVariablesDePostgres(t *testing.T) {
 	if strings.Contains(c.BaseDatos, "cl@ve:con/") {
 		t.Error("la contraseña debería ir codificada en la URL")
 	}
-	if c.JWT.Expiracion != 8*time.Hour {
+	if c.MaxAdjuntoMB != 10 || c.Almacenamiento != (almacenamiento.Config{Tipo: "local", Ruta: "/data"}) || c.JWT.Expiracion != 8*time.Hour {
 		t.Errorf("valores por defecto inesperados: %+v", c)
 	}
 	if c.ZonaHoraria.String() != "America/Bogota" {
@@ -56,9 +58,11 @@ func TestCargarValidaFormatos(t *testing.T) {
 	t.Setenv("JWT_SECRETO", secretoValido)
 	t.Setenv("APP_ZONA_HORARIA", "Marte/Monte_Olimpo")
 	t.Setenv("JWT_EXPIRACION", "mucho")
+	t.Setenv("ADJUNTO_MAX_MB", "diez")
 
 	_, err := Cargar()
-	if err == nil || !strings.Contains(err.Error(), "APP_ZONA_HORARIA") || !strings.Contains(err.Error(), "JWT_EXPIRACION") {
+	if err == nil || !strings.Contains(err.Error(), "APP_ZONA_HORARIA") || !strings.Contains(err.Error(), "JWT_EXPIRACION") ||
+		!strings.Contains(err.Error(), "ADJUNTO_MAX_MB") {
 		t.Fatalf("se esperaban errores de formato: %v", err)
 	}
 }

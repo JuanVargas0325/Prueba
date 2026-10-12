@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"seguimiento/internal/almacenamiento"
 )
 
 // Config es la configuración de la aplicación. En los pasos siguientes se le
-// agregan Redis, los archivos y la IA.
+// agregan Redis y la IA.
 type Config struct {
 	Entorno     string // desarrollo | produccion
 	PuertoHTTP  string
@@ -24,6 +27,9 @@ type Config struct {
 
 	JWT   JWT
 	Admin AdminInicial
+
+	Almacenamiento almacenamiento.Config
+	MaxAdjuntoMB   int
 }
 
 type JWT struct {
@@ -75,6 +81,12 @@ func Cargar() (Config, error) {
 		Password: os.Getenv("ADMIN_PASSWORD"),
 	}
 
+	c.Almacenamiento = almacenamiento.Config{
+		Tipo: texto("ALMACENAMIENTO_TIPO", almacenamiento.TipoLocal),
+		Ruta: texto("ALMACENAMIENTO_RUTA", "/data"),
+	}
+	c.MaxAdjuntoMB = entero("ADJUNTO_MAX_MB", 10, &errs)
+
 	return c, errors.Join(errs...)
 }
 
@@ -114,6 +126,19 @@ func lista(clave string) []string {
 		}
 	}
 	return valores
+}
+
+func entero(clave string, porDefecto int, errs *[]error) int {
+	v := strings.TrimSpace(os.Getenv(clave))
+	if v == "" {
+		return porDefecto
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s debe ser un número entero: %w", clave, err))
+		return porDefecto
+	}
+	return n
 }
 
 func duracion(clave string, porDefecto time.Duration, errs *[]error) time.Duration {
