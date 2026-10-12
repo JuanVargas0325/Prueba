@@ -1,9 +1,9 @@
 # Integración continua: se ejecuta en cada push y en cada pull request.
 #  1. calidad: formato (gofmt), análisis estático (golangci-lint, incluye go vet).
 #  2. pruebas: pruebas unitarias y de integración (con PostgreSQL) con cobertura.
+#  3. e2e: levanta todo con Docker Compose y ejecuta la colección de Postman con Newman.
 #
-# En pasos posteriores se agregan la prueba de punta a punta con Newman (paso 61) y el
-# análisis con SonarQube (paso 62).
+# En el paso 62 se agrega el análisis con SonarQube.
 
 name: CI
 
@@ -79,3 +79,37 @@ jobs:
 
       - name: Resumen de cobertura
         run: go tool cover -func=coverage.out | tail -n 1
+
+  e2e:
+    name: Despliegue con Docker Compose y pruebas de punta a punta (Newman)
+    needs: [calidad, pruebas]
+    runs-on: ubuntu-latest
+    env:
+      ADMIN_PASSWORD_CI: Admin-CI-2026*
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configuración de prueba (.env)
+        run: |
+          sed -e "s|^JWT_SECRETO=.*|JWT_SECRETO=$(openssl rand -hex 32)|" \
+              -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 16)|" \
+              -e "s|^ADMIN_PASSWORD=.*|ADMIN_PASSWORD=${ADMIN_PASSWORD_CI}|" \
+              .env.example > .env
+
+      - name: Levantar el sistema (construye las imágenes de la API y del worker)
+        run: docker compose up --build -d --wait
+
+      - name: Ejecutar la colección de Postman con Newman
+        run: |
+          docker run --rm --network host -v "$PWD/postman:/etc/newman" postman/newman:ubuntu \
+            run seguimiento.postman_collection.json \
+            --env-var "baseUrl=http://localhost:8080" \
+            --env-var "adminPassword=${ADMIN_PASSWORD_CI}"
+
+      - name: Logs si algo falla
+        if: failure()
+        run: docker compose logs --no-color api worker
+
+      - name: Detener el sistema
+        if: always()
+        run: docker compose down -v
