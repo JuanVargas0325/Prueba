@@ -5,6 +5,9 @@
 # Resultados de compilación y pruebas
 backend/coverage.out
 backend/bin/
+# Binarios que genera go build en la carpeta actual
+backend/api
+backend/worker
 *.test
 
 # Archivos generados localmente
