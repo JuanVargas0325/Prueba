@@ -14,12 +14,16 @@ import (
 )
 
 // Dobles compartidos por las pruebas del paquete: un logger que descarta los
-// mensajes y los actores con los que se prueban los permisos.
+// mensajes, los actores con los que se prueban los permisos y un instante fijo
+// para el reloj de prueba.
 var (
 	logPrueba = slog.New(slog.NewTextHandler(io.Discard, nil))
 	profesor  = auth.Actor{UsuarioID: "prof-1", Roles: []dominio.Rol{dominio.RolProfesor}}
+	otroProf  = auth.Actor{UsuarioID: "prof-2", Roles: []dominio.Rol{dominio.RolProfesor}}
 	admin     = auth.Actor{UsuarioID: "admin-1", Roles: []dominio.Rol{dominio.RolAdministrador}}
 	monitor   = auth.Actor{UsuarioID: "mon-1", Roles: []dominio.Rol{dominio.RolMonitor}}
+	// miércoles 14 de octubre de 2026
+	ahoraPrueba = time.Date(2026, 10, 14, 15, 0, 0, 0, time.UTC)
 )
 
 type usuariosFalsos struct {

@@ -196,3 +196,111 @@ func TestPeriodos(t *testing.T) {
 	_, err = s.Actualizar(ctx, admin, p.ID, CambiosPeriodo{})
 	esperarTipo(t, err, apperr.TipoValidacion)
 }
+
+// --- espacios ---------------------------------------------------------------------------
+
+type repoEspaciosFalso struct {
+	espacios     map[string]dominio.Espacio
+	participante bool
+	filtro       dominio.FiltroEspacios
+}
+
+func (r *repoEspaciosFalso) Crear(_ context.Context, e dominio.Espacio) (dominio.Espacio, error) {
+	e.ID = "e-nuevo"
+	r.espacios[e.ID] = e
+	return e, nil
+}
+
+func (r *repoEspaciosFalso) Obtener(_ context.Context, id string) (dominio.Espacio, error) {
+	e, ok := r.espacios[id]
+	if !ok {
+		return e, apperr.NoEncontrado("curso o proyecto no encontrado")
+	}
+	return e, nil
+}
+
+func (r *repoEspaciosFalso) Listar(_ context.Context, f dominio.FiltroEspacios) ([]dominio.Espacio, error) {
+	r.filtro = f
+	return nil, nil
+}
+
+func (r *repoEspaciosFalso) Cerrar(_ context.Context, id string) (dominio.Espacio, error) {
+	e := r.espacios[id]
+	e.Estado = dominio.EspacioCerrado
+	return e, nil
+}
+
+func (r *repoEspaciosFalso) EsParticipante(context.Context, string, string) (bool, error) {
+	return r.participante, nil
+}
+
+func entornoEspacios(t *testing.T) (*Espacios, *repoEspaciosFalso, *repoPeriodosFalso) {
+	periodos := &repoPeriodosFalso{periodos: map[string]dominio.PeriodoAcademico{
+		"p1": {ID: "p1", Codigo: "2026-20", Estado: dominio.PeriodoActivo, CreacionHabilitada: true,
+			FechaInicio: fechaP(t, "2026-08-01"), FechaCierre: fechaP(t, "2026-12-15")},
+	}}
+	repo := &repoEspaciosFalso{espacios: map[string]dominio.Espacio{
+		"e1": {ID: "e1", ProfesorID: "prof-1", Tipo: dominio.EspacioCurso, Nombre: "Nube", Estado: dominio.EspacioActivo},
+	}}
+	return NuevoEspacios(repo, periodos, RelojFijo(ahoraPrueba, time.UTC), logPrueba), repo, periodos
+}
+
+func TestCrearEspacio(t *testing.T) {
+	s, _, periodos := entornoEspacios(t)
+	ctx := context.Background()
+	n := NuevoEspacio{Tipo: dominio.EspacioCurso, Nombre: "Nube", PeriodoID: "p1",
+		FechaInicio: fechaP(t, "2026-08-03"), FechaCierre: fechaP(t, "2026-12-04")}
+
+	e, err := s.Crear(ctx, profesor, n)
+	if err != nil || e.ProfesorID != "prof-1" || e.Estado != dominio.EspacioActivo {
+		t.Fatalf("espacio inesperado: %+v %v", e, err)
+	}
+
+	_, err = s.Crear(ctx, monitor, n)
+	esperarTipo(t, err, apperr.TipoProhibido)
+
+	fuera := n
+	fuera.FechaCierre = fechaP(t, "2027-01-30")
+	_, err = s.Crear(ctx, profesor, fuera)
+	esperarTipo(t, err, apperr.TipoValidacion)
+
+	inexistente := n
+	inexistente.PeriodoID = "otro"
+	_, err = s.Crear(ctx, profesor, inexistente)
+	esperarTipo(t, err, apperr.TipoValidacion)
+
+	p := periodos.periodos["p1"]
+	p.CreacionHabilitada = false
+	periodos.periodos["p1"] = p
+	_, err = s.Crear(ctx, profesor, n)
+	esperarTipo(t, err, apperr.TipoReglaNegocio) // RF-03.2: período no habilitado
+}
+
+func TestVisibilidadYCierreDeEspacios(t *testing.T) {
+	s, repo, _ := entornoEspacios(t)
+	ctx := context.Background()
+
+	_, _ = s.Listar(ctx, monitor, dominio.FiltroEspacios{})
+	if repo.filtro.VisiblePara != "mon-1" {
+		t.Error("un monitor solo lista los espacios en los que participa")
+	}
+	_, _ = s.Listar(ctx, admin, dominio.FiltroEspacios{})
+	if repo.filtro.VisiblePara != "" {
+		t.Error("el administrador lista todos los espacios")
+	}
+
+	_, err := s.Obtener(ctx, monitor, "e1")
+	esperarTipo(t, err, apperr.TipoNoEncontrado)
+	repo.participante = true
+	if _, err := s.Obtener(ctx, monitor, "e1"); err != nil {
+		t.Errorf("un participante puede ver el espacio: %v", err)
+	}
+	_, err = s.Cerrar(ctx, monitor, "e1")
+	esperarTipo(t, err, apperr.TipoProhibido)
+
+	_, err = s.Cerrar(ctx, otroProf, "e1")
+	esperarTipo(t, err, apperr.TipoProhibido) // participa (repo.participante) pero no es el responsable
+	if e, err := s.Cerrar(ctx, profesor, "e1"); err != nil || e.Estado != dominio.EspacioCerrado {
+		t.Errorf("el profesor responsable puede cerrar el espacio: %+v %v", e, err)
+	}
+}
