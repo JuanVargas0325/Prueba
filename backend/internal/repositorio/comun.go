@@ -21,6 +21,8 @@ import (
 const (
 	recursoUsuario       = "usuario"
 	recursoUsuarios      = "usuarios"
+	recursoPeriodo       = "período"
+	recursoPeriodos      = "períodos"
 	recursoVinculaciones = "vinculaciones"
 )
 
