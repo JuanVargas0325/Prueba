@@ -17,6 +17,14 @@ import (
 	"seguimiento/internal/dominio"
 )
 
+// consultor es lo común entre el pool de conexiones y una transacción, para
+// reutilizar las mismas consultas dentro y fuera de transacciones.
+type consultor interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Nombres de los recursos que aparecen en los mensajes de error de la capa de datos.
 const (
 	recursoUsuario       = "usuario"
@@ -97,6 +105,11 @@ func (f *filtro) agregar(expresion string, valor any) {
 	f.condiciones = append(f.condiciones, strings.ReplaceAll(expresion, "?", fmt.Sprintf("$%d", len(f.args))))
 }
 
+// agregarFija añade una condición sin parámetros.
+func (f *filtro) agregarFija(expresion string) {
+	f.condiciones = append(f.condiciones, expresion)
+}
+
 // where devuelve la cláusula WHERE (vacía si no hay condiciones).
 func (f *filtro) where() string {
 	if len(f.condiciones) == 0 {
@@ -120,6 +133,15 @@ func (f *filtro) paginar(p dominio.Paginacion) string {
 func patronBusqueda(texto string) string {
 	escapado := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(texto)
 	return "%" + escapado + "%"
+}
+
+// recortarTexto limita los mensajes que se guardan en la base de datos.
+func recortarTexto(s string) string {
+	const maximo = 1000
+	if r := []rune(s); len(r) > maximo {
+		return string(r[:maximo])
+	}
+	return s
 }
 
 // recolectar lee todas las filas con la función de escaneo dada.
