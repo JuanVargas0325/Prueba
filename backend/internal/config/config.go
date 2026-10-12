@@ -5,16 +5,18 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 )
 
 // Config es la configuración de la aplicación. En los pasos siguientes se le
-// agregan la base de datos, la autenticación, Redis, los archivos y la IA.
+// agregan la autenticación, Redis, los archivos y la IA.
 type Config struct {
 	Entorno     string // desarrollo | produccion
 	PuertoHTTP  string
+	BaseDatos   string // URL de conexión a PostgreSQL
 	ZonaHoraria *time.Location
 }
 
@@ -35,7 +37,32 @@ func Cargar() (Config, error) {
 	}
 	c.ZonaHoraria = zona
 
+	c.BaseDatos = urlBaseDatos()
+	if c.BaseDatos == "" {
+		errs = append(errs, errors.New("defina DATABASE_URL o POSTGRES_USER, POSTGRES_PASSWORD y POSTGRES_DB"))
+	}
+
 	return c, errors.Join(errs...)
+}
+
+// urlBaseDatos construye la URL de PostgreSQL a partir de las mismas
+// variables que usa la imagen oficial de postgres, salvo que se defina DATABASE_URL.
+func urlBaseDatos() string {
+	if v := strings.TrimSpace(os.Getenv("DATABASE_URL")); v != "" {
+		return v
+	}
+	usuario, clave, bd := os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB")
+	if usuario == "" || bd == "" {
+		return ""
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(usuario, clave),
+		Host:     texto("POSTGRES_HOST", "localhost") + ":" + texto("POSTGRES_PUERTO", "5432"),
+		Path:     "/" + bd,
+		RawQuery: "sslmode=" + texto("POSTGRES_SSLMODE", "disable"),
+	}
+	return u.String()
 }
 
 func texto(clave, porDefecto string) string {

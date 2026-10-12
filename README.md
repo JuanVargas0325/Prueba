@@ -1,204 +1,171 @@
-# Paso 2 · Servidor HTTP con Gin y endpoint `/salud`
+# Paso 3 · Conexión a PostgreSQL
 
-> Rama `paso-a-paso` · paso 2 de 65 · anterior: **Paso 1 · Configuración** · siguiente: **Paso 3 · Conexión a PostgreSQL**
+> Rama `paso-a-paso` · paso 3 de 65 · anterior: **Paso 2 · Servidor HTTP con Gin** · siguiente: **Paso 4 · Migraciones y esquema**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-La API ya es un **servidor web**: escucha en el puerto configurado (`APP_PUERTO`, 8080 por defecto) y responde a `GET /salud`.
+La API se conecta a **PostgreSQL** al arrancar y `/salud` informa si la base de datos responde.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/go.mod`, `backend/go.sum` | **Modificados / nuevo.** Se agrega la librería **Gin** (`github.com/gin-gonic/gin v1.12.0`). |
-| `backend/internal/handler/router.go` | **Nuevo.** Crea el router de Gin y el endpoint `/salud`. |
-| `backend/internal/handler/router_test.go` | **Nuevo.** Utilidades de prueba HTTP y dos pruebas de `/salud`. |
-| `backend/cmd/api/main.go` | **Modificado.** Levanta el servidor HTTP y lo apaga de forma ordenada al recibir Ctrl+C o `SIGTERM`. |
+| `backend/go.mod`, `backend/go.sum` | Se agrega el controlador **pgx** (`github.com/jackc/pgx/v5 v5.11.0`). |
+| `backend/internal/basedatos/basedatos.go` | **Nuevo.** Función `Conectar`: crea el *pool* de conexiones y reintenta mientras PostgreSQL arranca. |
+| `backend/internal/config/config.go` | **Modificado.** Nuevo campo `BaseDatos` y función `urlBaseDatos()` que arma la URL de conexión. |
+| `backend/internal/config/config_test.go` | **Modificado.** Pruebas de la URL y de la variable obligatoria. |
+| `backend/cmd/api/main.go` | **Modificado.** Conecta a la base de datos y registra el comprobador `postgres` en `/salud`. |
+| `.env.example` | **Modificado.** Nueva sección `PostgreSQL`. |
 
-Ejemplo:
+Resultado:
 
 ```bash
 curl http://localhost:8080/salud
-# {"estado":"ok","componentes":{}}
+# {"estado":"ok","componentes":{"postgres":"ok"}}            → 200
+# (si PostgreSQL se cae)
+# {"estado":"degradado","componentes":{"postgres":"error"}}  → 503
 ```
 
 ---
 
 ## 2. Por qué
 
-- **Gin** es uno de los dos frameworks web que exige el stack del curso (Gin o Echo). Sobre la librería estándar `net/http` agrega: rutas con parámetros (`/tareas/:id`), grupos de rutas, middleware (código que se ejecuta antes o después de cada petición) y utilidades para leer y escribir JSON.
-- **`/salud` (health check)** es el primer endpoint porque lo necesita la infraestructura:
-  - Docker lo consultará (paso 5) para saber si el contenedor está sano;
-  - Docker Compose y Nginx esperarán a que la API esté sana antes de enviarle tráfico (pasos 6 y 7);
-  - en la Entrega 3, el balanceador de carga de la nube lo usará para sacar de servicio una instancia que falle.
-- **Apagado ordenado (graceful shutdown):** cuando Docker detiene un contenedor envía la señal `SIGTERM`. Si el programa simplemente muriera, las peticiones en curso se cortarían a la mitad. Con el apagado ordenado, el servidor deja de aceptar conexiones nuevas, termina las que están en curso (hasta 15 segundos) y sale.
+- **PostgreSQL** es la base de datos que exige el stack del curso. Guardará usuarios, períodos, cursos y proyectos, vinculaciones, tareas y reportes (RNF-04, persistencia).
+- **pgx** es el controlador de PostgreSQL más usado en Go. Se eligió frente a `database/sql` con `lib/pq` porque:
+  - habla el protocolo nativo de PostgreSQL (más rápido y con mejor manejo de tipos como `DATE`, `UUID` y arreglos);
+  - trae `pgxpool`, un *pool* de conexiones listo para usar;
+  - expone los códigos de error de PostgreSQL (`23505` = violación de unicidad), que se usarán en el paso 13 para traducir errores.
+- **Se conecta al arrancar y no en cada petición:** abrir una conexión cuesta varios milisegundos. Un *pool* mantiene conexiones abiertas y las reutiliza.
+- **Reintentos al arrancar:** con Docker Compose (paso 6), la API y PostgreSQL arrancan casi al mismo tiempo; PostgreSQL tarda unos segundos en aceptar conexiones. Sin reintentos, la API fallaría al primer intento.
+- **`/salud` refleja el estado real:** si la base de datos no responde, la API no puede trabajar y debe decirlo (503).
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Agregar la dependencia
+### 3.1 La URL de conexión (`config.go`)
 
-```bash
-cd backend
-go get github.com/gin-gonic/gin@v1.12.0
-go mod tidy
+PostgreSQL se identifica con una URL:
+
+```
+postgres://usuario:clave@host:puerto/basededatos?sslmode=disable
 ```
 
-- `go get` descarga la librería en la versión indicada y la anota en `go.mod` (`require github.com/gin-gonic/gin v1.12.0`).
-- `go mod tidy` ordena `go.mod`: agrega las dependencias indirectas (las librerías que Gin necesita, marcadas `// indirect`) y quita las que ya no se usan.
-- Se crea **`go.sum`**, que guarda un hash criptográfico de cada dependencia. Garantiza que todos (usted, sus compañeros, Docker y GitHub Actions) descarguen exactamente el mismo código. Se versiona, pero nunca se edita a mano.
-- Las librerías se descargan del proxy oficial `proxy.golang.org` y quedan en la caché local (`%USERPROFILE%\go\pkg\mod` en Windows).
-
-### 3.2 `internal/handler/router.go`
-
-El paquete `handler` será la **capa de presentación**: la única que sabe de HTTP. En los pasos siguientes recibirá un archivo por módulo (usuarios, tareas, reportes...).
+Se puede dar completa en `DATABASE_URL` o, más cómodo, por partes con **las mismas variables que usa la imagen oficial de PostgreSQL** (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`). Así, en el paso 6 un único `.env` configura a la vez el contenedor de la base de datos y la API.
 
 ```go
-type ComprobadorSalud func(ctx context.Context) error
-```
-
-- Define un **tipo función**: cualquier función que reciba un `context.Context` y devuelva un `error` es un `ComprobadorSalud`. En el paso 3 se pasará la función que hace *ping* a PostgreSQL; en el paso 49, la que hace *ping* a Redis. El router no necesita saber qué hay detrás.
-
-```go
-type Dependencias struct {
-	Salud map[string]ComprobadorSalud
+func urlBaseDatos() string {
+	if v := strings.TrimSpace(os.Getenv("DATABASE_URL")); v != "" {
+		return v
+	}
+	usuario, clave, bd := os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB")
+	if usuario == "" || bd == "" {
+		return ""
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(usuario, clave),
+		Host:     texto("POSTGRES_HOST", "localhost") + ":" + texto("POSTGRES_PUERTO", "5432"),
+		Path:     "/" + bd,
+		RawQuery: "sslmode=" + texto("POSTGRES_SSLMODE", "disable"),
+	}
+	return u.String()
 }
 ```
 
-- `Dependencias` agrupa todo lo que el router necesita desde fuera. Hoy solo los comprobadores de salud; después, los servicios de cada módulo. Así `NuevoRouter` no crea nada por su cuenta: **recibe** lo que usa (inyección de dependencias), y las pruebas pueden pasarle versiones falsas.
-- `map[string]ComprobadorSalud` es un diccionario: nombre de la dependencia → función que la comprueba.
+- **Prioridad:** si existe `DATABASE_URL`, se usa tal cual. Si no, se arma con las partes.
+- `usuario, clave, bd := a, b, c` asigna tres variables en una línea.
+- **Se usa `url.URL` y no concatenación de texto** porque la contraseña puede tener caracteres especiales. Con `cl@ve:con/símbolos`, una URL armada a mano quedaría `postgres://app:cl@ve:con/símbolos@...` y sería imposible saber dónde termina la contraseña. `url.UserPassword` la **codifica** (`cl%40ve%3Acon%2Fs%C3%ADmbolos`). La prueba `TestCargarConstruyeLaURLDesdeVariablesDePostgres` comprueba justamente eso.
+- `sslmode=disable`: dentro de la red de Docker no se cifra la conexión. En la nube (Entrega 2) se podrá cambiar con `POSTGRES_SSLMODE=require` sin tocar el código.
+
+En `Cargar()` la base de datos es **obligatoria**:
 
 ```go
-func NuevoRouter(d Dependencias) *gin.Engine {
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.GET("/salud", salud(d.Salud))
-	return r
-}
+	c.BaseDatos = urlBaseDatos()
+	if c.BaseDatos == "" {
+		errs = append(errs, errors.New("defina DATABASE_URL o POSTGRES_USER, POSTGRES_PASSWORD y POSTGRES_DB"))
+	}
 ```
 
-- `gin.New()` crea un router vacío (sin el middleware que trae `gin.Default()`, para decidir explícitamente cuál usar).
-- `r.Use(gin.Recovery())`: si algún handler entra en **pánico** (un error grave como acceder a un puntero `nil`), Recovery lo captura y responde 500 en lugar de tumbar todo el servidor.
-- `r.GET("/salud", ...)` asocia la ruta y el método HTTP con una función que atiende la petición.
+### 3.2 `internal/basedatos/basedatos.go`
 
 ```go
-type estadoSalud struct {
-	Estado      string            `json:"estado"`
-	Componentes map[string]string `json:"componentes"`
-}
+func Conectar(ctx context.Context, url string, log *slog.Logger) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("configuración de base de datos inválida: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("creando pool de conexiones: %w", err)
+	}
 ```
 
-- Las **etiquetas** entre comillas invertidas (`` `json:"estado"` ``) le dicen al paquete de JSON qué nombre usar para cada campo. Sin ellas, el JSON tendría `"Estado"` con mayúscula.
+- `pgxpool.ParseConfig` interpreta la URL (y detecta errores de formato).
+- `pgxpool.NewWithConfig` crea el **pool**: un conjunto de conexiones que se abren cuando hacen falta y se reutilizan entre peticiones. Por defecto admite tantas conexiones como núcleos de CPU (mínimo 4). Las peticiones concurrentes de Gin toman una conexión libre, la usan y la devuelven.
+- Crear el pool **no** abre ninguna conexión todavía; por eso el siguiente bloque hace *ping*.
 
 ```go
-func salud(comprobadores map[string]ComprobadorSalud) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		ctx, cancelar := context.WithTimeout(c.Request.Context(), 3*time.Second)
-		defer cancelar()
-		respuesta := estadoSalud{Estado: "ok", Componentes: map[string]string{}}
-		codigo := http.StatusOK
-		for nombre, comprobar := range comprobadores {
-			if err := comprobar(ctx); err != nil {
-				respuesta.Componentes[nombre] = "error"
-				respuesta.Estado = "degradado"
-				codigo = http.StatusServiceUnavailable
-				continue
-			}
-			respuesta.Componentes[nombre] = "ok"
+	const intentos = 15
+	for i := 1; ; i++ {
+		ctxPing, cancelar := context.WithTimeout(ctx, 3*time.Second)
+		err = pool.Ping(ctxPing)
+		cancelar()
+		if err == nil {
+			return pool, nil
 		}
-		c.JSON(codigo, respuesta)
+		if i == intentos {
+			pool.Close()
+			return nil, fmt.Errorf("no fue posible conectarse a PostgreSQL: %w", err)
+		}
+		log.Warn("esperando a PostgreSQL", "intento", i, "error", err)
+		select {
+		case <-ctx.Done():
+			pool.Close()
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 ```
 
-- `salud` es una función que **devuelve otra función** (el handler). La función interna "recuerda" el mapa `comprobadores` aunque `salud` ya haya terminado: eso se llama **closure**.
-- `gin.Context` (`c`) representa la petición y la respuesta en curso.
-- `context.WithTimeout(..., 3*time.Second)`: cada comprobación tiene como máximo 3 segundos. Si la base de datos no responde, `/salud` no se queda colgado.
-- `defer cancelar()`: `defer` programa una instrucción para que se ejecute **al salir de la función**, pase lo que pase. Aquí libera los recursos del temporizador.
-- `for nombre, comprobar := range comprobadores` recorre el mapa (clave y valor).
-- Si alguna dependencia falla, la respuesta es **503 Service Unavailable** con estado `degradado`; si todas responden, **200 OK**. Ese código es lo que mirarán Docker y el balanceador.
-- `continue` salta a la siguiente vuelta del ciclo.
-- `c.JSON(codigo, respuesta)` convierte el struct a JSON y lo envía con el código indicado.
-- En este paso el mapa está vacío, así que la respuesta es `{"estado":"ok","componentes":{}}`.
+- `for i := 1; ; i++` es un ciclo **sin condición de salida en la cabecera**: termina con los `return` de adentro.
+- Cada *ping* tiene 3 segundos como máximo. Si responde, se devuelve el pool listo.
+- Hasta **15 intentos con 2 segundos de espera** (unos 30 a 75 segundos en total). Si no se logra, se cierra el pool y se devuelve el error; la API termina con código 1.
+- El `select` espera 2 segundos (`time.After`) **o** a que se cancele el contexto (Ctrl+C). Así, si se detiene la API mientras espera a la base de datos, sale de inmediato en lugar de seguir reintentando.
+- `const intentos = 15`: una constante local; documenta el número en lugar de dejar un "15" suelto.
 
-### 3.3 `internal/handler/router_test.go`
-
-Las pruebas HTTP no levantan un servidor real: usan `httptest`, que permite entregar una petición falsa al router y capturar la respuesta en memoria. Son rápidas y no ocupan puertos.
-
-- `nuevoEntorno(t, configurar)` arma un router con dependencias por defecto (un "postgres" que siempre responde bien). El parámetro `configurar` permite que cada prueba cambie lo que necesite.
-- `peticion(metodo, ruta, cuerpo)` crea la petición con `httptest.NewRequest`, la pasa por el router (`ServeHTTP`) y devuelve el `ResponseRecorder` con el código y el cuerpo.
-- `esperarEstado` falla la prueba si el código no es el esperado y muestra el cuerpo para entender por qué.
-- `t.Helper()` le indica a Go que, si la prueba falla dentro de esta función auxiliar, reporte la línea de **quien la llamó**, que es la que interesa.
-- `gin.SetMode(gin.TestMode)` silencia los mensajes de depuración de Gin durante las pruebas.
-
-Las dos pruebas verifican el contrato de `/salud`: 200 cuando todo está bien y 503 cuando una dependencia falla.
-
-### 3.4 `cmd/api/main.go`
+### 3.3 `cmd/api/main.go`
 
 ```go
-	if !cfg.EsDesarrollo() {
-		gin.SetMode(gin.ReleaseMode)
+	// Capa de datos
+	db, err := basedatos.Conectar(ctx, cfg.BaseDatos, log)
+	if err != nil {
+		return err
 	}
+	defer db.Close()
 ```
-- En producción, Gin no imprime sus avisos de depuración.
+
+- La conexión se abre **después** de crear el contexto de señales, para que Ctrl+C pueda interrumpir los reintentos.
+- `defer db.Close()` cierra todas las conexiones del pool al terminar `ejecutar`. Este es el motivo del patrón `main → ejecutar` del paso 0: si la lógica estuviera en `main` y se llamara a `os.Exit`, este `defer` no se ejecutaría.
 
 ```go
-	ctx, detener := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer detener()
+	router := handler.NuevoRouter(handler.Dependencias{
+		Salud: map[string]handler.ComprobadorSalud{
+			"postgres": db.Ping,
+		},
+	})
 ```
-- Crea un **contexto** que se cancela cuando el proceso recibe Ctrl+C (`os.Interrupt`) o `SIGTERM` (lo que envía `docker stop`). Un `context.Context` es la forma estándar de Go de avisar "hay que parar" a todo lo que esté trabajando.
 
-```go
-	router := handler.NuevoRouter(handler.Dependencias{})
+- `db.Ping` es un **método usado como valor**: tiene la forma `func(ctx context.Context) error`, que es exactamente un `ComprobadorSalud` (paso 2). El router no conoce pgx; solo recibe "una función que comprueba algo".
 
-	servidor := &http.Server{
-		Addr:              ":" + cfg.PuertoHTTP,
-		Handler:           router,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       5 * time.Minute,
-		WriteTimeout:      5 * time.Minute,
-		IdleTimeout:       2 * time.Minute,
-	}
-```
-- Se usa el servidor de la librería estándar (`http.Server`) con el router de Gin como `Handler`. Así se controlan los **tiempos máximos**:
-  - `ReadHeaderTimeout` (10 s): un cliente que envía las cabeceras muy despacio no puede retener una conexión indefinidamente (protección contra el ataque *Slowloris*);
-  - `ReadTimeout` y `WriteTimeout` (5 min): margen para subir y descargar archivos (adjuntos y PDF, pasos 40 y 49);
-  - `IdleTimeout` (2 min): cuánto se mantiene abierta una conexión sin uso.
-- `":" + cfg.PuertoHTTP` produce `":8080"`: escuchar en el puerto 8080 de **todas** las interfaces de red (necesario dentro de un contenedor).
-- `&http.Server{...}` crea el struct y devuelve un **puntero** a él (`&`).
+### 3.4 Pruebas de configuración
 
-```go
-	errServidor := make(chan error, 1)
-	go func() {
-		log.Info("API escuchando", "puerto", cfg.PuertoHTTP, "entorno", cfg.Entorno)
-		errServidor <- servidor.ListenAndServe()
-	}()
-```
-- `ListenAndServe` **bloquea**: se queda atendiendo peticiones hasta que el servidor se detiene. Por eso se ejecuta en una **goroutine** (`go func() {...}()`), un hilo de ejecución liviano de Go, para que `ejecutar` pueda seguir y esperar la señal de apagado.
-- `make(chan error, 1)` crea un **canal**: una "tubería" por la que la goroutine envía (`<-`) el error con el que terminó el servidor. El `1` le da espacio para un mensaje sin que nadie lo esté leyendo todavía.
+- `TestCargarConstruyeLaURLDesdeVariablesDePostgres`: arma la URL con una contraseña llena de símbolos y verifica host, puerto, base de datos y que la contraseña esté codificada.
+- `TestCargarExigeBaseDeDatos`: sin variables de base de datos, el error debe mencionar `DATABASE_URL`.
+- `TestCargarRechazaZonaHorariaInvalida`: ahora define `DATABASE_URL`, porque la base de datos pasó a ser obligatoria y la prueba quiere aislar el error de la zona.
 
-```go
-	select {
-	case err := <-errServidor:
-		if !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-	case <-ctx.Done():
-		log.Info("deteniendo la API")
-	}
-```
-- `select` espera a que **uno** de los casos ocurra:
-  - el servidor terminó por su cuenta (por ejemplo, el puerto ya estaba ocupado): se devuelve ese error;
-  - llegó Ctrl+C o `SIGTERM` (`ctx.Done()` se cierra): se procede a apagar.
-- `errors.Is(err, http.ErrServerClosed)` distingue el "error" normal de un servidor que se cerró a propósito.
-
-```go
-	ctxCierre, cancelar := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancelar()
-	return servidor.Shutdown(ctxCierre)
-```
-- `Shutdown` deja de aceptar conexiones y espera a que terminen las peticiones en curso, como máximo 15 segundos. Docker espera 10 segundos por defecto antes de matar el proceso; para la mayoría de peticiones es suficiente.
+`Conectar` **no** tiene prueba unitaria porque necesita un PostgreSQL real. Se prueba con las pruebas de integración del paso 58 y con Docker Compose desde el paso 6.
 
 ---
 
@@ -206,67 +173,65 @@ Las dos pruebas verifican el contrato de `/salud`: 200 cuando todo está bien y 
 
 | Concepto | Explicación |
 |---|---|
-| Dependencias externas | `go get` + `go mod tidy`; quedan en `go.mod` y `go.sum`. |
-| Tipo función | `type ComprobadorSalud func(ctx context.Context) error`. |
-| `map[K]V` | Diccionario. Se recorre con `for clave, valor := range m`. |
-| Closure | Función interna que usa variables de la función que la creó (`salud`). |
-| Etiquetas de struct | `` `json:"estado"` `` define el nombre del campo en JSON. |
-| `defer` | Ejecuta algo al salir de la función, aunque haya error. |
-| `context.Context` | Lleva cancelación y tiempos máximos a través de las llamadas. |
-| Goroutine | `go f()` ejecuta `f` en paralelo. |
-| Canal | `make(chan T, n)`; se envía con `c <- v` y se recibe con `v := <-c`. |
-| `select` | Espera al primero de varios canales que tenga algo. |
-| `&T{...}` | Crea un valor y devuelve un puntero a él. |
-| `httptest` | Paquete estándar para probar handlers HTTP sin red. |
+| Asignación múltiple | `a, b, c := x, y, z`. |
+| Ciclo sin condición | `for i := 1; ; i++ { ... }` se repite hasta un `return` o `break`. |
+| `const` local | Valor fijo con nombre dentro de una función. |
+| `time.After(d)` | Canal que recibe un valor cuando pasa el tiempo `d`; útil en `select`. |
+| Método como valor | `db.Ping` se puede pasar como función, "atado" a `db`. |
+| `nil` en punteros | `return nil, err`: no hay pool que devolver. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
-```bash
-cd backend
-go test ./...
-go run ./cmd/api
-# en otra terminal:
-curl -i http://localhost:8080/salud      # 200 {"estado":"ok","componentes":{}}
-curl -i http://localhost:8080/no-existe  # 404 (texto plano por ahora; en el paso 10 será JSON)
-```
-
-Con Docker hay que publicar el puerto (`-p`):
+Necesita un PostgreSQL. La forma más rápida es con Docker (en el paso 6 esto lo hará Docker Compose):
 
 ```bash
-docker run --rm -p 8080:8080 -v "${PWD}/backend:/src" -w /src golang:1.26 go run ./cmd/api
+docker run -d --name pg -p 5432:5432 -e POSTGRES_USER=seguimiento -e POSTGRES_PASSWORD=clave -e POSTGRES_DB=seguimiento postgres:16-bookworm
 ```
 
-Al presionar Ctrl+C se ve `deteniendo la API` y el programa termina sin error.
+Con Go instalado, desde `backend/`:
+
+```bash
+POSTGRES_USER=seguimiento POSTGRES_PASSWORD=clave POSTGRES_DB=seguimiento go run ./cmd/api
+curl http://localhost:8080/salud          # {"estado":"ok","componentes":{"postgres":"ok"}}
+docker stop pg
+curl -i http://localhost:8080/salud       # 503 {"estado":"degradado",...}
+```
+
+En PowerShell, las variables se definen antes: `$env:POSTGRES_USER="seguimiento"`, etc.
+
+Si arranca la API antes que PostgreSQL, verá en el log `"msg":"esperando a PostgreSQL"` hasta que la base de datos acepte conexiones.
+
+Pruebas unitarias: `go test ./...`
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 1
+## 6. Pasos para lograr esta versión desde el paso 2
 
-1. Agregar Gin (desde `backend/`):
+1. Agregar pgx (desde `backend/`):
    ```bash
-   go get github.com/gin-gonic/gin@v1.12.0
+   go get github.com/jackc/pgx/v5@v5.11.0
    go mod tidy
    ```
-2. Crear `backend/internal/handler/router.go` con `ComprobadorSalud`, `Dependencias`, `NuevoRouter`, `estadoSalud` y `salud` (sección 3.2).
-3. Crear `backend/internal/handler/router_test.go` con las utilidades (`entorno`, `nuevoEntorno`, `peticion`, `peticionCon`, `esperarEstado`) y las dos pruebas de `/salud`.
-4. Modificar `backend/cmd/api/main.go`:
-   - imports: `context`, `errors`, `net/http`, `os/signal`, `syscall`, `time`, `github.com/gin-gonic/gin` y `seguimiento/internal/handler`;
-   - modo release de Gin fuera de desarrollo;
-   - contexto que se cancela con Ctrl+C o `SIGTERM`;
-   - `http.Server` con los tiempos máximos;
-   - `ListenAndServe` en una goroutine, `select` y `Shutdown` con 15 s.
-5. Probar: `go test ./...` y `go run ./cmd/api` + `curl http://localhost:8080/salud`.
-6. Commit: `git add . && git commit -m "Paso 2: servidor HTTP con Gin y endpoint de salud"`
+2. Modificar `backend/internal/config/config.go`:
+   - import `net/url`;
+   - campo `BaseDatos string` en `Config`;
+   - en `Cargar()`, asignar `c.BaseDatos = urlBaseDatos()` y agregar el error si está vacío;
+   - nueva función `urlBaseDatos()` (sección 3.1).
+3. Actualizar `backend/internal/config/config_test.go` con las tres pruebas descritas en 3.4.
+4. Crear `backend/internal/basedatos/basedatos.go` con `Conectar` (sección 3.2).
+5. Modificar `backend/cmd/api/main.go`: import `seguimiento/internal/basedatos`, llamar a `Conectar`, `defer db.Close()` y pasar `db.Ping` en `Dependencias.Salud`.
+6. Agregar a `.env.example` la sección `PostgreSQL` (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_HOST`, `POSTGRES_PUERTO` y el ejemplo comentado de `DATABASE_URL`).
+7. Probar como en la sección 5 y hacer commit: `git commit -am "Paso 3: conexión a PostgreSQL"` (más `git add` de los archivos nuevos).
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- **`/salud` devuelve 503 si una dependencia falla.** En la Entrega 3, el balanceador de carga de GCP usará exactamente ese código para dejar de enviar tráfico a una instancia enferma.
-- **El apagado ordenado** permite reiniciar o escalar instancias (Entrega 3) y desplegar versiones nuevas en Cloud Run (Entrega 4) sin cortar peticiones en curso.
-- **El puerto sale de `APP_PUERTO`.** Cloud Run asigna el puerto con una variable de entorno; bastará con mapearla.
+- **`DATABASE_URL` tiene prioridad.** En la Entrega 2 la base de datos será un servicio administrado (Cloud SQL). Bastará con definir `DATABASE_URL` con la dirección privada de esa instancia y, si se requiere, `sslmode=require`.
+- **Los reintentos al arrancar** también ayudan en la nube: si la API se inicia antes de que la red privada o la base de datos estén listas, espera en lugar de fallar.
+- **`/salud` con el estado de PostgreSQL** permitirá que el balanceador (Entrega 3) saque de servicio una instancia que perdió la conexión.
 
 ---
 
@@ -274,6 +239,6 @@ Al presionar Ctrl+C se ve `deteniendo la API` y el programa termina sin error.
 
 | Requisito | Cómo |
 |---|---|
-| Stack: Go + Gin | Servidor HTTP con Gin. |
-| RNF-01: backend sólido | Tiempos máximos, recuperación de pánicos y apagado ordenado. |
-| Despliegue reproducible (pasos 5 a 7) | `/salud` es la base de los healthchecks de Docker. |
+| Stack: PostgreSQL | Conexión con pgx y pool de conexiones. |
+| RNF-04 Persistencia | Base para guardar todos los datos del sistema. |
+| Lineamientos 10 | Credenciales solo por variables de entorno, contraseña codificada en la URL. |

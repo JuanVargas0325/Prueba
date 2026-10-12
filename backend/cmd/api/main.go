@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"seguimiento/internal/basedatos"
 	"seguimiento/internal/config"
 	"seguimiento/internal/handler"
 )
@@ -38,8 +39,19 @@ func ejecutar(log *slog.Logger) error {
 	ctx, detener := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer detener()
 
+	// Capa de datos
+	db, err := basedatos.Conectar(ctx, cfg.BaseDatos, log)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
 	// Capa de presentación
-	router := handler.NuevoRouter(handler.Dependencias{})
+	router := handler.NuevoRouter(handler.Dependencias{
+		Salud: map[string]handler.ComprobadorSalud{
+			"postgres": db.Ping,
+		},
+	})
 
 	servidor := &http.Server{
 		Addr:              ":" + cfg.PuertoHTTP,
