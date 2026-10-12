@@ -45,6 +45,9 @@ func ejecutar(log *slog.Logger) error {
 		return err
 	}
 	defer db.Close()
+	if err := basedatos.Migrar(ctx, db, log); err != nil {
+		return err
+	}
 
 	// Capa de presentación
 	router := handler.NuevoRouter(handler.Dependencias{

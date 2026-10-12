@@ -1,237 +1,246 @@
-# Paso 3 · Conexión a PostgreSQL
+# Paso 4 · Migraciones y esquema de la base de datos
 
-> Rama `paso-a-paso` · paso 3 de 65 · anterior: **Paso 2 · Servidor HTTP con Gin** · siguiente: **Paso 4 · Migraciones y esquema**
+> Rama `paso-a-paso` · paso 4 de 65 · anterior: **Paso 3 · Conexión a PostgreSQL** · siguiente: **Paso 5 · Dockerfile de la API**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-La API se conecta a **PostgreSQL** al arrancar y `/salud` informa si la base de datos responde.
+Al arrancar, la API crea automáticamente **todas las tablas** del sistema aplicando *migraciones*.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/go.mod`, `backend/go.sum` | Se agrega el controlador **pgx** (`github.com/jackc/pgx/v5 v5.11.0`). |
-| `backend/internal/basedatos/basedatos.go` | **Nuevo.** Función `Conectar`: crea el *pool* de conexiones y reintenta mientras PostgreSQL arranca. |
-| `backend/internal/config/config.go` | **Modificado.** Nuevo campo `BaseDatos` y función `urlBaseDatos()` que arma la URL de conexión. |
-| `backend/internal/config/config_test.go` | **Modificado.** Pruebas de la URL y de la variable obligatoria. |
-| `backend/cmd/api/main.go` | **Modificado.** Conecta a la base de datos y registra el comprobador `postgres` en `/salud`. |
-| `.env.example` | **Modificado.** Nueva sección `PostgreSQL`. |
+| `backend/internal/basedatos/migraciones/0001_esquema_inicial.sql` | **Nuevo.** El esquema completo: 10 tablas con sus restricciones e índices. |
+| `backend/internal/basedatos/basedatos.go` | **Modificado.** Funciones `Migrar` y `aplicarMigracion`; los archivos `.sql` quedan **dentro del ejecutable** con `go:embed`. |
+| `backend/cmd/api/main.go` | **Modificado.** Llama a `basedatos.Migrar` después de conectarse. |
 
-Resultado:
+Al arrancar con una base de datos vacía se ve en el log:
 
-```bash
-curl http://localhost:8080/salud
-# {"estado":"ok","componentes":{"postgres":"ok"}}            → 200
-# (si PostgreSQL se cae)
-# {"estado":"degradado","componentes":{"postgres":"error"}}  → 503
+```json
+{"level":"INFO","msg":"migración aplicada","servicio":"api","version":"0001_esquema_inicial"}
 ```
+
+y la base de datos queda con 11 tablas: las 10 del sistema más `migraciones_aplicadas`. En los arranques siguientes no se vuelve a aplicar nada.
 
 ---
 
 ## 2. Por qué
 
-- **PostgreSQL** es la base de datos que exige el stack del curso. Guardará usuarios, períodos, cursos y proyectos, vinculaciones, tareas y reportes (RNF-04, persistencia).
-- **pgx** es el controlador de PostgreSQL más usado en Go. Se eligió frente a `database/sql` con `lib/pq` porque:
-  - habla el protocolo nativo de PostgreSQL (más rápido y con mejor manejo de tipos como `DATE`, `UUID` y arreglos);
-  - trae `pgxpool`, un *pool* de conexiones listo para usar;
-  - expone los códigos de error de PostgreSQL (`23505` = violación de unicidad), que se usarán en el paso 13 para traducir errores.
-- **Se conecta al arrancar y no en cada petición:** abrir una conexión cuesta varios milisegundos. Un *pool* mantiene conexiones abiertas y las reutiliza.
-- **Reintentos al arrancar:** con Docker Compose (paso 6), la API y PostgreSQL arrancan casi al mismo tiempo; PostgreSQL tarda unos segundos en aceptar conexiones. Sin reintentos, la API fallaría al primer intento.
-- **`/salud` refleja el estado real:** si la base de datos no responde, la API no puede trabajar y debe decirlo (503).
+### ¿Qué es una migración?
+
+Un archivo con los cambios que hay que aplicar a la **estructura** de la base de datos (crear tablas, columnas, índices) para pasar de una versión del esquema a la siguiente. Es un "control de versiones" para la base de datos: Git guarda la evolución del código y las migraciones la del esquema.
+
+El código y la base de datos deben estar sincronizados: si el código lee una columna, esa columna tiene que existir en **todas** las bases de datos (la de cada integrante, la de GitHub Actions, la de la nube). Hacer ese cambio a mano en cada una es lento y propenso a olvidos. Con migraciones, el cambio queda escrito y se aplica igual en todas partes.
+
+### ¿Por qué todo el esquema en este paso?
+
+Las funcionalidades llegan una por una en los pasos siguientes, pero el **modelo de datos se diseña completo al inicio** porque:
+- las tablas dependen unas de otras (una tarea pertenece a una vinculación, que pertenece a un espacio, que pertenece a un período);
+- si cada integrante del equipo creara "su" tabla por separado, se producirían conflictos entre migraciones;
+- muchas reglas de negocio se garantizan con restricciones en la base de datos (`CHECK`, `UNIQUE`), y es más fácil razonarlas viendo todo el modelo.
+
+### ¿Por qué aplicarlas al arrancar?
+
+Así una base de datos vacía (la de un integrante nuevo, la de CI o la de la nube) queda lista solo con levantar la API, sin comandos manuales.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 La URL de conexión (`config.go`)
-
-PostgreSQL se identifica con una URL:
-
-```
-postgres://usuario:clave@host:puerto/basededatos?sslmode=disable
-```
-
-Se puede dar completa en `DATABASE_URL` o, más cómodo, por partes con **las mismas variables que usa la imagen oficial de PostgreSQL** (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`). Así, en el paso 6 un único `.env` configura a la vez el contenedor de la base de datos y la API.
+### 3.1 Cómo funciona `Migrar` (`basedatos.go`)
 
 ```go
-func urlBaseDatos() string {
-	if v := strings.TrimSpace(os.Getenv("DATABASE_URL")); v != "" {
-		return v
-	}
-	usuario, clave, bd := os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_DB")
-	if usuario == "" || bd == "" {
-		return ""
-	}
-	u := url.URL{
-		Scheme:   "postgres",
-		User:     url.UserPassword(usuario, clave),
-		Host:     texto("POSTGRES_HOST", "localhost") + ":" + texto("POSTGRES_PUERTO", "5432"),
-		Path:     "/" + bd,
-		RawQuery: "sslmode=" + texto("POSTGRES_SSLMODE", "disable"),
-	}
-	return u.String()
-}
+//go:embed migraciones/*.sql
+var archivosMigracion embed.FS
 ```
 
-- **Prioridad:** si existe `DATABASE_URL`, se usa tal cual. Si no, se arma con las partes.
-- `usuario, clave, bd := a, b, c` asigna tres variables en una línea.
-- **Se usa `url.URL` y no concatenación de texto** porque la contraseña puede tener caracteres especiales. Con `cl@ve:con/símbolos`, una URL armada a mano quedaría `postgres://app:cl@ve:con/símbolos@...` y sería imposible saber dónde termina la contraseña. `url.UserPassword` la **codifica** (`cl%40ve%3Acon%2Fs%C3%ADmbolos`). La prueba `TestCargarConstruyeLaURLDesdeVariablesDePostgres` comprueba justamente eso.
-- `sslmode=disable`: dentro de la red de Docker no se cifra la conexión. En la nube (Entrega 2) se podrá cambiar con `POSTGRES_SSLMODE=require` sin tocar el código.
-
-En `Cargar()` la base de datos es **obligatoria**:
+- `//go:embed` es una **directiva del compilador**: copia los archivos indicados **dentro del ejecutable**. La variable `archivosMigracion` se comporta como un sistema de archivos de solo lectura.
+- Ventaja: el binario es autosuficiente. La imagen de Docker (paso 5) no necesita copiar la carpeta `migraciones/`, y es imposible que el binario y sus migraciones no coincidan.
+- El comentario debe ir pegado a la variable y sin espacio entre `//` y `go:embed`.
 
 ```go
-	c.BaseDatos = urlBaseDatos()
-	if c.BaseDatos == "" {
-		errs = append(errs, errors.New("defina DATABASE_URL o POSTGRES_USER, POSTGRES_PASSWORD y POSTGRES_DB"))
+const claveBloqueoMigraciones = 4204_2026
+
+func Migrar(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) error {
+	conn, err := pool.Acquire(ctx)
+	...
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", claveBloqueoMigraciones); err != nil {
+		return fmt.Errorf("bloqueando migraciones: %w", err)
 	}
+	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", claveBloqueoMigraciones) //nolint:errcheck
 ```
 
-### 3.2 `internal/basedatos/basedatos.go`
+- `pool.Acquire` toma **una** conexión del pool y la reserva. Es necesario porque el bloqueo de PostgreSQL pertenece a una conexión concreta.
+- `pg_advisory_lock(42042026)` es un **bloqueo consultivo**: un candado con un número arbitrario que solo una conexión puede tener a la vez. Si dos instancias de la API arrancan al mismo tiempo (Entrega 3, varias instancias), la segunda espera a que la primera termine de migrar. Sin el candado, ambas intentarían crear las mismas tablas y una fallaría.
+- `4204_2026`: los `_` en un número solo sirven para leerlo mejor (el curso es MISW4204). Vale `42042026`.
+- El `defer` libera el candado al terminar. `context.WithoutCancel(ctx)` asegura que la liberación se ejecute aunque el contexto original se haya cancelado. El comentario `//nolint:errcheck` le indica al linter (paso 8) que ignorar ese error es intencional: si falla, la conexión se cierra igual y PostgreSQL libera el candado.
 
 ```go
-func Conectar(ctx context.Context, url string, log *slog.Logger) (*pgxpool.Pool, error) {
-	cfg, err := pgxpool.ParseConfig(url)
-	if err != nil {
-		return nil, fmt.Errorf("configuración de base de datos inválida: %w", err)
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("creando pool de conexiones: %w", err)
-	}
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS migraciones_aplicadas (
+		version     TEXT PRIMARY KEY,
+		aplicada_en TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`); err != nil { ... }
 ```
 
-- `pgxpool.ParseConfig` interpreta la URL (y detecta errores de formato).
-- `pgxpool.NewWithConfig` crea el **pool**: un conjunto de conexiones que se abren cuando hacen falta y se reutilizan entre peticiones. Por defecto admite tantas conexiones como núcleos de CPU (mínimo 4). Las peticiones concurrentes de Gin toman una conexión libre, la usan y la devuelven.
-- Crear el pool **no** abre ninguna conexión todavía; por eso el siguiente bloque hace *ping*.
+- Una tabla de control con las versiones ya aplicadas. `IF NOT EXISTS` la crea solo la primera vez.
+- El texto entre comillas invertidas (`` ` ``) es un **string literal crudo**: puede tener varias líneas y no interpreta `\`.
 
 ```go
-	const intentos = 15
-	for i := 1; ; i++ {
-		ctxPing, cancelar := context.WithTimeout(ctx, 3*time.Second)
-		err = pool.Ping(ctxPing)
-		cancelar()
-		if err == nil {
-			return pool, nil
-		}
-		if i == intentos {
-			pool.Close()
-			return nil, fmt.Errorf("no fue posible conectarse a PostgreSQL: %w", err)
-		}
-		log.Warn("esperando a PostgreSQL", "intento", i, "error", err)
-		select {
-		case <-ctx.Done():
-			pool.Close()
-			return nil, ctx.Err()
-		case <-time.After(2 * time.Second):
+	nombres, err := fs.Glob(archivosMigracion, "migraciones/*.sql")
+	...
+	sort.Strings(nombres)
+	for _, nombre := range nombres {
+		if err := aplicarMigracion(ctx, conn.Conn(), nombre, log); err != nil {
+			return err
 		}
 	}
-}
 ```
 
-- `for i := 1; ; i++` es un ciclo **sin condición de salida en la cabecera**: termina con los `return` de adentro.
-- Cada *ping* tiene 3 segundos como máximo. Si responde, se devuelve el pool listo.
-- Hasta **15 intentos con 2 segundos de espera** (unos 30 a 75 segundos en total). Si no se logra, se cierra el pool y se devuelve el error; la API termina con código 1.
-- El `select` espera 2 segundos (`time.After`) **o** a que se cancele el contexto (Ctrl+C). Así, si se detiene la API mientras espera a la base de datos, sale de inmediato en lugar de seguir reintentando.
-- `const intentos = 15`: una constante local; documenta el número en lugar de dejar un "15" suelto.
-
-### 3.3 `cmd/api/main.go`
+- Lista los archivos y los **ordena por nombre**. Por eso los nombres empiezan con un número de 4 dígitos (`0001_`, `0002_`...): el orden alfabético coincide con el orden de aplicación.
+- `for _, nombre := range nombres`: el `_` descarta el índice, que no se necesita.
 
 ```go
-	// Capa de datos
-	db, err := basedatos.Conectar(ctx, cfg.BaseDatos, log)
-	if err != nil {
-		return err
+func aplicarMigracion(ctx context.Context, conn *pgx.Conn, nombre string, log *slog.Logger) error {
+	version := strings.TrimSuffix(strings.TrimPrefix(nombre, "migraciones/"), ".sql")
+	var aplicada bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM migraciones_aplicadas WHERE version = $1)", version).Scan(&aplicada); err != nil { ... }
+	if aplicada {
+		return nil
 	}
-	defer db.Close()
-```
-
-- La conexión se abre **después** de crear el contexto de señales, para que Ctrl+C pueda interrumpir los reintentos.
-- `defer db.Close()` cierra todas las conexiones del pool al terminar `ejecutar`. Este es el motivo del patrón `main → ejecutar` del paso 0: si la lógica estuviera en `main` y se llamara a `os.Exit`, este `defer` no se ejecutaría.
-
-```go
-	router := handler.NuevoRouter(handler.Dependencias{
-		Salud: map[string]handler.ComprobadorSalud{
-			"postgres": db.Ping,
-		},
+	sql, err := archivosMigracion.ReadFile(nombre)
+	...
+	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, string(sql)); err != nil {
+			return fmt.Errorf("aplicando migración %s: %w", version, err)
+		}
+		if _, err := tx.Exec(ctx, "INSERT INTO migraciones_aplicadas (version) VALUES ($1)", version); err != nil {
+			return fmt.Errorf("registrando migración %s: %w", version, err)
+		}
+		return nil
 	})
+	...
+	log.Info("migración aplicada", "version", version)
+	return nil
+}
 ```
 
-- `db.Ping` es un **método usado como valor**: tiene la forma `func(ctx context.Context) error`, que es exactamente un `ComprobadorSalud` (paso 2). El router no conoce pgx; solo recibe "una función que comprueba algo".
+- La versión es el nombre del archivo sin carpeta ni extensión: `0001_esquema_inicial`.
+- `$1` es un **parámetro**: el valor viaja aparte del SQL. Nunca se concatena texto en una consulta (eso permitiría inyección SQL).
+- `.Scan(&aplicada)` copia el resultado de la consulta en la variable; `&` pasa su dirección para que `Scan` pueda escribir en ella.
+- `pgx.BeginFunc` abre una **transacción**, ejecuta la función y:
+  - si la función devuelve `nil`, confirma (`COMMIT`);
+  - si devuelve un error, revierte (`ROLLBACK`).
+  
+  Por eso una migración con un error a la mitad **no deja la base de datos a medias**: o se aplica completa y queda registrada, o no se aplica nada. PostgreSQL permite crear tablas dentro de transacciones, lo que no todas las bases de datos admiten.
+- Se separó en dos funciones (`Migrar` y `aplicarMigracion`) para que cada una sea corta y fácil de leer.
 
-### 3.4 Pruebas de configuración
+**Regla de oro:** **nunca se edita una migración que ya se aplicó.** Si `0001` ya corrió en una base de datos, editarla no cambia nada allí (la versión ya está registrada y se salta). Los cambios futuros van en un archivo nuevo, por ejemplo `0002_fecha_limite_creacion.sql`.
 
-- `TestCargarConstruyeLaURLDesdeVariablesDePostgres`: arma la URL con una contraseña llena de símbolos y verifica host, puerto, base de datos y que la contraseña esté codificada.
-- `TestCargarExigeBaseDeDatos`: sin variables de base de datos, el error debe mencionar `DATABASE_URL`.
-- `TestCargarRechazaZonaHorariaInvalida`: ahora define `DATABASE_URL`, porque la base de datos pasó a ser obligatoria y la prueba quiere aislar el error de la zona.
+### 3.2 El esquema (`0001_esquema_inicial.sql`)
 
-`Conectar` **no** tiene prueba unitaria porque necesita un PostgreSQL real. Se prueba con las pruebas de integración del paso 58 y con Docker Compose desde el paso 6.
+```mermaid
+erDiagram
+    usuarios ||--o{ usuario_roles : tiene
+    periodos_academicos ||--o{ espacios : agrupa
+    usuarios ||--o{ espacios : "dirige (profesor)"
+    usuarios ||--o{ vinculaciones : "se vincula"
+    espacios ||--o{ vinculaciones : tiene
+    vinculaciones ||--o{ vinculacion_rectificaciones : "se corrige"
+    vinculaciones ||--o{ tareas : registra
+    tareas ||--o{ tarea_adjuntos : adjunta
+    usuarios ||--o{ lotes_reportes : solicita
+    lotes_reportes ||--o{ reportes_semanales : contiene
+    usuarios ||--o{ reportes_semanales : "es reportado"
+```
+
+**Decisiones comunes a todas las tablas:**
+- **Identificadores UUID** (`UUID PRIMARY KEY DEFAULT gen_random_uuid()`): códigos aleatorios como `6f1c2a8e-1a7d-...` en lugar de números consecutivos. Las URLs de la API (`/tareas/{id}`) no permiten adivinar otros registros probando 1, 2, 3...; además pueden generarse en la aplicación antes de insertar (se aprovecha en el paso 36 con las tareas).
+- **`TIMESTAMPTZ`** (fecha y hora con zona horaria) para los momentos (`creado_en`), y **`DATE`** (solo fecha) para los días de calendario (`fecha_inicio`, `semana_inicio`).
+- **`TEXT` con `CHECK (x IN (...))`** para los catálogos cerrados (roles, estados): la base de datos rechaza cualquier valor fuera de la lista aunque el código tuviera un error.
+- **`REFERENCES`** (llaves foráneas): no se puede crear, por ejemplo, una tarea para una vinculación que no existe.
+- **Índices** en las columnas por las que se busca a menudo, para que las consultas no recorran toda la tabla.
+
+**Tabla por tabla:**
+
+| Tabla | Qué guarda | Detalles importantes |
+|---|---|---|
+| `usuarios` | Personas registradas (RF-02). | Índice **único** sobre `lower(correo)`: `Ana@x.co` y `ana@x.co` son el mismo usuario. Se guarda `password_hash`, nunca la contraseña (paso 12). `activo` para una futura desactivación. |
+| `usuario_roles` | Roles de cada usuario (RF-01.3, RN-01: una persona puede tener varios). | Llave primaria `(usuario_id, rol)`: no se repite un rol. `ON DELETE CASCADE`: si se borra el usuario, se borran sus roles. `CHECK` con los 4 roles: administrador, profesor, monitor y asistente_graduado. |
+| `periodos_academicos` | Semestres, por ejemplo `2026-20` (RF-03.2). | `codigo` único. `creacion_habilitada` abre o cierra la ventana para crear cursos y proyectos (RN-07). `CHECK (fecha_cierre > fecha_inicio)`. |
+| `espacios` | Cursos y proyectos (RF-03). | `tipo` curso o proyecto; `estado` activo o cerrado (RF-03.5); `profesor_id` es el profesor responsable. Índice por profesor porque casi todas las consultas filtran por él. |
+| `vinculaciones` | Persona + espacio + rol + horas semanales (RF-04). | `UNIQUE (usuario_id, espacio_id, rol)`: una persona puede estar en el mismo espacio con **roles distintos**, pero no dos veces con el mismo (RF-04.6). `CHECK (horas_semanales > 0)`. Las reglas de 22 h, 12 h, 3 monitorías y 40 % **no** se pueden expresar con `CHECK` porque involucran varias filas; se validan en la aplicación dentro de una transacción con bloqueo (paso 31). |
+| `vinculacion_rectificaciones` | Historial de correcciones que hace el administrador (RF-04.5). | Guarda rol y horas anteriores y nuevos, quién corrigió y el motivo. Nada se pierde. |
+| `tareas` | Registro semanal de actividades (RF-06). | `CHECK (EXTRACT(ISODOW FROM semana_inicio) = 1)`: la semana se guarda siempre como **su lunes** (RF-08.1). `horas_invertidas INTEGER` (horas enteras, RN-24). `tardia` marca el reporte tardío (RN-32). Índices por vinculación y semana. |
+| `tarea_adjuntos` | Metadatos de archivos de evidencia (RF-06.4). | El archivo en sí se guarda fuera de la base de datos (paso 38); aquí solo nombre, ruta, tipo y tamaño. `ON DELETE CASCADE` con la tarea. |
+| `lotes_reportes` | Cada ejecución de "generar reportes de la semana" (RF-14.1). | Estado del lote y contadores (total, completados, fallidos) para seguir su avance. |
+| `reportes_semanales` | Un reporte PDF por persona y semana (RF-14.2). | Resumen de IA, ruta del PDF, intentos, error, proveedor y modelo de IA usados. `UNIQUE (lote_id, usuario_id)`: un reporte por persona en cada lote. |
 
 ---
 
-## 4. Conceptos de Go de este paso
+## 4. Conceptos de Go (y SQL) de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Asignación múltiple | `a, b, c := x, y, z`. |
-| Ciclo sin condición | `for i := 1; ; i++ { ... }` se repite hasta un `return` o `break`. |
-| `const` local | Valor fijo con nombre dentro de una función. |
-| `time.After(d)` | Canal que recibe un valor cuando pasa el tiempo `d`; útil en `select`. |
-| Método como valor | `db.Ping` se puede pasar como función, "atado" a `db`. |
-| `nil` en punteros | `return nil, err`: no hay pool que devolver. |
+| `//go:embed` | Incluye archivos dentro del ejecutable (`embed.FS`). |
+| String crudo | `` `texto` ``: varias líneas, sin secuencias de escape. |
+| `_` en números | Separador visual: `4204_2026` es `42042026`. |
+| `&variable` | Dirección de la variable, para que otra función escriba en ella (`Scan(&aplicada)`). |
+| Transacción | Conjunto de operaciones que se confirman todas o ninguna (`BEGIN`/`COMMIT`/`ROLLBACK`). |
+| Parámetros `$1` | Valores separados del SQL; previenen la inyección SQL. |
+| Bloqueo consultivo | Candado de PostgreSQL identificado por un número (`pg_advisory_lock`). |
+| `//nolint:regla` | Desactiva una advertencia del linter en esa línea, dejando claro que es intencional. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
-Necesita un PostgreSQL. La forma más rápida es con Docker (en el paso 6 esto lo hará Docker Compose):
+Con un PostgreSQL vacío (como en el paso 3):
 
 ```bash
-docker run -d --name pg -p 5432:5432 -e POSTGRES_USER=seguimiento -e POSTGRES_PASSWORD=clave -e POSTGRES_DB=seguimiento postgres:16-bookworm
-```
-
-Con Go instalado, desde `backend/`:
-
-```bash
+cd backend
 POSTGRES_USER=seguimiento POSTGRES_PASSWORD=clave POSTGRES_DB=seguimiento go run ./cmd/api
-curl http://localhost:8080/salud          # {"estado":"ok","componentes":{"postgres":"ok"}}
-docker stop pg
-curl -i http://localhost:8080/salud       # 503 {"estado":"degradado",...}
+# log: "migración aplicada" ... "version":"0001_esquema_inicial"
 ```
 
-En PowerShell, las variables se definen antes: `$env:POSTGRES_USER="seguimiento"`, etc.
+Ver las tablas creadas:
 
-Si arranca la API antes que PostgreSQL, verá en el log `"msg":"esperando a PostgreSQL"` hasta que la base de datos acepte conexiones.
+```bash
+docker exec -it pg psql -U seguimiento -d seguimiento -c '\dt'
+docker exec -it pg psql -U seguimiento -d seguimiento -c 'SELECT * FROM migraciones_aplicadas'
+```
 
-Pruebas unitarias: `go test ./...`
+Detenga y vuelva a arrancar la API: ya no aparece "migración aplicada" porque la versión está registrada.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 2
+## 6. Pasos para lograr esta versión desde el paso 3
 
-1. Agregar pgx (desde `backend/`):
-   ```bash
-   go get github.com/jackc/pgx/v5@v5.11.0
-   go mod tidy
+1. Crear la carpeta `backend/internal/basedatos/migraciones/`.
+2. Crear `0001_esquema_inicial.sql` con las 10 tablas (ver el archivo en este commit; cada bloque está comentado con los requisitos que atiende).
+3. En `backend/internal/basedatos/basedatos.go`:
+   - actualizar el comentario del paquete ("...y las migraciones del esquema");
+   - agregar los imports `embed`, `io/fs`, `sort`, `strings` y `github.com/jackc/pgx/v5`;
+   - declarar `//go:embed migraciones/*.sql` y `var archivosMigracion embed.FS`;
+   - agregar la constante `claveBloqueoMigraciones`, `Migrar` y `aplicarMigracion` (sección 3.1).
+4. En `backend/cmd/api/main.go`, justo después de `defer db.Close()`:
+   ```go
+   if err := basedatos.Migrar(ctx, db, log); err != nil {
+       return err
+   }
    ```
-2. Modificar `backend/internal/config/config.go`:
-   - import `net/url`;
-   - campo `BaseDatos string` en `Config`;
-   - en `Cargar()`, asignar `c.BaseDatos = urlBaseDatos()` y agregar el error si está vacío;
-   - nueva función `urlBaseDatos()` (sección 3.1).
-3. Actualizar `backend/internal/config/config_test.go` con las tres pruebas descritas en 3.4.
-4. Crear `backend/internal/basedatos/basedatos.go` con `Conectar` (sección 3.2).
-5. Modificar `backend/cmd/api/main.go`: import `seguimiento/internal/basedatos`, llamar a `Conectar`, `defer db.Close()` y pasar `db.Ping` en `Dependencias.Salud`.
-6. Agregar a `.env.example` la sección `PostgreSQL` (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_HOST`, `POSTGRES_PUERTO` y el ejemplo comentado de `DATABASE_URL`).
-7. Probar como en la sección 5 y hacer commit: `git commit -am "Paso 3: conexión a PostgreSQL"` (más `git add` de los archivos nuevos).
+5. Probar contra una base de datos vacía (sección 5) y hacer commit: `git add . && git commit -m "Paso 4: migraciones y esquema de la base de datos"`
+
+Para cambiar el esquema en el futuro: crear `0002_descripcion.sql`; **no editar** `0001`.
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- **`DATABASE_URL` tiene prioridad.** En la Entrega 2 la base de datos será un servicio administrado (Cloud SQL). Bastará con definir `DATABASE_URL` con la dirección privada de esa instancia y, si se requiere, `sslmode=require`.
-- **Los reintentos al arrancar** también ayudan en la nube: si la API se inicia antes de que la red privada o la base de datos estén listas, espera en lugar de fallar.
-- **`/salud` con el estado de PostgreSQL** permitirá que el balanceador (Entrega 3) saque de servicio una instancia que perdió la conexión.
+- **El bloqueo consultivo** permite que, en la Entrega 3, varias instancias de la API arranquen a la vez contra la misma base de datos sin pelearse por las migraciones.
+- **Las migraciones dentro del binario** hacen que desplegar en una VM o en Cloud Run sea solo "ejecutar la imagen nueva": el esquema se actualiza solo.
+- **UUID como identificadores** facilitará escalar horizontalmente: varias instancias pueden generar identificadores sin coordinarse.
 
 ---
 
@@ -239,6 +248,9 @@ Pruebas unitarias: `go test ./...`
 
 | Requisito | Cómo |
 |---|---|
-| Stack: PostgreSQL | Conexión con pgx y pool de conexiones. |
-| RNF-04 Persistencia | Base para guardar todos los datos del sistema. |
-| Lineamientos 10 | Credenciales solo por variables de entorno, contraseña codificada en la URL. |
+| RNF-04 Persistencia | Tablas para todos los datos del sistema. |
+| RNF-06 Consistencia | Restricciones `CHECK`, `UNIQUE` y llaves foráneas. |
+| RF-04.6 Vinculaciones independientes | `UNIQUE (usuario_id, espacio_id, rol)`. |
+| RF-07.2 Estados de tarea | `CHECK` con abierto, en_desarrollo y finalizado. |
+| RF-08.1 Semana de lunes a domingo | `CHECK` de que `semana_inicio` es lunes. |
+| Arquitectura §5 Modelo de datos | El esquema completo queda definido. |
