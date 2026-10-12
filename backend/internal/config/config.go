@@ -12,7 +12,7 @@ import (
 )
 
 // Config es la configuración de la aplicación. En los pasos siguientes se le
-// agregan la autenticación, Redis, los archivos y la IA.
+// agregan Redis, los archivos y la IA.
 type Config struct {
 	Entorno     string // desarrollo | produccion
 	PuertoHTTP  string
@@ -21,6 +21,21 @@ type Config struct {
 	// OrigenesCORS son los orígenes (esquema://dominio:puerto) desde los que un
 	// frontend en el navegador puede llamar a la API.
 	OrigenesCORS []string
+
+	JWT   JWT
+	Admin AdminInicial
+}
+
+type JWT struct {
+	Secreto    string
+	Expiracion time.Duration
+}
+
+// AdminInicial es el administrador que se crea al arrancar si aún no existe.
+type AdminInicial struct {
+	Nombre   string
+	Correo   string
+	Password string
 }
 
 // EsDesarrollo indica si la aplicación corre en modo desarrollo.
@@ -44,6 +59,20 @@ func Cargar() (Config, error) {
 	c.BaseDatos = urlBaseDatos()
 	if c.BaseDatos == "" {
 		errs = append(errs, errors.New("defina DATABASE_URL o POSTGRES_USER, POSTGRES_PASSWORD y POSTGRES_DB"))
+	}
+
+	c.JWT = JWT{
+		Secreto:    os.Getenv("JWT_SECRETO"),
+		Expiracion: duracion("JWT_EXPIRACION", 8*time.Hour, &errs),
+	}
+	if len(c.JWT.Secreto) < 32 {
+		errs = append(errs, errors.New("JWT_SECRETO es obligatorio y debe tener al menos 32 caracteres"))
+	}
+
+	c.Admin = AdminInicial{
+		Nombre:   texto("ADMIN_NOMBRE", "Administrador"),
+		Correo:   strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_CORREO"))),
+		Password: os.Getenv("ADMIN_PASSWORD"),
 	}
 
 	return c, errors.Join(errs...)
@@ -85,4 +114,17 @@ func lista(clave string) []string {
 		}
 	}
 	return valores
+}
+
+func duracion(clave string, porDefecto time.Duration, errs *[]error) time.Duration {
+	v := strings.TrimSpace(os.Getenv(clave))
+	if v == "" {
+		return porDefecto
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s debe ser una duración como 30s o 2m: %w", clave, err))
+		return porDefecto
+	}
+	return d
 }

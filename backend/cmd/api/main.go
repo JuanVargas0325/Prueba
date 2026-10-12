@@ -14,9 +14,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"seguimiento/internal/auth"
 	"seguimiento/internal/basedatos"
 	"seguimiento/internal/config"
 	"seguimiento/internal/handler"
+	"seguimiento/internal/repositorio"
+	"seguimiento/internal/servicio"
 )
 
 func main() {
@@ -46,6 +49,14 @@ func ejecutar(log *slog.Logger) error {
 	}
 	defer db.Close()
 	if err := basedatos.Migrar(ctx, db, log); err != nil {
+		return err
+	}
+	usuarios := repositorio.NuevoUsuarios(db)
+
+	// Capa de servicio
+	tokens := auth.NuevoGestorTokens(cfg.JWT.Secreto, cfg.JWT.Expiracion)
+	servicioAuth := servicio.NuevaAutenticacion(usuarios, tokens, log)
+	if err := servicioAuth.AsegurarAdministrador(ctx, cfg.Admin.Nombre, cfg.Admin.Correo, cfg.Admin.Password); err != nil {
 		return err
 	}
 

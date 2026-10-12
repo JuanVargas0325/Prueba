@@ -3,7 +3,10 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+const secretoValido = "un-secreto-de-prueba-con-mas-de-32-caracteres"
 
 func TestCargarConstruyeLaURLDesdeVariablesDePostgres(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
@@ -11,6 +14,7 @@ func TestCargarConstruyeLaURLDesdeVariablesDePostgres(t *testing.T) {
 	t.Setenv("POSTGRES_PASSWORD", "cl@ve:con/símbolos")
 	t.Setenv("POSTGRES_DB", "seguimiento")
 	t.Setenv("POSTGRES_HOST", "postgres")
+	t.Setenv("JWT_SECRETO", secretoValido)
 
 	c, err := Cargar()
 	if err != nil {
@@ -22,29 +26,40 @@ func TestCargarConstruyeLaURLDesdeVariablesDePostgres(t *testing.T) {
 	if strings.Contains(c.BaseDatos, "cl@ve:con/") {
 		t.Error("la contraseña debería ir codificada en la URL")
 	}
+	if c.JWT.Expiracion != 8*time.Hour {
+		t.Errorf("valores por defecto inesperados: %+v", c)
+	}
 	if c.ZonaHoraria.String() != "America/Bogota" {
 		t.Errorf("zona horaria por defecto = %s", c.ZonaHoraria)
 	}
 }
 
-func TestCargarExigeBaseDeDatos(t *testing.T) {
+func TestCargarExigeSecretoYBaseDeDatos(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("POSTGRES_USER", "")
 	t.Setenv("POSTGRES_DB", "")
+	t.Setenv("JWT_SECRETO", "corto")
 
 	_, err := Cargar()
-	if err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
-		t.Fatalf("se esperaba un error que mencionara DATABASE_URL: %v", err)
+	if err == nil {
+		t.Fatal("se esperaba error de configuración")
+	}
+	for _, esperado := range []string{"JWT_SECRETO", "DATABASE_URL"} {
+		if !strings.Contains(err.Error(), esperado) {
+			t.Errorf("el error debería mencionar %s: %v", esperado, err)
+		}
 	}
 }
 
-func TestCargarRechazaZonaHorariaInvalida(t *testing.T) {
+func TestCargarValidaFormatos(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x@localhost/db")
+	t.Setenv("JWT_SECRETO", secretoValido)
 	t.Setenv("APP_ZONA_HORARIA", "Marte/Monte_Olimpo")
+	t.Setenv("JWT_EXPIRACION", "mucho")
 
 	_, err := Cargar()
-	if err == nil || !strings.Contains(err.Error(), "APP_ZONA_HORARIA") {
-		t.Fatalf("se esperaba un error que mencionara APP_ZONA_HORARIA: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "APP_ZONA_HORARIA") || !strings.Contains(err.Error(), "JWT_EXPIRACION") {
+		t.Fatalf("se esperaban errores de formato: %v", err)
 	}
 }
 
