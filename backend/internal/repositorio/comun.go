@@ -23,6 +23,9 @@ const (
 	recursoUsuarios      = "usuarios"
 	recursoPeriodo       = "período"
 	recursoPeriodos      = "períodos"
+	recursoEspacio       = "curso o proyecto"
+	recursoEspacios      = "cursos y proyectos"
+	recursoVinculacion   = "vinculación"
 	recursoVinculaciones = "vinculaciones"
 )
 

@@ -1,129 +1,104 @@
-# Paso 25 · Dominio: cursos y proyectos
+# Paso 26 · Repositorio de espacios
 
-> Rama `paso-a-paso` · paso 25 de 65 · anterior: **Paso 24 · Endpoints de períodos** · siguiente: **Paso 26 · Repositorio de espacios**
+> Rama `paso-a-paso` · paso 26 de 65 · anterior: **Paso 25 · Dominio de cursos y proyectos** · siguiente: **Paso 27 · Reloj inyectable**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se modelaron los **cursos y proyectos**. En el código ambos se llaman **espacios** porque comparten casi todo (un profesor responsable, un período, fechas y estado) y solo se distinguen por su tipo.
+Se creó el repositorio de cursos y proyectos sobre la tabla `espacios`.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/dominio/espacio.go` | **Modificado.** `TipoEspacio`, `EstadoEspacio`, la entidad `Espacio`, sus reglas (`ValidarFechasEnPeriodo`, `PermiteRegistros`, `IncluyeSemana`), `FiltroEspacios` y la función auxiliar `seCruzan`. |
-| `backend/internal/dominio/reglas_test.go` | **Modificado.** `TestEspacioFechasYEstado`. |
+| `backend/internal/repositorio/espacios.go` | **Nuevo.** `Crear`, `Obtener`, `Listar` (con visibilidad por usuario), `Cerrar` y `EsParticipante`. |
+| `backend/internal/repositorio/comun.go` | **Modificado.** Constantes `recursoEspacio`, `recursoEspacios` y `recursoVinculacion`. |
 
 ---
 
 ## 2. Por qué
 
-- **RF-03.1 / RN-06:** el profesor crea cursos **y** proyectos. Como las reglas son las mismas, un único concepto con un campo `Tipo` evita duplicar todo el código.
-- **RF-03.3:** información mínima: tipo, nombre, período, fechas de inicio y cierre, profesor responsable y observaciones.
-- **RF-03.5 a RF-03.7 / RN-08 y RN-09:** un espacio se puede **cerrar**; cerrado, se consulta pero no admite registros nuevos.
+- El servicio de espacios (paso 28) necesita guardarlos, consultarlos y cerrarlos.
+- **La visibilidad se aplica en la consulta SQL:** un profesor solo ve sus espacios y un monitor solo aquellos en los que está vinculado (RF-03.4, RF-11.1, RF-12). Hacerlo en SQL es eficiente (la base de datos devuelve solo lo necesario) y seguro (el servicio nunca recibe datos que el actor no debe ver).
 
 ---
 
-## 3. Explicación detallada
+## 3. Explicación detallada de `espacios.go`
 
-### 3.1 Tipo y estado
+### 3.1 Consulta base con `JOIN`
 
 ```go
-type TipoEspacio string
-
-const (
-	EspacioCurso    TipoEspacio = "curso"
-	EspacioProyecto TipoEspacio = "proyecto"
-)
-
-type EstadoEspacio string
-
-const (
-	EspacioActivo  EstadoEspacio = "activo"
-	EspacioCerrado EstadoEspacio = "cerrado"
-)
+const selectEspacio = `
+	SELECT e.id, e.tipo, e.nombre, e.periodo_id, p.codigo, e.profesor_id, u.nombre,
+	       e.fecha_inicio, e.fecha_cierre, e.observaciones, e.estado, e.creado_en
+	FROM espacios e
+	JOIN periodos_academicos p ON p.id = e.periodo_id
+	JOIN usuarios u ON u.id = e.profesor_id`
 ```
-- Cada uno con su `EsValido()`, como en los pasos anteriores. Los valores coinciden con los `CHECK` de la tabla `espacios` (paso 4).
+- Un **`JOIN`** combina filas de varias tablas. Aquí trae, junto con cada espacio, el **código del período** y el **nombre del profesor**. Por eso la entidad del dominio tiene `PeriodoCodigo` y `ProfesorNombre` (paso 25).
+- Las letras `e`, `p`, `u` son **alias** de las tablas, para escribir menos.
 
-### 3.2 La entidad
-
-```go
-type Espacio struct {
-	ID             string
-	Tipo           TipoEspacio
-	Nombre         string
-	PeriodoID      string
-	PeriodoCodigo  string
-	ProfesorID     string
-	ProfesorNombre string
-	FechaInicio    time.Time
-	FechaCierre    time.Time
-	Observaciones  string
-	Estado         EstadoEspacio
-	CreadoEn       time.Time
-}
-```
-- Además de los IDs, trae `PeriodoCodigo` y `ProfesorNombre`. El repositorio los obtendrá con un `JOIN` (paso 26), para que la API pueda mostrar "2026-20" y "Carolina Rojas" sin consultas adicionales.
-
-### 3.3 Reglas
+### 3.2 `Crear`
 
 ```go
-func (e Espacio) ValidarFechasEnPeriodo(p PeriodoAcademico) error {
-	if e.FechaCierre.Before(e.FechaInicio) {
-		return apperr.Validacion("la fecha de cierre no puede ser anterior a la de inicio")
+func (r *Espacios) Crear(ctx context.Context, e dominio.Espacio) (dominio.Espacio, error) {
+	var id string
+	err := r.db.QueryRow(ctx,
+		`INSERT INTO espacios (tipo, nombre, periodo_id, profesor_id, fecha_inicio, fecha_cierre, observaciones)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+		...
+	).Scan(&id)
+	if err != nil {
+		return e, traducir(err, recursoEspacio)
 	}
-	if e.FechaInicio.Before(p.FechaInicio) || e.FechaCierre.After(p.FechaCierre) {
-		return apperr.Validacion("las fechas deben estar dentro del período %s (%s a %s)",
-			p.Codigo, p.FechaInicio.Format(FormatoFecha), p.FechaCierre.Format(FormatoFecha))
+	return r.Obtener(ctx, id)
+}
+```
+- Inserta y luego **vuelve a leer** con `Obtener`, para devolver el espacio completo con los datos de los `JOIN` (código del período y nombre del profesor), que el `INSERT` no tiene.
+- El estado no se envía: la columna tiene `DEFAULT 'activo'`.
+
+### 3.3 `Listar` con visibilidad
+
+```go
+func (r *Espacios) Listar(ctx context.Context, f dominio.FiltroEspacios) ([]dominio.Espacio, error) {
+	var w filtro
+	if f.VisiblePara != "" {
+		w.agregar(`(e.profesor_id = ? OR EXISTS (SELECT 1 FROM vinculaciones v WHERE v.espacio_id = e.id AND v.usuario_id = ?))`, f.VisiblePara)
 	}
-	return nil
+	if f.PeriodoID != "" { w.agregar("e.periodo_id = ?", f.PeriodoID) }
+	if f.Estado != "" { w.agregar("e.estado = ?", string(f.Estado)) }
+	if f.Tipo != "" { w.agregar("e.tipo = ?", string(f.Tipo)) }
+	sql := selectEspacio + w.where() + ` ORDER BY e.estado, lower(e.nombre)` + w.paginar(f.Paginacion)
+	...
 }
 ```
-- Un curso no puede empezar antes ni terminar después de su período. El mensaje dice cuáles son las fechas válidas, para que el usuario sepa cómo corregir.
-- Esta regla no se puede expresar con un `CHECK` de la tabla `espacios`, porque las fechas del período están en otra tabla. Por eso vive aquí.
+- **La regla de visibilidad en una línea de SQL:** el espacio es visible si el usuario es su **profesor** o si tiene alguna **vinculación** en él. Aquí se aprovecha que `filtro.agregar` reemplaza **los dos** `?` por el mismo parámetro (paso 13).
+- `EXISTS (SELECT 1 ...)` pregunta "¿existe al menos una fila?" sin traerlas.
+- Orden: primero los activos (`activo` < `cerrado` alfabéticamente) y luego por nombre.
+
+### 3.4 `Cerrar`
 
 ```go
-func (e Espacio) PermiteRegistros() error {
-	if e.Estado == EspacioCerrado {
-		return apperr.ReglaNegocio("el %s %q está cerrado y solo admite consultas", e.Tipo, e.Nombre)
+func (r *Espacios) Cerrar(ctx context.Context, id string) (dominio.Espacio, error) {
+	etiqueta, err := r.db.Exec(ctx,
+		`UPDATE espacios SET estado = 'cerrado', actualizado_en = now() WHERE id = $1 AND estado = 'activo'`, id)
+	if err != nil {
+		return dominio.Espacio{}, traducir(err, recursoEspacio)
 	}
-	return nil
+	if etiqueta.RowsAffected() == 0 {
+		return dominio.Espacio{}, apperr.Conflicto("el curso o proyecto ya está cerrado")
+	}
+	return r.Obtener(ctx, id)
 }
 ```
-- **RN-09 / RF-03.7:** un espacio cerrado no admite vinculaciones nuevas (paso 32) ni tareas nuevas o modificadas (pasos 36 y 39). Mensaje de ejemplo: `el curso "Nube" está cerrado y solo admite consultas`.
+- El `WHERE ... AND estado = 'activo'` hace que la operación sea **segura ante concurrencia**: si dos peticiones intentan cerrar a la vez, solo una cambia la fila.
+- `RowsAffected()` dice cuántas filas cambió el `UPDATE`. Si fue 0, el espacio ya estaba cerrado → **409**. (Si el espacio no existiera, el servicio lo detecta antes con `Obtener`.)
+
+### 3.5 `EsParticipante`
 
 ```go
-func (e Espacio) IncluyeSemana(semanaInicio time.Time) bool {
-	return seCruzan(e.FechaInicio, e.FechaCierre, InicioSemana(semanaInicio), FinSemana(semanaInicio))
-}
-
-func seCruzan(a1, a2, b1, b2 time.Time) bool {
-	return !a1.After(b2) && !b1.After(a2)
-}
+func (r *Espacios) EsParticipante(ctx context.Context, espacioID, usuarioID string) (bool, error)
 ```
-- ¿La semana tiene al menos un día dentro de las fechas del espacio? Se usa para rechazar tareas en semanas en las que el curso no existía (paso 36).
-- `seCruzan` es la prueba clásica de **intersección de intervalos**: dos intervalos `[a1, a2]` y `[b1, b2]` comparten algún día si **ninguno empieza después de que el otro termina**. Se reutilizará para la vigencia de las vinculaciones (paso 30).
-
-```go
-type FiltroEspacios struct {
-	// VisiblePara limita el resultado a los espacios del profesor o en los que
-	// el usuario participa. Vacío = sin restricción (administrador).
-	VisiblePara string
-	PeriodoID   string
-	Estado      EstadoEspacio
-	Tipo        TipoEspacio
-	Paginacion
-}
-```
-- `VisiblePara` es el mecanismo de **visibilidad** (RF-12) que usarán todos los listados: el servicio lo llena con el usuario del actor (o lo deja vacío para el administrador), y el repositorio filtra con él. Así un usuario nunca puede pedir ver lo de otros.
-
-### 3.4 Prueba
-
-`TestEspacioFechasYEstado` comprueba:
-- fechas dentro del período → válidas;
-- un cierre en enero de 2027, fuera del período → inválido;
-- un cierre anterior al inicio → inválido;
-- la semana del 5 de agosto está dentro del curso y la del 9 de diciembre no;
-- un espacio cerrado no admite registros (regla de negocio).
+- `SELECT EXISTS` sobre `vinculaciones`. El servicio lo usa para decidir si un monitor puede ver el detalle de un espacio.
 
 ---
 
@@ -131,37 +106,44 @@ type FiltroEspacios struct {
 
 | Concepto | Explicación |
 |---|---|
-| Un tipo para dos conceptos | `Espacio` con `Tipo` curso/proyecto en lugar de dos structs casi iguales. |
-| Datos desnormalizados para lectura | `PeriodoCodigo`, `ProfesorNombre` vienen de otras tablas para no hacer consultas extra. |
-| Intersección de intervalos | `!a1.After(b2) && !b1.After(a2)`. |
-| `%q` en mensajes | Pone el nombre entre comillas: `"Nube"`. |
+| `JOIN` | Combina filas relacionadas de varias tablas. |
+| `EXISTS` | Subconsulta que solo pregunta si hay filas. |
+| `RowsAffected()` | Filas modificadas por un `UPDATE`/`DELETE`. |
+| `UPDATE ... WHERE estado = 'activo'` | Cambio condicional, seguro ante peticiones simultáneas. |
+| Visibilidad en SQL | Filtrar en la base de datos según quién pregunta. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/dominio/ -v -run TestEspacio
+make lint
 ```
 
----
-
-## 6. Pasos para lograr esta versión desde el paso 24
-
-1. En `dominio/espacio.go`, después de `FiltroPeriodos`, agregar `TipoEspacio`, `EstadoEspacio` (con constantes y `EsValido`), `Espacio`, `ValidarFechasEnPeriodo`, `PermiteRegistros`, `IncluyeSemana`, `FiltroEspacios` y `seCruzan`.
-2. En `reglas_test.go`, después de `TestCodigoPeriodo`, agregar `TestEspacioFechasYEstado`.
-3. `make pruebas lint`
-4. Commit: `git add . && git commit -m "Paso 25: dominio de cursos y proyectos"`
+Se ejercita por HTTP en el paso 29 y con pruebas de integración en el paso 58 (`TestEspaciosVisibilidadYCierre`).
 
 ---
 
-## 7. Requisitos que atiende
+## 6. Pasos para lograr esta versión desde el paso 25
+
+1. En `repositorio/comun.go`, agregar al bloque de constantes `recursoEspacio = "curso o proyecto"`, `recursoEspacios = "cursos y proyectos"` y `recursoVinculacion = "vinculación"`.
+2. Crear `backend/internal/repositorio/espacios.go` con `Espacios`, `NuevoEspacios`, `selectEspacio`, `escanearEspacio`, `Crear`, `Obtener`, `Listar`, `Cerrar` y `EsParticipante`.
+3. `make lint`
+4. Commit: `git add . && git commit -m "Paso 26: repositorio de espacios"`
+
+---
+
+## 7. Preparación para las próximas entregas
+
+- **La visibilidad filtrada en SQL** mantiene las respuestas pequeñas aunque crezca el número de espacios. Si hiciera falta, un índice sobre `vinculaciones(espacio_id, usuario_id)` acelera el `EXISTS` (ya existen índices por `usuario_id` y por `espacio_id`).
+
+---
+
+## 8. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-03.1 / RN-06 Cursos y proyectos | `Espacio` con `TipoEspacio`. |
-| RF-03.3 Información mínima | Campos de la entidad. |
-| RF-03.5 / RN-08 Cerrar | `EstadoEspacio`. |
-| RF-03.7 / RN-09 Sin registros en espacios cerrados | `PermiteRegistros`. |
-| RF-12 Visibilidad | `FiltroEspacios.VisiblePara`. |
+| RF-03.1 Crear cursos y proyectos | `Crear`. |
+| RF-03.4 / RF-11.1 Consultar sus espacios | `Listar` con `VisiblePara`. |
+| RF-03.5 Cerrar | `Cerrar`, sin doble cierre. |
+| RF-12 Visibilidad | Filtro por profesor o participación en SQL. |
