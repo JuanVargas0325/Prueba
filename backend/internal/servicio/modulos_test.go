@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"seguimiento/internal/apperr"
 	"seguimiento/internal/auth"
@@ -17,6 +18,15 @@ func esperarTipo(t *testing.T, err error, tipo apperr.Tipo) {
 	if !apperr.Es(err, tipo) {
 		t.Fatalf("se esperaba un error %s, se obtuvo %v", tipo, err)
 	}
+}
+
+func fechaP(t *testing.T, texto string) time.Time {
+	t.Helper()
+	f, err := dominio.ParsearFecha(texto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
 }
 
 // --- usuarios ------------------------------------------------------------------------
@@ -131,4 +141,58 @@ func TestAsignarRoles(t *testing.T) {
 
 	_, err = s.Obtener(ctx, monitor, "u1")
 	esperarTipo(t, err, apperr.TipoNoEncontrado) // un usuario solo se ve a sí mismo
+}
+
+// --- períodos -------------------------------------------------------------------------
+
+type repoPeriodosFalso struct {
+	periodos map[string]dominio.PeriodoAcademico
+}
+
+func (r *repoPeriodosFalso) Crear(_ context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error) {
+	p.ID = "p-" + p.Codigo
+	r.periodos[p.ID] = p
+	return p, nil
+}
+
+func (r *repoPeriodosFalso) Obtener(_ context.Context, id string) (dominio.PeriodoAcademico, error) {
+	p, ok := r.periodos[id]
+	if !ok {
+		return p, apperr.NoEncontrado("período no encontrado")
+	}
+	return p, nil
+}
+
+func (r *repoPeriodosFalso) Listar(context.Context, dominio.FiltroPeriodos) ([]dominio.PeriodoAcademico, error) {
+	return nil, nil
+}
+
+func (r *repoPeriodosFalso) Actualizar(_ context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error) {
+	r.periodos[p.ID] = p
+	return p, nil
+}
+
+func TestPeriodos(t *testing.T) {
+	repo := &repoPeriodosFalso{periodos: map[string]dominio.PeriodoAcademico{}}
+	s := NuevoPeriodos(repo, logPrueba)
+	ctx := context.Background()
+
+	p, err := s.Crear(ctx, admin, NuevoPeriodo{Codigo: "2026-20", FechaInicio: fechaP(t, "2026-08-01"), FechaCierre: fechaP(t, "2026-12-15"), CreacionHabilitada: true})
+	if err != nil || p.Estado != dominio.PeriodoActivo {
+		t.Fatalf("período inesperado: %+v %v", p, err)
+	}
+	_, err = s.Crear(ctx, profesor, NuevoPeriodo{Codigo: "2026-20"})
+	esperarTipo(t, err, apperr.TipoProhibido)
+	_, err = s.Crear(ctx, admin, NuevoPeriodo{Codigo: "2026", FechaInicio: fechaP(t, "2026-08-01"), FechaCierre: fechaP(t, "2026-12-15")})
+	esperarTipo(t, err, apperr.TipoValidacion)
+	_, err = s.Crear(ctx, admin, NuevoPeriodo{Codigo: "2026-10", FechaInicio: fechaP(t, "2026-08-01"), FechaCierre: fechaP(t, "2026-07-01")})
+	esperarTipo(t, err, apperr.TipoValidacion)
+
+	cerrado := dominio.PeriodoCerrado
+	actualizado, err := s.Actualizar(ctx, admin, p.ID, CambiosPeriodo{Estado: &cerrado})
+	if err != nil || actualizado.CreacionHabilitada {
+		t.Errorf("cerrar el período debe deshabilitar la creación: %+v %v", actualizado, err)
+	}
+	_, err = s.Actualizar(ctx, admin, p.ID, CambiosPeriodo{})
+	esperarTipo(t, err, apperr.TipoValidacion)
 }

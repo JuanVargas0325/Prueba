@@ -1,130 +1,165 @@
-# Paso 22 · Repositorio de períodos
+# Paso 23 · Servicio de períodos
 
-> Rama `paso-a-paso` · paso 22 de 65 · anterior: **Paso 21 · Dominio de períodos** · siguiente: **Paso 23 · Servicio de períodos**
+> Rama `paso-a-paso` · paso 23 de 65 · anterior: **Paso 22 · Repositorio de períodos** · siguiente: **Paso 24 · Endpoints de períodos**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el repositorio que guarda y lee los períodos académicos en la tabla `periodos_academicos` (creada en el paso 4).
+Se creó el caso de uso de los períodos académicos: el **administrador** los crea y los actualiza (cerrar o reabrir; abrir o cerrar la ventana de creación) y **cualquier usuario autenticado** puede consultarlos.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/repositorio/periodos.go` | **Nuevo.** `Crear`, `Obtener`, `Listar` y `Actualizar`. |
-| `backend/internal/repositorio/comun.go` | **Modificado.** Constantes `recursoPeriodo` y `recursoPeriodos` para los mensajes de error. |
+| `backend/internal/servicio/periodos.go` | **Nuevo.** Servicio `Periodos` con `Crear`, `Listar`, `Obtener` y `Actualizar`. |
+| `backend/internal/servicio/modulos_test.go` | **Modificado.** Auxiliar `fechaP`, repositorio falso de períodos y `TestPeriodos`. |
 
 ---
 
 ## 2. Por qué
 
-El servicio de períodos (paso 23) necesita persistirlos. Siguiendo la arquitectura en capas, **solo** el repositorio escribe SQL.
+- **RF-03.2** exige que los períodos se gestionen de forma explícita (código, fechas, estado). Alguien tiene que crearlos: el administrador, que es quien gestiona la estructura académica.
+- Los profesores necesitan **consultarlos** para elegir en qué período crean un curso (paso 28), por eso la lectura está abierta a todos los usuarios autenticados.
+- **RN-07:** la ventana de creación se controla con `CreacionHabilitada`.
 
 ---
 
 ## 3. Explicación detallada de `periodos.go`
 
 ```go
-type Periodos struct {
-	db *pgxpool.Pool
+type RepositorioPeriodos interface {
+	Crear(ctx context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error)
+	Obtener(ctx context.Context, id string) (dominio.PeriodoAcademico, error)
+	Listar(ctx context.Context, f dominio.FiltroPeriodos) ([]dominio.PeriodoAcademico, error)
+	Actualizar(ctx context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error)
 }
 
-func NuevoPeriodos(db *pgxpool.Pool) *Periodos { return &Periodos{db: db} }
+type NuevoPeriodo struct {
+	Codigo             string
+	FechaInicio        time.Time
+	FechaCierre        time.Time
+	CreacionHabilitada bool
+}
 
-const columnasPeriodo = `id, codigo, fecha_inicio, fecha_cierre, estado, creacion_habilitada, creado_en`
-```
-- Mismo esqueleto que el repositorio de usuarios (paso 13).
-- `columnasPeriodo` evita repetir la lista de columnas en cada consulta y garantiza que siempre coincida con el orden de `escanearPeriodo`.
-
-```go
-func escanearPeriodo(fila pgx.Row) (dominio.PeriodoAcademico, error) {
-	var p dominio.PeriodoAcademico
-	var estado string
-	err := fila.Scan(&p.ID, &p.Codigo, &p.FechaInicio, &p.FechaCierre, &estado, &p.CreacionHabilitada, &p.CreadoEn)
-	p.Estado = dominio.EstadoPeriodo(estado)
-	return p, err
+type CambiosPeriodo struct {
+	Estado             *dominio.EstadoPeriodo
+	CreacionHabilitada *bool
 }
 ```
-- pgx convierte las columnas `DATE` en `time.Time` a medianoche UTC, exactamente la representación de fechas del dominio (paso 20).
-- El estado se lee como `string` y se convierte al tipo del dominio.
+- `CambiosPeriodo` usa **punteros** para expresar "opcional": `nil` significa "no cambiar ese campo". Sin punteros no se podría distinguir entre "no envió `creacion_habilitada`" y "envió `false`", porque el valor cero de un `bool` es `false`. Es la forma habitual en Go de modelar actualizaciones parciales (como un `PATCH` HTTP).
+
+### `Crear`
 
 ```go
-func (r *Periodos) Crear(ctx context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error) {
-	creado, err := escanearPeriodo(r.db.QueryRow(ctx,
-		`INSERT INTO periodos_academicos (codigo, fecha_inicio, fecha_cierre, estado, creacion_habilitada)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING `+columnasPeriodo,
-		p.Codigo, p.FechaInicio, p.FechaCierre, string(p.Estado), p.CreacionHabilitada))
-	if esViolacionUnica(err) {
-		return creado, apperr.Conflicto("ya existe el período %s", p.Codigo)
+func (s *Periodos) Crear(ctx context.Context, actor auth.Actor, n NuevoPeriodo) (dominio.PeriodoAcademico, error) {
+	if err := exigirRol(actor, dominio.RolAdministrador); err != nil {
+		return dominio.PeriodoAcademico{}, err
 	}
-	return creado, traducir(err, recursoPeriodo)
-}
-```
-- `INSERT ... RETURNING <columnas>` inserta y devuelve la fila completa en un solo viaje a la base de datos.
-- El código del período es único (`codigo TEXT NOT NULL UNIQUE`): crear dos veces `2026-20` → **409** con un mensaje específico.
-
-```go
-func (r *Periodos) Listar(ctx context.Context, f dominio.FiltroPeriodos) ([]dominio.PeriodoAcademico, error) {
-	var w filtro
-	if f.Estado != "" {
-		w.agregar("estado = ?", string(f.Estado))
+	p := dominio.PeriodoAcademico{
+		Codigo:             strings.TrimSpace(n.Codigo),
+		FechaInicio:        n.FechaInicio,
+		FechaCierre:        n.FechaCierre,
+		Estado:             dominio.PeriodoActivo,
+		CreacionHabilitada: n.CreacionHabilitada,
 	}
-	sql := `SELECT ` + columnasPeriodo + ` FROM periodos_academicos` + w.where() +
-		` ORDER BY fecha_inicio DESC` + w.paginar(f.Paginacion)
+	if err := dominio.ValidarCodigoPeriodo(p.Codigo); err != nil { ... }
+	if err := p.ValidarFechas(); err != nil { ... }
+	creado, err := s.repo.Crear(ctx, p)
 	...
 }
 ```
-- Filtro opcional por estado, del período más reciente al más antiguo, paginado.
+- Todo período nace **activo**. Las validaciones son las del dominio (paso 21).
+
+### `Listar` y `Obtener`
 
 ```go
-func (r *Periodos) Actualizar(ctx context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error) {
-	actualizado, err := escanearPeriodo(r.db.QueryRow(ctx,
-		`UPDATE periodos_academicos SET estado = $2, creacion_habilitada = $3
-		 WHERE id = $1 RETURNING `+columnasPeriodo,
-		p.ID, string(p.Estado), p.CreacionHabilitada))
-	return actualizado, traducir(err, recursoPeriodo)
+func (s *Periodos) Listar(ctx context.Context, _ auth.Actor, f dominio.FiltroPeriodos) ([]dominio.PeriodoAcademico, error) {
+	if f.Estado != "" && !f.Estado.EsValido() {
+		return nil, apperr.Validacion("estado inválido: use activo o cerrado")
+	}
+	return s.repo.Listar(ctx, f)
 }
 ```
-- Solo se pueden cambiar el **estado** y la **ventana de creación**. El código y las fechas no se modifican después de creado el período (los cursos ya creados dependen de ellas).
-- Si el `id` no existe, `RETURNING` no devuelve filas → `pgx.ErrNoRows` → `traducir` lo convierte en 404.
+- No exigen rol: el actor se recibe por **uniformidad** con el resto de servicios (todos reciben el actor), pero no se usa (`_`).
+
+### `Actualizar`
+
+```go
+func (s *Periodos) Actualizar(ctx context.Context, actor auth.Actor, id string, c CambiosPeriodo) (dominio.PeriodoAcademico, error) {
+	if err := exigirRol(actor, dominio.RolAdministrador); err != nil { ... }
+	if c.Estado == nil && c.CreacionHabilitada == nil {
+		return dominio.PeriodoAcademico{}, apperr.Validacion("indique estado o creacion_habilitada")
+	}
+	p, err := s.repo.Obtener(ctx, id)
+	...
+	if c.Estado != nil {
+		if !c.Estado.EsValido() { ... }
+		p.Estado = *c.Estado
+	}
+	if c.CreacionHabilitada != nil {
+		p.CreacionHabilitada = *c.CreacionHabilitada
+	}
+	if p.Estado == dominio.PeriodoCerrado {
+		p.CreacionHabilitada = false
+	}
+	actualizado, err := s.repo.Actualizar(ctx, p)
+	...
+}
+```
+- Patrón **leer → modificar → guardar**: se obtiene el período, se aplican solo los cambios enviados y se guarda.
+- `*c.Estado` **desreferencia** el puntero: obtiene el valor al que apunta.
+- **Regla de consistencia:** un período **cerrado** no puede tener la ventana de creación abierta; al cerrarlo, se cierra también la ventana.
 
 ---
 
-## 4. Conceptos de este paso
+## 4. Las pruebas
+
+```go
+func fechaP(t *testing.T, texto string) time.Time { ... }
+```
+- Auxiliar para escribir fechas legibles (como `fecha` en el dominio, paso 20).
+
+`repoPeriodosFalso` guarda los períodos en un mapa. `TestPeriodos` verifica:
+- el administrador crea un período, que queda **activo**;
+- un profesor no puede crear (403);
+- código `2026` (sin `-NN`) → 400;
+- cierre anterior al inicio → 400;
+- **cerrar el período deshabilita la creación**;
+- una actualización sin cambios → 400.
+
+---
+
+## 5. Conceptos de Go de este paso
 
 | Concepto | Explicación |
 |---|---|
-| `INSERT/UPDATE ... RETURNING` | PostgreSQL devuelve las filas afectadas, sin otra consulta. |
-| Lista de columnas compartida | Una constante para que la consulta y el `Scan` no se desalineen. |
-| Conversión de tipos | `string(p.Estado)` al escribir, `dominio.EstadoPeriodo(estado)` al leer. |
+| Punteros como "opcional" | `*bool` distingue "no enviado" (`nil`) de `false`. |
+| Desreferenciar | `*p` obtiene el valor apuntado por `p`. |
+| Leer-modificar-guardar | Patrón para actualizaciones parciales. |
 
 ---
 
-## 5. Cómo comprobarlo
+## 6. Cómo comprobarlo
 
 ```bash
-make lint
+cd backend
+go test ./internal/servicio/ -v -run TestPeriodos
 ```
 
-Se ejercita por HTTP en el paso 24 y con pruebas automáticas contra PostgreSQL en el paso 58.
+---
+
+## 7. Pasos para lograr esta versión desde el paso 22
+
+1. Crear `backend/internal/servicio/periodos.go` con `RepositorioPeriodos`, `NuevoPeriodo`, `CambiosPeriodo`, `Periodos`, `NuevoPeriodos`, `Crear`, `Listar`, `Obtener` y `Actualizar`.
+2. En `modulos_test.go`: agregar `fechaP` (debajo de `esperarTipo`) y, después de la sección de usuarios, la sección `// --- períodos ---` con `repoPeriodosFalso` y `TestPeriodos`.
+3. `make pruebas lint`
+4. Commit: `git add . && git commit -m "Paso 23: servicio de períodos"`
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 21
-
-1. En `repositorio/comun.go`, agregar al bloque de constantes:
-   ```go
-   recursoPeriodo  = "período"
-   recursoPeriodos = "períodos"
-   ```
-2. Crear `backend/internal/repositorio/periodos.go` con `Periodos`, `NuevoPeriodos`, `columnasPeriodo`, `escanearPeriodo`, `Crear`, `Obtener`, `Listar` y `Actualizar`.
-3. `make lint`
-4. Commit: `git add . && git commit -m "Paso 22: repositorio de períodos"`
-
----
-
-## 7. Requisitos que atiende
+## 8. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-03.2 Períodos explícitos | Persistencia de código, fechas, estado y ventana de creación. |
-| RNF-04 Persistencia | Tabla `periodos_academicos`. |
+| RF-03.2 Períodos académicos | Creación y consulta con código, fechas y estado. |
+| RN-07 Ventana de creación | `CreacionHabilitada`, que se cierra junto con el período. |
+| RF-15 Administración | Solo el administrador crea y modifica períodos. |
