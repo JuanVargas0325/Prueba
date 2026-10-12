@@ -18,6 +18,7 @@ type Dependencias struct {
 	Autenticacion ServicioAutenticacion
 	Usuarios      ServicioUsuarios
 	Periodos      ServicioPeriodos
+	Espacios      ServicioEspacios
 
 	Tokens ValidadorTokens
 	Salud  map[string]ComprobadorSalud
@@ -58,6 +59,7 @@ func NuevoRouter(d Dependencias) *gin.Engine {
 		autenticacion,
 		&HandlerUsuarios{servicio: d.Usuarios, log: d.Log},
 		&HandlerPeriodos{servicio: d.Periodos, log: d.Log},
+		&HandlerEspacios{servicio: d.Espacios, log: d.Log},
 	}
 	for _, m := range modulos {
 		m.Registrar(protegidas)

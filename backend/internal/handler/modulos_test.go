@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"seguimiento/internal/apperr"
 	"seguimiento/internal/auth"
 	"seguimiento/internal/dominio"
 	"seguimiento/internal/servicio"
@@ -87,4 +88,41 @@ func TestPeriodos(t *testing.T) {
 		t.Errorf("cambios inesperados: %+v", srv.cambios)
 	}
 	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/periodos", e.token(t, dominio.RolMonitor), ""), http.StatusOK)
+}
+
+type servicioEspaciosFalso struct{ nuevo servicio.NuevoEspacio }
+
+func (s *servicioEspaciosFalso) Crear(_ context.Context, _ auth.Actor, n servicio.NuevoEspacio) (dominio.Espacio, error) {
+	s.nuevo = n
+	return dominio.Espacio{ID: uuidA, Estado: dominio.EspacioActivo}, nil
+}
+
+func (s *servicioEspaciosFalso) Listar(context.Context, auth.Actor, dominio.FiltroEspacios) ([]dominio.Espacio, error) {
+	return nil, nil
+}
+
+func (s *servicioEspaciosFalso) Obtener(context.Context, auth.Actor, string) (dominio.Espacio, error) {
+	return dominio.Espacio{}, apperr.NoEncontrado("curso o proyecto no encontrado")
+}
+
+func (s *servicioEspaciosFalso) Cerrar(context.Context, auth.Actor, string) (dominio.Espacio, error) {
+	return dominio.Espacio{ID: uuidA, Estado: dominio.EspacioCerrado}, nil
+}
+
+func TestEspacios(t *testing.T) {
+	srv := &servicioEspaciosFalso{}
+	e := nuevoEntorno(t, func(d *Dependencias) { d.Espacios = srv })
+	profesor := e.token(t, dominio.RolProfesor)
+
+	esperarEstado(t, e.peticion(http.MethodPost, "/api/v1/espacios", profesor,
+		`{"tipo":"curso","nombre":"Nube","periodo_id":"`+uuidB+`","fecha_inicio":"2026-08-03","fecha_cierre":"2026-12-04"}`), http.StatusCreated)
+	if srv.nuevo.PeriodoID != uuidB || srv.nuevo.Tipo != dominio.EspacioCurso {
+		t.Errorf("datos recibidos inesperados: %+v", srv.nuevo)
+	}
+	w := e.peticion(http.MethodPost, "/api/v1/espacios/"+uuidA+"/cerrar", profesor, "")
+	esperarEstado(t, w, http.StatusOK)
+	if !strings.Contains(w.Body.String(), `"solo_lectura":true`) {
+		t.Errorf("un espacio cerrado debe indicarse como solo lectura: %s", w.Body.String())
+	}
+	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/espacios/"+uuidA, e.token(t, dominio.RolMonitor), ""), http.StatusNotFound)
 }

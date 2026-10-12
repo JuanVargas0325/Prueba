@@ -21,3 +21,9 @@ type usuarioJSON struct {
 func aUsuarioJSON(u dominio.Usuario) usuarioJSON {
 	return usuarioJSON{ID: u.ID, Nombre: u.Nombre, Correo: u.Correo, Activo: u.Activo, Roles: rolesTexto(u.Roles), CreadoEn: u.CreadoEn}
 }
+
+type personaRef struct {
+	ID     string `json:"id"`
+	Nombre string `json:"nombre"`
+	Correo string `json:"correo,omitempty"`
+}

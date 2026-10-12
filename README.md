@@ -1,208 +1,180 @@
-# Paso 28 · Servicio de espacios
+# Paso 29 · Endpoints de espacios
 
-> Rama `paso-a-paso` · paso 28 de 65 · anterior: **Paso 27 · Reloj inyectable** · siguiente: **Paso 29 · Endpoints de espacios**
+> Rama `paso-a-paso` · paso 29 de 65 · anterior: **Paso 28 · Servicio de espacios** · siguiente: **Paso 30 · Dominio: vinculaciones y reglas de horas**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el caso de uso de **cursos y proyectos**: el profesor los crea dentro de un período habilitado, todos consultan los que les corresponden y el profesor responsable (o el administrador) los cierra.
+Cursos y proyectos se gestionan por HTTP:
+
+| Método | Ruta | Rol | Descripción |
+|---|---|---|---|
+| POST | `/api/v1/espacios` | profesor | Crea un curso o proyecto en un período habilitado. |
+| GET | `/api/v1/espacios` | todos | Lista los espacios visibles. Filtros: `?periodo_id=`, `?estado=`, `?tipo=`. |
+| GET | `/api/v1/espacios/{id}` | todos (si lo puede ver) | Detalle; los cerrados traen `"solo_lectura": true`. |
+| POST | `/api/v1/espacios/{id}/cerrar` | profesor responsable o administrador | Cierra el espacio. |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/servicio/espacios.go` | **Nuevo.** Servicio `Espacios` con `Crear`, `Listar`, `Obtener` y `Cerrar`. |
-| `backend/internal/servicio/acceso.go` | **Modificado.** Reglas de visibilidad por profesor: `esProfesorResponsable`, `puedeVerDeProfesor` y `visiblePara`. |
-| `backend/internal/servicio/modulos_test.go` | **Modificado.** Repositorio falso de espacios y dos pruebas. |
-| `backend/internal/servicio/autenticacion_test.go` | **Modificado.** Agrega el actor `otroProf` y el instante fijo `ahoraPrueba` (miércoles 14 de octubre de 2026). |
+| `backend/internal/handler/espacios.go` | **Nuevo.** Módulo de espacios. |
+| `backend/internal/handler/formatos.go` | **Modificado.** `personaRef`: referencia corta a una persona (id, nombre y correo opcional). |
+| `backend/internal/handler/respuestas.go` | **Modificado.** `consultaUUID` y `validarUUIDOpcional`. |
+| `backend/internal/handler/router.go` | **Modificado.** Servicio `Espacios` y su módulo. |
+| `backend/internal/handler/router_test.go` | **Modificado.** Constante `uuidB` y caso "un monitor no crea espacios". |
+| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso de espacios y `TestEspacios`. |
+| `backend/cmd/api/main.go` | **Modificado.** Repositorio de espacios, el **reloj** de la aplicación y el servicio de espacios. |
+
+```bash
+curl -s -X POST localhost:8080/api/v1/espacios -H "Authorization: Bearer $TOKEN_PROFESOR" -H 'Content-Type: application/json' \
+  -d '{"tipo":"curso","nombre":"Desarrollo en la nube","periodo_id":"<id del período>","fecha_inicio":"2026-08-03","fecha_cierre":"2026-12-04"}'
+# {"id":"372c...","tipo":"curso","nombre":"Desarrollo en la nube",
+#  "periodo":{"id":"8e99...","codigo":"2026-20"},"profesor":{"id":"4ed2...","nombre":"Carolina Rojas"},
+#  "fecha_inicio":"2026-08-03","fecha_cierre":"2026-12-04","observaciones":"","estado":"activo","solo_lectura":false,...}
+```
 
 ---
 
 ## 2. Por qué
 
-- **RF-03.1 y RF-03.2:** solo un profesor crea espacios, y solo en un período habilitado (reglas del dominio, paso 21).
-- **RF-03.4, RF-03.6 y RF-11.1:** cada usuario consulta sus espacios; un monitor ve aquellos en los que está vinculado.
-- **RF-03.5:** solo el profesor **responsable** cierra su espacio (o el administrador).
-- **RF-12 / RN-03 a RN-05:** la visibilidad se decide en el servicio con reglas reutilizables.
+- **RF-03.1 a RF-03.7** quedan disponibles por la API.
+- **`POST /espacios/{id}/cerrar` en lugar de `PATCH` con `estado`:** cerrar es una **acción** con reglas propias (solo el responsable, no se puede reabrir), no la edición de un campo cualquiera. Un endpoint de acción lo deja explícito.
+- **`solo_lectura`:** RF-03.6 pide que los espacios cerrados se puedan consultar "en modo de solo lectura". El campo le dice al cliente (el frontend de la Entrega 2) que no debe ofrecer acciones de edición.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Reglas de visibilidad (`acceso.go`)
+### 3.1 Registro de rutas
 
 ```go
-func esProfesorResponsable(actor auth.Actor, profesorID string) bool {
-	return actor.TieneRol(dominio.RolProfesor) && actor.UsuarioID == profesorID
-}
-
-func puedeVerDeProfesor(actor auth.Actor, profesorID string) bool {
-	return actor.EsAdministrador() || esProfesorResponsable(actor, profesorID)
-}
-
-func visiblePara(actor auth.Actor) string {
-	if actor.EsAdministrador() {
-		return ""
-	}
-	return actor.UsuarioID
+func (h *HandlerEspacios) Registrar(g *gin.RouterGroup) {
+	r := g.Group("/espacios")
+	r.GET("", h.Listar)
+	r.GET("/:id", h.Obtener)
+	r.POST("", RequiereRol(dominio.RolProfesor), h.Crear)
+	r.POST("/:id/cerrar", RequiereRol(dominio.RolProfesor, dominio.RolAdministrador), h.Cerrar)
 }
 ```
-- **RN-03:** un profesor ve lo de sus espacios. **RN-05:** el administrador ve todo.
-- `puedeVerDeProfesor` responde "¿este actor puede ver un recurso que pertenece a tal profesor?". Se reutilizará en vinculaciones, tareas y reportes.
-- `visiblePara` produce el valor del campo `VisiblePara` de los filtros (paso 25): vacío para el administrador (sin restricción) y el propio ID para los demás. El repositorio hace el resto en SQL (paso 26).
+- La lectura no exige rol en el router: la visibilidad la decide el servicio (paso 28).
 
-### 3.2 Dependencias del servicio
+### 3.2 Formato de salida
 
 ```go
-type RepositorioEspacios interface {
-	Crear(ctx context.Context, e dominio.Espacio) (dominio.Espacio, error)
-	Obtener(ctx context.Context, id string) (dominio.Espacio, error)
-	Listar(ctx context.Context, f dominio.FiltroEspacios) ([]dominio.Espacio, error)
-	Cerrar(ctx context.Context, id string) (dominio.Espacio, error)
-	EsParticipante(ctx context.Context, espacioID, usuarioID string) (bool, error)
+type espacioJSON struct {
+	ID            string                `json:"id"`
+	Tipo          dominio.TipoEspacio   `json:"tipo"`
+	Nombre        string                `json:"nombre"`
+	Periodo       periodoRef            `json:"periodo"`
+	Profesor      personaRef            `json:"profesor"`
+	FechaInicio   string                `json:"fecha_inicio"`
+	FechaCierre   string                `json:"fecha_cierre"`
+	Observaciones string                `json:"observaciones"`
+	Estado        dominio.EstadoEspacio `json:"estado"`
+	SoloLectura   bool                  `json:"solo_lectura"`
+	CreadoEn      time.Time             `json:"creado_en"`
 }
 
-type LectorPeriodos interface {
-	Obtener(ctx context.Context, id string) (dominio.PeriodoAcademico, error)
-}
-
-type Espacios struct {
-	repo     RepositorioEspacios
-	periodos LectorPeriodos
-	reloj    Reloj
-	log      *slog.Logger
+type periodoRef struct {
+	ID     string `json:"id"`
+	Codigo string `json:"codigo"`
 }
 ```
-- `LectorPeriodos`: de los períodos solo necesita **leer uno**; se declara una interfaz de un solo método. El repositorio de períodos (paso 22) la cumple.
-- Recibe el `Reloj` (paso 27) para saber qué día es hoy.
+- **Objetos anidados** para las referencias: `"periodo": {"id", "codigo"}` y `"profesor": {"id", "nombre"}`. El cliente obtiene lo que necesita para mostrar ("2026-20", "Carolina Rojas") y el ID por si quiere más detalle.
+- `personaRef` va en `formatos.go` porque la reutilizarán vinculaciones, tareas y seguimiento:
+  ```go
+  type personaRef struct {
+  	ID     string `json:"id"`
+  	Nombre string `json:"nombre"`
+  	Correo string `json:"correo,omitempty"`
+  }
+  ```
+  `omitempty`: si el correo está vacío, el campo **no aparece** en el JSON.
+- `SoloLectura: e.Estado == dominio.EspacioCerrado` se calcula al convertir.
 
-### 3.3 `Crear`
+### 3.3 Validar identificadores que llegan en el cuerpo o la consulta
 
 ```go
-func (s *Espacios) Crear(ctx context.Context, actor auth.Actor, n NuevoEspacio) (dominio.Espacio, error) {
-	if err := exigirRol(actor, dominio.RolProfesor); err != nil { ... }
-	if !n.Tipo.EsValido() {
-		return dominio.Espacio{}, apperr.Validacion("tipo inválido: use curso o proyecto")
+func consultaUUID(c *gin.Context, nombre string) (string, error) {
+	return validarUUIDOpcional(nombre, c.Query(nombre))
+}
+
+func validarUUIDOpcional(nombre, valor string) (string, error) {
+	if valor == "" {
+		return "", nil
 	}
-	nombre, err := dominio.Texto("el nombre", n.Nombre, true, dominio.LongitudMaxNombre)
-	...
-	observaciones, err := dominio.Texto("las observaciones", n.Observaciones, false, dominio.LongitudMaxObservaciones)
-	...
-	periodo, err := s.periodos.Obtener(ctx, n.PeriodoID)
-	if apperr.Es(err, apperr.TipoNoEncontrado) {
-		return dominio.Espacio{}, apperr.Validacion("el período académico indicado no existe")
+	if _, err := uuid.Parse(valor); err != nil {
+		return "", apperr.Validacion("%s debe ser un identificador válido", nombre)
 	}
-	...
-	if err := periodo.PermiteCrearEspacios(s.reloj.Hoy()); err != nil { ... }
-	e := dominio.Espacio{
-		Tipo: n.Tipo, Nombre: nombre, PeriodoID: periodo.ID, ProfesorID: actor.UsuarioID,
-		FechaInicio: n.FechaInicio, FechaCierre: n.FechaCierre, Observaciones: observaciones,
-		Estado: dominio.EspacioActivo,
-	}
-	if err := e.ValidarFechasEnPeriodo(periodo); err != nil { ... }
-	creado, err := s.repo.Crear(ctx, e)
-	...
+	return valor, nil
 }
 ```
-- El **profesor responsable es siempre quien lo crea** (`ProfesorID: actor.UsuarioID`); no se puede crear un curso a nombre de otro.
-- Un período inexistente se informa como **dato inválido** (400) y no como 404: el recurso que se está creando es el espacio; el período es un dato de la petición.
-- `PermiteCrearEspacios(s.reloj.Hoy())`: período activo, ventana habilitada y no terminado (RF-03.2, RN-07) → si no, **422**.
-- Las fechas deben caber dentro del período.
+- `parametroUUID` (paso 19) valida parámetros de **ruta**, que son obligatorios. Estos validan IDs **opcionales**: en la consulta (`?periodo_id=`) o dentro del JSON (`"periodo_id"` en `Crear`). Vacío está bien; un texto que no es UUID → 400.
 
-### 3.4 `Listar`, `Obtener` y `Cerrar`
+### 3.4 `main.go`
 
 ```go
-func (s *Espacios) Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroEspacios) ([]dominio.Espacio, error) {
-	... validar estado y tipo ...
-	f.VisiblePara = visiblePara(actor)
-	return s.repo.Listar(ctx, f)
-}
+	reloj := servicio.NuevoReloj(cfg.ZonaHoraria)
+	...
+		Espacios: servicio.NuevoEspacios(espacios, periodos, reloj, log),
 ```
-- **El servicio sobrescribe `VisiblePara`.** Aunque el cliente intentara mandar otro valor, no puede: el filtro de visibilidad lo decide el servicio a partir del actor.
+- Se crea **el** reloj de la aplicación con `APP_ZONA_HORARIA` (paso 1). Todos los servicios que dependen de la fecha lo compartirán.
+- El servicio de espacios recibe el repositorio de períodos como su `LectorPeriodos`.
 
-```go
-func (s *Espacios) Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Espacio, error) {
-	e, err := s.repo.Obtener(ctx, id)
-	...
-	if puedeVerDeProfesor(actor, e.ProfesorID) {
-		return e, nil
-	}
-	participa, err := s.repo.EsParticipante(ctx, id, actor.UsuarioID)
-	...
-	if !participa {
-		return dominio.Espacio{}, noEncontrado("curso o proyecto")
-	}
-	return e, nil
-}
-```
-- Pueden verlo su profesor, el administrador o quien participe en él. A los demás se les responde **404** (no se revela que existe).
-- **RF-03.6:** un espacio cerrado se sigue consultando; el handler (paso 29) lo marcará como "solo lectura".
+### 3.5 Pruebas
 
-```go
-func (s *Espacios) Cerrar(ctx context.Context, actor auth.Actor, id string) (dominio.Espacio, error) {
-	e, err := s.Obtener(ctx, actor, id)
-	...
-	if !puedeVerDeProfesor(actor, e.ProfesorID) {
-		return dominio.Espacio{}, apperr.Prohibido("solo el profesor responsable puede cerrar el %s", e.Tipo)
-	}
-	cerrado, err := s.repo.Cerrar(ctx, id)
-	...
-}
-```
-- Primero se verifica que pueda **verlo** (si no, 404); después que sea el **responsable** (si no, 403). Un monitor vinculado ve el curso, pero no puede cerrarlo.
+- `TestControlDeAccesoPorRol`: un monitor no puede crear espacios (403).
+- `TestEspacios` (handler):
+  - crear un curso pasa al servicio el `periodo_id` y el tipo;
+  - cerrar devuelve `"solo_lectura":true`;
+  - un `apperr.NoEncontrado` del servicio se traduce en **404**.
+- `uuidB` es un segundo UUID fijo para las pruebas.
 
 ---
 
-## 4. Las pruebas
-
-`repoEspaciosFalso` guarda espacios en un mapa y **registra el último filtro recibido** (`r.filtro`), para comprobar qué visibilidad aplicó el servicio. `entornoEspacios` arma el servicio con un período `2026-20` habilitado y un reloj fijo (`RelojFijo(ahoraPrueba, time.UTC)`).
-
-| Prueba | Qué verifica |
-|---|---|
-| `TestCrearEspacio` | El profesor crea un espacio activo a su nombre. Un monitor no puede (403). Fechas fuera del período (400). Período inexistente (400). Período con la ventana cerrada (422, RF-03.2). |
-| `TestVisibilidadYCierreDeEspacios` | Un monitor lista con `VisiblePara = "mon-1"`; el administrador sin restricción. Un monitor que no participa recibe 404; si participa, lo ve. Un monitor no puede cerrar (403); otro profesor tampoco, aunque participe (403); el responsable sí. |
-
-`otroProf` y `ahoraPrueba` se agregaron al bloque de dobles compartidos de `autenticacion_test.go` (se trasladará a `reportes_test.go` en el paso 48).
-
----
-
-## 5. Conceptos de este paso
+## 4. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Interfaz de un método | `LectorPeriodos`: se pide lo mínimo necesario. |
-| Visibilidad decidida por el servidor | El servicio fija `VisiblePara`; el cliente no puede cambiarlo. |
-| 404 antes que 403 | Primero "¿puede verlo?" (404), luego "¿puede modificarlo?" (403). |
-| Dobles que registran | El repositorio falso guarda el filtro recibido para verificarlo. |
+| Endpoint de acción | `POST /recurso/{id}/accion` para operaciones con reglas propias. |
+| Objetos anidados en JSON | Structs dentro de structs (`periodoRef`, `personaRef`). |
+| `omitempty` | El campo se omite del JSON si tiene su valor cero. |
+| Campos calculados | `solo_lectura` se deriva del estado al responder. |
 
 ---
 
-## 6. Cómo comprobarlo
+## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/servicio/ -v -run 'Espacio'
+make pruebas
+docker compose up --build -d --wait
 ```
 
----
-
-## 7. Pasos para lograr esta versión desde el paso 27
-
-1. En `servicio/acceso.go`: `esProfesorResponsable`, `puedeVerDeProfesor` y `visiblePara`.
-2. Crear `backend/internal/servicio/espacios.go` con `RepositorioEspacios`, `LectorPeriodos`, `NuevoEspacio`, `Espacios`, `NuevoEspacios`, `Crear`, `Listar`, `Obtener` y `Cerrar`.
-3. En `autenticacion_test.go`, agregar al bloque `var (...)` los dobles `otroProf` y `ahoraPrueba`.
-4. En `modulos_test.go`, después de períodos, la sección `// --- espacios ---` con `repoEspaciosFalso`, `entornoEspacios`, `TestCrearEspacio` y `TestVisibilidadYCierreDeEspacios`.
-5. `make pruebas lint`
-6. Commit: `git add . && git commit -m "Paso 28: servicio de espacios"`
+1. Con el token del administrador: crear un usuario con rol `profesor` (paso 19) y un período (paso 24).
+2. Iniciar sesión como el profesor y crear un curso (ejemplo de la sección 1).
+3. `POST /api/v1/espacios/<id>/cerrar` → `"estado":"cerrado","solo_lectura":true`; repetir → **409**.
+4. Con el administrador, `PATCH /api/v1/periodos/<id>` con `{"creacion_habilitada":false}`; crear otro curso → **422** "el período 2026-20 no está habilitado para crear cursos o proyectos".
 
 ---
 
-## 8. Requisitos que atiende
+## 6. Pasos para lograr esta versión desde el paso 28
+
+1. En `formatos.go`: `personaRef`.
+2. En `respuestas.go`: `consultaUUID` y `validarUUIDOpcional`.
+3. Crear `backend/internal/handler/espacios.go` (interfaz, handler, `Registrar`, `espacioJSON`, `periodoRef`, `aEspacioJSON`, `peticionEspacio` y los cuatro endpoints).
+4. En `router.go`: campo `Espacios` y `&HandlerEspacios{...}`.
+5. En `router_test.go`: `uuidB` y el caso `POST /api/v1/espacios` con token de monitor.
+6. En `handler/modulos_test.go`: `servicioEspaciosFalso` y `TestEspacios`.
+7. En `main.go`: `espacios = repositorio.NuevoEspacios(db)`, `reloj := servicio.NuevoReloj(cfg.ZonaHoraria)` y `Espacios: servicio.NuevoEspacios(espacios, periodos, reloj, log)`.
+8. `make pruebas lint` y commit: `git add . && git commit -m "Paso 29: endpoints de espacios"`
+
+---
+
+## 7. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-03.1 Crear cursos y proyectos | `Crear` (solo profesores, a su nombre). |
-| RF-03.2 / RN-07 Período habilitado | `PermiteCrearEspacios` con la fecha del reloj. |
-| RF-03.4 / RF-11.1 Consultar sus espacios | `Listar` con `visiblePara`. |
-| RF-03.5 Cerrar | `Cerrar` solo por el responsable o el administrador. |
-| RF-03.6 Consultar cerrados | `Obtener` también devuelve espacios cerrados. |
-| RF-12 / RN-03 a RN-05 Visibilidad | `acceso.go`. |
+| RF-03.1 a RF-03.3 Crear con información mínima | `POST /api/v1/espacios`. |
+| RF-03.4 / RF-11.1 Consultar sus espacios | `GET /api/v1/espacios` con visibilidad. |
+| RF-03.5 Cerrar | `POST /api/v1/espacios/{id}/cerrar`. |
+| RF-03.6 Consultar cerrados en solo lectura | Campo `solo_lectura`. |

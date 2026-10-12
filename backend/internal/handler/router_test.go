@@ -78,6 +78,7 @@ func esperarEstado(t *testing.T, w *httptest.ResponseRecorder, estado int) {
 
 const (
 	uuidA = "6f1c2a8e-1a7d-4b8e-9c55-0d6c5c1f7a01"
+	uuidB = "0b8f3e52-6c1a-4f0e-8a3b-2a9f1d7c4e02"
 )
 
 // --- router -----------------------------------------------------------------------
@@ -155,6 +156,7 @@ func TestControlDeAccesoPorRol(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/v1/usuarios", monitor},   // solo administrador
 		{http.MethodPost, "/api/v1/periodos", profesor}, // solo administrador
+		{http.MethodPost, "/api/v1/espacios", monitor},  // solo profesor
 	}
 	for _, c := range casos {
 		if w := e.peticion(c.metodo, c.ruta, c.token, `{}`); w.Code != http.StatusForbidden {

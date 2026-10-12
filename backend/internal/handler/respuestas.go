@@ -102,6 +102,21 @@ func parametroUUID(c *gin.Context, nombre string) (string, error) {
 	return valor, nil
 }
 
+// consultaUUID lee un parámetro de consulta opcional y valida que sea un UUID.
+func consultaUUID(c *gin.Context, nombre string) (string, error) {
+	return validarUUIDOpcional(nombre, c.Query(nombre))
+}
+
+func validarUUIDOpcional(nombre, valor string) (string, error) {
+	if valor == "" {
+		return "", nil
+	}
+	if _, err := uuid.Parse(valor); err != nil {
+		return "", apperr.Validacion("%s debe ser un identificador válido", nombre)
+	}
+	return valor, nil
+}
+
 // parsearFecha interpreta un campo de fecha con formato AAAA-MM-DD.
 func parsearFecha(campo, texto string) (time.Time, error) {
 	f, err := dominio.ParsearFecha(texto)

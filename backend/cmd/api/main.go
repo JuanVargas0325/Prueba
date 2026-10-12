@@ -54,9 +54,11 @@ func ejecutar(log *slog.Logger) error {
 	var (
 		usuarios = repositorio.NuevoUsuarios(db)
 		periodos = repositorio.NuevoPeriodos(db)
+		espacios = repositorio.NuevoEspacios(db)
 	)
 
 	// Capa de servicio
+	reloj := servicio.NuevoReloj(cfg.ZonaHoraria)
 	tokens := auth.NuevoGestorTokens(cfg.JWT.Secreto, cfg.JWT.Expiracion)
 	servicioAuth := servicio.NuevaAutenticacion(usuarios, tokens, log)
 	if err := servicioAuth.AsegurarAdministrador(ctx, cfg.Admin.Nombre, cfg.Admin.Correo, cfg.Admin.Password); err != nil {
@@ -68,6 +70,7 @@ func ejecutar(log *slog.Logger) error {
 		Autenticacion: servicioAuth,
 		Usuarios:      servicio.NuevoUsuarios(usuarios, log),
 		Periodos:      servicio.NuevoPeriodos(periodos, log),
+		Espacios:      servicio.NuevoEspacios(espacios, periodos, reloj, log),
 		Tokens:        tokens,
 		OrigenesCORS:  cfg.OrigenesCORS,
 		Log:           log,
