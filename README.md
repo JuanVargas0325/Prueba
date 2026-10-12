@@ -1,327 +1,243 @@
-# Paso 13 · Repositorio de usuarios
+# Paso 14 · Servicio de autenticación
 
-> Rama `paso-a-paso` · paso 13 de 65 · anterior: **Paso 12 · bcrypt y JWT** · siguiente: **Paso 14 · Servicio de autenticación**
+> Rama `paso-a-paso` · paso 14 de 65 · anterior: **Paso 13 · Repositorio de usuarios** · siguiente: **Paso 15 · Administrador inicial al arrancar**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó la **capa de datos** (`repositorio`) con su primer repositorio: el de usuarios. Es el único lugar del sistema que escribe SQL sobre las tablas `usuarios` y `usuario_roles`.
+Se creó la **capa de servicio** (`servicio`) con su primer caso de uso: la autenticación.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/repositorio/comun.go` | **Nuevo.** Utilidades compartidas por todos los repositorios: transacciones, traducción de errores de PostgreSQL, constructor de filtros `WHERE`, paginación y lectura de filas. |
-| `backend/internal/repositorio/usuarios.go` | **Nuevo.** `BuscarPorCorreo`, `BuscarPorID`, `Listar`, `Crear`, `ReemplazarRoles`, `TieneVinculacionesActivas` y `TieneEspaciosActivos`. |
+| `backend/internal/servicio/autenticacion.go` | **Nuevo.** `IniciarSesion` (valida credenciales y emite un token), `UsuarioActual` y `AsegurarAdministrador` (crea el primer administrador si no existe). |
+| `backend/internal/servicio/autenticacion_test.go` | **Nuevo.** Pruebas con un repositorio **falso en memoria**: no necesitan base de datos. |
 
 ---
 
 ## 2. Por qué
 
-- **Patrón repositorio:** las capas superiores piden "búscame el usuario con este correo" sin saber que hay SQL detrás. Si mañana cambia la consulta, o incluso la base de datos, solo cambia este paquete.
-- **Errores de PostgreSQL → errores de la aplicación:** un correo repetido produce en PostgreSQL el código `23505`. El servicio no debería conocer ese número; el repositorio lo traduce a `apperr.Conflicto` (paso 9), que el handler convertirá en 409.
-- **Utilidades comunes desde el primer repositorio:** en los pasos siguientes llegarán cinco repositorios más (períodos, espacios, vinculaciones, tareas y reportes). Todos necesitan transacciones, filtros y paginación; se escriben una vez.
+### La capa de servicio
+
+Es la capa del medio: recibe pedidos de la capa HTTP, aplica las reglas (permisos, validaciones, orden de los pasos) y usa los repositorios para leer y guardar. **No conoce HTTP ni SQL.**
+
+```
+handler (HTTP) ──► servicio (casos de uso) ──► repositorio (SQL)
+                          │
+                          └──► auth (bcrypt, JWT), dominio (reglas)
+```
+
+### Interfaces declaradas por quien las usa
+
+El servicio no depende del repositorio concreto (`*repositorio.Usuarios`), sino de una **interfaz** que él mismo declara con **solo los métodos que necesita**:
+
+```go
+type RepositorioUsuarios interface {
+	BuscarPorCorreo(ctx context.Context, correo string) (dominio.Usuario, error)
+	BuscarPorID(ctx context.Context, id string) (dominio.Usuario, error)
+	Crear(ctx context.Context, u dominio.Usuario) (dominio.Usuario, error)
+}
+```
+
+Ventajas:
+- **Pruebas sin base de datos:** en la prueba se pasa un repositorio falso que guarda los usuarios en un mapa. Las pruebas corren en milisegundos.
+- **Bajo acoplamiento:** `*repositorio.Usuarios` cumple la interfaz automáticamente (tiene esos métodos), sin que el paquete `repositorio` sepa que el servicio existe.
+- Es una convención de Go: *"acepta interfaces, devuelve structs"*, y las interfaces se declaran **del lado de quien las consume**.
 
 ---
 
-## 3. Explicación detallada
-
-### 3.1 `comun.go`
-
-#### Nombres de recursos
+## 3. Explicación detallada de `autenticacion.go`
 
 ```go
-const (
-	recursoUsuario       = "usuario"
-	recursoUsuarios      = "usuarios"
-	recursoVinculaciones = "vinculaciones"
-)
+// Package servicio contiene la capa de lógica de negocio: casos de uso,
+// reglas del dominio y control de acceso a la información. No conoce HTTP ni
+// SQL; depende de interfaces que implementan las capas de datos e infraestructura.
+package servicio
 ```
-- Textos que aparecen en los mensajes de error ("usuario no encontrado"). Se definen como constantes para no repetir el mismo literal en muchos lugares (SonarQube lo reportaría en el paso 62). Cada repositorio nuevo agregará las suyas.
 
-#### Transacciones
+### Dependencias del servicio
 
 ```go
-func enTransaccion(ctx context.Context, db *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("iniciando transacción: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // no hace nada si ya se confirmó
+type EmisorTokens interface {
+	Generar(u dominio.Usuario) (string, time.Time, error)
+}
 
-	if err := fn(tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("confirmando transacción: %w", err)
-	}
-	return nil
+type Autenticacion struct {
+	usuarios RepositorioUsuarios
+	tokens   EmisorTokens
+	log      *slog.Logger
+	// hashFicticio se compara cuando el correo no existe, para que el tiempo de
+	// respuesta no revele qué correos están registrados.
+	hashFicticio string
+}
+
+type Sesion struct {
+	Token    string
+	ExpiraEn time.Time
+	Usuario  dominio.Usuario
 }
 ```
-- Recibe una **función** con el trabajo a hacer dentro de la transacción.
-- El truco del `defer tx.Rollback`: si `fn` falla (o entra en pánico), al salir se revierte todo. Si ya se hizo `Commit`, el `Rollback` posterior no hace nada. Así es imposible olvidar revertir.
-- Se usa, por ejemplo, para crear un usuario y sus roles: o se guardan ambos o ninguno.
-
-#### Traducción de errores
+- `EmisorTokens` es otra interfaz mínima: el servicio solo necesita **generar** tokens; `*auth.GestorTokens` (paso 12) la cumple.
+- `Sesion` es lo que devuelve un inicio de sesión exitoso.
 
 ```go
-const (
-	codigoUnico         = "23505"
-	codigoLlaveForanea  = "23503"
-	codigoRestriccion   = "23514"
-	codigoTextoInvalido = "22P02"
-)
+func NuevaAutenticacion(usuarios RepositorioUsuarios, tokens EmisorTokens, log *slog.Logger) *Autenticacion {
+	hash, _ := auth.HashPassword("contraseña-ficticia-para-comparar")
+	return &Autenticacion{usuarios: usuarios, tokens: tokens, log: log, hashFicticio: hash}
+}
+```
+- Calcula **una vez**, al crear el servicio, el hash de una contraseña ficticia. Su uso se explica abajo.
 
-func traducir(err error, recurso string) error {
+### `IniciarSesion`
+
+```go
+func (s *Autenticacion) IniciarSesion(ctx context.Context, correo, password string) (Sesion, error) {
+	correo = strings.TrimSpace(correo)
+	if correo == "" || password == "" {
+		return Sesion{}, apperr.Validacion("correo y contraseña son obligatorios")
+	}
+	u, err := s.usuarios.BuscarPorCorreo(ctx, correo)
+	if err != nil && !apperr.Es(err, apperr.TipoNoEncontrado) {
+		return Sesion{}, err
+	}
+	hash := s.hashFicticio
+	if err == nil {
+		hash = u.PasswordHash
+	}
+	if !auth.VerificarPassword(hash, password) || err != nil || !u.Activo {
+		return Sesion{}, apperr.NoAutenticado("credenciales inválidas")
+	}
+	token, expira, err := s.tokens.Generar(u)
+	if err != nil {
+		return Sesion{}, apperr.Interno(err, "no fue posible iniciar sesión")
+	}
+	return Sesion{Token: token, ExpiraEn: expira, Usuario: u}, nil
+}
+```
+
+Paso a paso:
+1. Sin correo o sin contraseña → **400** (validación).
+2. Busca el usuario. Si falla por algo distinto de "no existe" (por ejemplo, la base de datos cayó), devuelve ese error tal cual (500).
+3. **Siempre calcula bcrypt**, exista o no el usuario: si no existe, compara contra `hashFicticio`.
+4. Si la contraseña no coincide, el usuario no existe o está inactivo → **el mismo error 401** "credenciales inválidas".
+5. Emite el token. Si eso fallara, es un error interno con un mensaje genérico.
+
+**Dos detalles de seguridad:**
+- **Mismo mensaje para todo.** Si el sistema dijera "ese correo no existe" frente a "contraseña incorrecta", un atacante podría averiguar qué correos están registrados (*enumeración de usuarios*).
+- **Mismo tiempo de respuesta.** bcrypt tarda unos 70 ms. Si con un correo inexistente se respondiera de inmediato (sin calcular bcrypt), midiendo el tiempo se sabría igual qué correos existen (*ataque de tiempo*). Por eso se compara contra el hash ficticio.
+
+### `UsuarioActual`
+
+```go
+func (s *Autenticacion) UsuarioActual(ctx context.Context, actor auth.Actor) (dominio.Usuario, error) {
+	return s.usuarios.BuscarPorID(ctx, actor.UsuarioID)
+}
+```
+- Devuelve los datos completos del usuario autenticado (lo usará `GET /auth/yo` en el paso 17).
+
+### `AsegurarAdministrador`
+
+```go
+func (s *Autenticacion) AsegurarAdministrador(ctx context.Context, nombre, correo, password string) error {
+	if correo == "" || password == "" {
+		s.log.Warn("ADMIN_CORREO o ADMIN_PASSWORD no están definidos: no se crea el administrador inicial")
+		return nil
+	}
+	_, err := s.usuarios.BuscarPorCorreo(ctx, correo)
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		return apperr.NoEncontrado("%s no encontrado", recurso)
+	if !apperr.Es(err, apperr.TipoNoEncontrado) {
+		return err
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case codigoUnico:
-			return apperr.Conflicto("%s ya existe", recurso)
-		case codigoLlaveForanea:
-			return apperr.Validacion("%s hace referencia a un registro que no existe", recurso)
-		case codigoRestriccion, codigoTextoInvalido:
-			return apperr.Validacion("los datos de %s no son válidos", recurso)
-		}
-	}
-	return fmt.Errorf("%s: %w", recurso, err)
-}
-```
-
-| Situación | PostgreSQL | Se traduce a |
-|---|---|---|
-| La consulta no devolvió filas | `pgx.ErrNoRows` | `NoEncontrado` (404) |
-| Violación de `UNIQUE` | `23505` | `Conflicto` (409) |
-| Llave foránea a un registro inexistente | `23503` | `Validacion` (400) |
-| Violación de un `CHECK` | `23514` | `Validacion` (400) |
-| Texto que no es un UUID válido, etc. | `22P02` | `Validacion` (400) |
-| Cualquier otro | — | se envuelve y queda como error interno (500) |
-
-- Si `err` es `nil`, devuelve `nil`. Eso permite escribir `return u, traducir(err, recursoUsuario)` siempre, haya o no error.
-
-#### Constructor de filtros
-
-```go
-type filtro struct {
-	condiciones []string
-	args        []any
-}
-
-func (f *filtro) agregar(expresion string, valor any) {
-	f.args = append(f.args, valor)
-	f.condiciones = append(f.condiciones, strings.ReplaceAll(expresion, "?", fmt.Sprintf("$%d", len(f.args))))
-}
-
-func (f *filtro) where() string {
-	if len(f.condiciones) == 0 {
-		return ""
-	}
-	return " WHERE " + strings.Join(f.condiciones, " AND ")
-}
-```
-- Muchos listados tienen filtros **opcionales** (por rol, por búsqueda...). Armar el `WHERE` a mano con los números `$1, $2...` es propenso a errores. `filtro` lo hace solo:
-  ```go
-  var w filtro
-  w.agregar("rol = ?", "monitor")                         // condición "rol = $1", args = ["monitor"]
-  w.agregar("(nombre ILIKE ? OR correo ILIKE ?)", "%an%") // "(nombre ILIKE $2 OR correo ILIKE $2)"
-  w.where()  // " WHERE rol = $1 AND (nombre ILIKE $2 OR correo ILIKE $2)"
-  ```
-- Cada `?` de una expresión se reemplaza por **el mismo** parámetro; así una condición puede usar el valor dos veces.
-- Los valores **nunca** se pegan en el SQL: van en `args` como parámetros. Esto elimina la **inyección SQL**.
-- `var w filtro` crea un filtro vacío listo para usar: en Go los structs tienen un **valor cero** útil (listas vacías).
-- Receptor puntero `(f *filtro)`: `agregar` **modifica** el filtro.
-
-```go
-func (f *filtro) paginar(p dominio.Paginacion) string {
-	if p == dominio.SinPaginar {
-		return ""
-	}
-	p = p.Normalizar()
-	f.args = append(f.args, p.Limite, p.Desplazamiento)
-	return fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(f.args)-1, len(f.args))
-}
-```
-- Agrega `LIMIT`/`OFFSET` con los valores normalizados del paso 11 (máximo 200). `SinPaginar` no agrega nada.
-
-```go
-func patronBusqueda(texto string) string {
-	escapado := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(texto)
-	return "%" + escapado + "%"
-}
-```
-- En `LIKE`/`ILIKE`, `%` significa "cualquier texto" y `_` "un carácter". Si un usuario busca `50%`, el `%` debe tratarse como literal. Se **escapan** los comodines y luego se envuelve con `%...%` ("contiene").
-
-#### Leer filas con genéricos
-
-```go
-func recolectar[T any](filas pgx.Rows, escanear func(pgx.Row) (T, error)) ([]T, error) {
-	defer filas.Close()
-	resultado := []T{}
-	for filas.Next() {
-		v, err := escanear(filas)
-		if err != nil {
-			return nil, err
-		}
-		resultado = append(resultado, v)
-	}
-	return resultado, filas.Err()
-}
-```
-- `[T any]` es un **parámetro de tipo (genéricos)**: la misma función sirve para leer usuarios, tareas o reportes. `T` se deduce de la función `escanear` que se le pasa.
-- `defer filas.Close()` libera la conexión aunque haya un error a mitad del recorrido.
-- Devuelve `[]T{}` (lista vacía) y no `nil` cuando no hay filas: en JSON eso se ve como `[]` y no como `null`, más cómodo para los clientes.
-- `filas.Err()` informa errores que ocurrieron durante la lectura.
-
-### 3.2 `usuarios.go`
-
-```go
-type Usuarios struct {
-	db *pgxpool.Pool
-}
-
-func NuevoUsuarios(db *pgxpool.Pool) *Usuarios { return &Usuarios{db: db} }
-```
-- El repositorio guarda el pool (paso 3). `NuevoUsuarios` es su **constructor** (en Go, una función normal por convención `NuevoX`).
-
-```go
-const selectUsuario = `
-	SELECT u.id, u.nombre, u.correo, u.password_hash, u.activo, u.creado_en,
-	       COALESCE(array_agg(r.rol ORDER BY r.rol) FILTER (WHERE r.rol IS NOT NULL), '{}') AS roles
-	FROM usuarios u
-	LEFT JOIN usuario_roles r ON r.usuario_id = u.id`
-```
-- Trae cada usuario **con sus roles en una sola consulta**:
-  - `LEFT JOIN`: incluye al usuario aunque no tenga roles;
-  - `array_agg(r.rol ...)` junta los roles en un arreglo de PostgreSQL (requiere `GROUP BY u.id`, que agrega cada consulta);
-  - `FILTER (WHERE r.rol IS NOT NULL)` evita un arreglo `{NULL}` para usuarios sin roles, y `COALESCE(..., '{}')` lo convierte en arreglo vacío.
-
-```go
-func escanearUsuario(fila pgx.Row) (dominio.Usuario, error) {
-	var u dominio.Usuario
-	var roles []string
-	if err := fila.Scan(&u.ID, &u.Nombre, &u.Correo, &u.PasswordHash, &u.Activo, &u.CreadoEn, &roles); err != nil {
-		return u, err
-	}
-	for _, r := range roles {
-		u.Roles = append(u.Roles, dominio.Rol(r))
-	}
-	return u, nil
-}
-```
-- `Scan` copia cada columna en su campo, en el mismo orden del `SELECT`. pgx convierte el arreglo de PostgreSQL en `[]string` y aquí se pasa a `[]dominio.Rol`.
-
-```go
-func (r *Usuarios) BuscarPorCorreo(ctx context.Context, correo string) (dominio.Usuario, error) {
-	u, err := escanearUsuario(r.db.QueryRow(ctx,
-		selectUsuario+` WHERE lower(u.correo) = lower($1) GROUP BY u.id`, strings.TrimSpace(correo)))
-	return u, traducir(err, recursoUsuario)
-}
-```
-- Compara en minúsculas: coincide con el índice único `lower(correo)` del paso 4 y PostgreSQL puede usar ese índice.
-
-```go
-func (r *Usuarios) Listar(ctx context.Context, f dominio.FiltroUsuarios) ([]dominio.Usuario, error) {
-	var w filtro
-	if f.Rol != "" {
-		w.agregar(`EXISTS (SELECT 1 FROM usuario_roles x WHERE x.usuario_id = u.id AND x.rol = ?)`, string(f.Rol))
-	}
-	if b := strings.TrimSpace(f.Busqueda); b != "" {
-		w.agregar(`(u.nombre ILIKE ? OR u.correo ILIKE ?)`, patronBusqueda(b))
-	}
-	sql := selectUsuario + w.where() + ` GROUP BY u.id ORDER BY lower(u.nombre), u.correo` + w.paginar(f.Paginacion)
+	hash, err := auth.HashPassword(password)
 	...
-}
-```
-- El filtro por rol usa `EXISTS` (subconsulta) para no perder los **demás** roles del usuario en el `array_agg`.
-- `ILIKE` es `LIKE` sin distinguir mayúsculas.
-- Orden alfabético por nombre (sin distinguir mayúsculas) y, si empatan, por correo.
-
-```go
-func (r *Usuarios) Crear(ctx context.Context, u dominio.Usuario) (dominio.Usuario, error) {
-	err := enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx,
-			`INSERT INTO usuarios (nombre, correo, password_hash, activo) VALUES ($1, $2, $3, $4)
-			 RETURNING id, creado_en`,
-			u.Nombre, u.Correo, u.PasswordHash, u.Activo,
-		).Scan(&u.ID, &u.CreadoEn)
-		if esViolacionUnica(err) {
-			return apperr.Conflicto("ya existe un usuario con el correo %s", u.Correo)
-		}
-		if err != nil {
-			return traducir(err, recursoUsuario)
-		}
-		return insertarRoles(ctx, tx, u.ID, u.Roles)
+	_, err = s.usuarios.Crear(ctx, dominio.Usuario{
+		Nombre: nombre, Correo: correo, PasswordHash: hash, Activo: true,
+		Roles: []dominio.Rol{dominio.RolAdministrador},
 	})
-	return u, err
+	if apperr.Es(err, apperr.TipoConflicto) {
+		return nil // otra instancia lo creó al mismo tiempo
+	}
+	...
+	s.log.Info("administrador inicial creado", "correo", correo)
+	return nil
 }
 ```
-- Usuario y roles en **una transacción**.
-- `RETURNING id, creado_en` devuelve los valores que generó PostgreSQL (el UUID y la fecha) sin otra consulta.
-- Un correo repetido produce un mensaje específico ("ya existe un usuario con el correo ...") en lugar del genérico.
-
-```go
-func (r *Usuarios) ReemplazarRoles(ctx context.Context, usuarioID string, roles []dominio.Rol) error
-```
-- Borra los roles actuales e inserta los nuevos en una transacción (RF-02.2). `insertarRoles` usa `ON CONFLICT DO NOTHING` para ignorar repetidos.
-
-```go
-func (r *Usuarios) TieneVinculacionesActivas(ctx context.Context, usuarioID string, rol dominio.Rol) (bool, error)
-func (r *Usuarios) TieneEspaciosActivos(ctx context.Context, usuarioID string) (bool, error)
-```
-- Consultas `SELECT EXISTS (...)` (devuelven verdadero o falso) sobre `vinculaciones` y `espacios`. Las tablas existen desde el paso 4 aunque sus módulos lleguen después. Las usará el servicio de usuarios (paso 18) para impedir que se le quite a alguien un rol que está usando en un curso activo.
+- **El problema del huevo y la gallina:** para crear usuarios hace falta un administrador, pero ¿quién crea al primero? Al arrancar, la API crea uno con los datos de la configuración (paso 15).
+- Es **idempotente**: si ya existe, no hace nada. Se puede llamar en cada arranque.
+- Si dos instancias arrancan a la vez, ambas podrían intentar crearlo; la segunda recibirá un conflicto (correo único) y lo ignora.
+- Si no hay configuración, solo advierte en el log (útil en pruebas).
 
 ---
 
-## 4. Conceptos de Go de este paso
+## 4. Las pruebas (`autenticacion_test.go`)
+
+```go
+var logPrueba = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+type usuariosFalsos struct {
+	porCorreo map[string]dominio.Usuario
+	creados   []dominio.Usuario
+}
+
+func (u *usuariosFalsos) BuscarPorCorreo(_ context.Context, correo string) (dominio.Usuario, error) { ... }
+func (u *usuariosFalsos) BuscarPorID(_ context.Context, id string) (dominio.Usuario, error) { ... }
+func (u *usuariosFalsos) Crear(_ context.Context, usuario dominio.Usuario) (dominio.Usuario, error) { ... }
+```
+- `usuariosFalsos` es un **doble de prueba**: cumple `RepositorioUsuarios` con un mapa en memoria y anota lo que se creó.
+- `_ context.Context`: el parámetro existe para cumplir la interfaz, pero no se usa; `_` lo indica.
+- `logPrueba` descarta los logs. **Nota:** más adelante (paso 48) esta variable se trasladará, junto con otros dobles compartidos del paquete, a `reportes_test.go`.
+
+| Prueba | Qué verifica |
+|---|---|
+| `TestIniciarSesion` | El correo se acepta con espacios y mayúsculas; se emite un token. Contraseña incorrecta, correo inexistente y usuario inactivo → 401; correo vacío → 400. |
+| `TestAsegurarAdministrador` | La primera vez crea un administrador activo con la contraseña **hasheada**; la segunda no lo duplica; sin configuración no crea nada. |
+
+---
+
+## 5. Conceptos de Go de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Genéricos | `func recolectar[T any](...)`: una función para muchos tipos. |
-| Valor cero útil | `var w filtro` ya es un filtro vacío utilizable. |
-| Función como parámetro | `enTransaccion(ctx, db, func(tx pgx.Tx) error { ... })`. |
-| `errors.As` con tipos de librería | Detecta `*pgconn.PgError` para leer el código de PostgreSQL. |
-| Constructor `NuevoX` | Convención para crear un valor ya configurado. |
+| Interfaz en el consumidor | El servicio declara qué necesita; los repositorios la cumplen sin saberlo. |
+| Doble de prueba (fake) | Implementación en memoria de una interfaz para probar sin infraestructura. |
+| `_` como nombre de parámetro | Parámetro obligatorio por la firma, pero que no se usa. |
+| Valor cero de un struct | `Sesion{}`: struct vacío que se devuelve junto con un error. |
 
 ---
 
-## 5. Cómo comprobarlo
-
-Este repositorio todavía no tiene consumidores. Se valida compilando y con el lint:
+## 6. Cómo comprobarlo
 
 ```bash
-make lint      # o: cd backend && go vet ./...
+cd backend
+go test ./internal/servicio/ -v -run 'TestIniciarSesion|TestAsegurarAdministrador'
 ```
 
-Se ejercitará de verdad en el paso 15 (creación del administrador inicial al arrancar la API) y tendrá pruebas automáticas contra un PostgreSQL real en el paso 58 (pruebas de integración).
+`-run` filtra las pruebas por nombre (expresión regular).
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 12
+## 7. Pasos para lograr esta versión desde el paso 13
 
-1. Crear `backend/internal/repositorio/comun.go` con: comentario del paquete, constantes `recursoUsuario`, `recursoUsuarios` y `recursoVinculaciones`, `enTransaccion`, códigos de error, `traducir`, `esViolacionUnica`, `filtro` (`agregar`, `where`, `paginar`), `patronBusqueda` y `recolectar`.
-2. Crear `backend/internal/repositorio/usuarios.go` con el struct `Usuarios`, `NuevoUsuarios`, `selectUsuario`, `escanearUsuario` y los métodos descritos en 3.2.
-3. `make lint`
-4. Commit: `git add . && git commit -m "Paso 13: repositorio de usuarios"`
-
----
-
-## 7. Preparación para las próximas entregas
-
-- **Solo el paquete `repositorio` conoce PostgreSQL.** Al pasar a Cloud SQL (Entrega 2) no cambia nada; si algún día se usara otra base de datos, solo se reescribiría este paquete.
-- **Paginación obligatoria en los listados:** limita el costo de cada consulta, algo que se medirá en las pruebas de carga.
+1. Crear `backend/internal/servicio/autenticacion.go` con el comentario del paquete, las interfaces `RepositorioUsuarios` y `EmisorTokens`, los structs `Autenticacion` y `Sesion`, `NuevaAutenticacion`, `IniciarSesion`, `UsuarioActual` y `AsegurarAdministrador`.
+2. Crear `backend/internal/servicio/autenticacion_test.go` con `logPrueba`, el doble `usuariosFalsos`, `nuevaAutenticacionPrueba` y las dos pruebas.
+3. `make pruebas lint`
+4. Commit: `git add . && git commit -m "Paso 14: servicio de autenticación"`
 
 ---
 
-## 8. Requisitos que atiende
+## 8. Preparación para las próximas entregas
+
+- **`AsegurarAdministrador` tolera arranques simultáneos**, como los de varias instancias detrás de un balanceador (Entrega 3).
+- **El servicio no sabe de HTTP.** La misma lógica de inicio de sesión serviría si en el futuro se expusiera por otro medio.
+
+---
+
+## 9. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-02.1 Crear usuarios | `Crear` con usuario y roles en una transacción. |
-| RF-02.2 Asignar roles | `ReemplazarRoles`. |
-| RF-02.3 Consulta global de usuarios | `Listar` con filtros por rol y búsqueda, paginado. |
-| RNF-06 Consistencia | Transacciones y traducción de las restricciones de la base de datos. |
+| RF-01.1 Inicio de sesión local | `IniciarSesion` valida credenciales y emite un JWT. |
+| RF-02 / RF-15.2 Gestión por el administrador | Existe siempre un administrador inicial. |
+| RNF-03 Seguridad básica | Mensaje y tiempo de respuesta iguales ante credenciales inválidas. |
