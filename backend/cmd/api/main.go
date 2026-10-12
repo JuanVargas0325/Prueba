@@ -13,10 +13,12 @@ import (
 	_ "time/tzdata" // incluye las zonas horarias en el binario
 
 	"github.com/gin-gonic/gin"
+	"github.com/hibiken/asynq"
 
 	"seguimiento/internal/almacenamiento"
 	"seguimiento/internal/auth"
 	"seguimiento/internal/basedatos"
+	"seguimiento/internal/cola"
 	"seguimiento/internal/config"
 	"seguimiento/internal/dominio"
 	"seguimiento/internal/handler"
@@ -59,6 +61,7 @@ func ejecutar(log *slog.Logger) error {
 		espacios      = repositorio.NuevoEspacios(db)
 		vinculaciones = repositorio.NuevoVinculaciones(db)
 		tareas        = repositorio.NuevoTareas(db)
+		reportes      = repositorio.NuevoReportes(db)
 	)
 
 	// Infraestructura
@@ -66,6 +69,15 @@ func ejecutar(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	clienteCola := cola.NuevoCliente(
+		asynq.RedisClientOpt{Addr: cfg.Redis.Direccion, Password: cfg.Redis.Password, DB: cfg.Redis.DB},
+		cola.Opciones{MaxReintentos: cfg.Worker.MaxReintentos, TimeoutReporte: cfg.Worker.TimeoutReporte},
+	)
+	defer func() {
+		if err := clienteCola.Cerrar(); err != nil {
+			log.Warn("cerrando el cliente de la cola", "error", err)
+		}
+	}()
 
 	// Capa de servicio
 	reloj := servicio.NuevoReloj(cfg.ZonaHoraria)
@@ -85,6 +97,7 @@ func ejecutar(log *slog.Logger) error {
 		Vinculaciones: servicio.NuevoVinculaciones(vinculaciones, usuarios, espacios, log),
 		Tareas:        servicio.NuevoTareas(tareas, vinculaciones, almacen, reloj, maxBytesAdjunto, log),
 		Seguimiento:   servicio.NuevoSeguimiento(vinculaciones, tareas, usuarios, reloj),
+		Reportes:      servicio.NuevoReportes(reportes, clienteCola, almacen, reloj, log),
 		Tokens:        tokens,
 		// Todos los adjuntos de una tarea más un margen para los demás campos.
 		MaxCuerpoArchivosMB: cfg.MaxAdjuntoMB*dominio.MaxAdjuntosPorTarea + 1,
@@ -92,6 +105,7 @@ func ejecutar(log *slog.Logger) error {
 		Log:                 log,
 		Salud: map[string]handler.ComprobadorSalud{
 			"postgres": db.Ping,
+			"redis":    func(context.Context) error { return clienteCola.Ping() },
 		},
 	})
 

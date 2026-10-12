@@ -1,187 +1,228 @@
-# Paso 48 · Servicio de reportes (solicitud por lotes)
+# Paso 49 · Endpoints de reportes
 
-> Rama `paso-a-paso` · paso 48 de 65 · anterior: **Paso 47 · Cola con Asynq y Redis** · siguiente: **Paso 49 · Endpoints de reportes**
+> Rama `paso-a-paso` · paso 49 de 65 · anterior: **Paso 48 · Servicio de reportes** · siguiente: **Paso 50 · Generador de PDF**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó la parte del módulo de reportes que corre **en la API**: solicitar un lote (que se encola y se procesa después) y consultar o descargar los resultados.
+La API expone el módulo de reportes y se conecta a Redis:
+
+| Método | Ruta | Rol | Descripción |
+|---|---|---|---|
+| POST | `/api/v1/reportes/lotes` | profesor | Solicita la generación de los reportes de una semana (`{"semana":"AAAA-MM-DD"}`). Responde **202 Accepted** y queda encolado. |
+| GET | `/api/v1/reportes/lotes` | profesor o administrador | Lista lotes (`?semana=`, `?profesor_id=` para el administrador). |
+| GET | `/api/v1/reportes/lotes/{id}` | profesor o administrador | Avance del lote y estado de cada reporte. |
+| GET | `/api/v1/reportes` | profesor o administrador | Lista reportes (`?semana=`, `?usuario_id=`, `?lote_id=`, `?profesor_id=`). |
+| GET | `/api/v1/reportes/{id}` | profesor o administrador | Detalle con el resumen. |
+| GET | `/api/v1/reportes/{id}/pdf` | profesor o administrador | Descarga el PDF. |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/servicio/reportes.go` | **Nuevo.** Interfaces `RepositorioReportes`, `Encolador` y `Almacenamiento`; servicio `Reportes` con `SolicitarLote`, `ListarLotes`, `ObtenerLote`, `ListarReportes`, `ObtenerReporte` y `AbrirPDF`. |
-| `backend/internal/servicio/reportes_test.go` | **Nuevo.** Dobles del repositorio, del encolador y del almacenamiento, el bloque de dobles compartidos del paquete y ocho pruebas. |
-| `backend/internal/servicio/tareas.go` | **Modificado.** La interfaz `Almacenamiento` se traslada a `reportes.go`. |
-| `backend/internal/servicio/autenticacion_test.go` | **Modificado.** El bloque de dobles compartidos (`logPrueba`, actores, `ahoraPrueba`) y `almacenamientoFalso` se trasladan a `reportes_test.go`. |
+| `backend/internal/handler/reportes.go` | **Nuevo.** Módulo de reportes. |
+| `backend/internal/handler/reportes_test.go` | **Nuevo.** Seis pruebas del módulo. |
+| `backend/internal/handler/archivos.go` | **Modificado.** `nombreArchivo`: nombre de persona → nombre de archivo seguro. |
+| `backend/internal/handler/router.go` | **Modificado.** Servicio `Reportes` y su módulo (el router queda completo). |
+| `backend/internal/handler/router_test.go` | **Modificado.** Rutas de reportes protegidas, permisos y prueba de nombres de archivo. |
+| `backend/cmd/api/main.go` | **Modificado.** Repositorio de reportes, **cliente de la cola** y Redis en `/salud`. |
+| `docker-compose.yml` | **Modificado.** La API recibe `REDIS_DIRECCION=redis:6379` y espera a que Redis esté sano. |
+
+```bash
+curl -i -X POST localhost:8080/api/v1/reportes/lotes -H "Authorization: Bearer $TOKEN_PROFESOR" \
+  -H 'Content-Type: application/json' -d '{"semana":"2026-10-08"}'
+# HTTP/1.1 202 Accepted
+# Location: /api/v1/reportes/lotes/d9d3...
+# {"id":"d9d3...","semana_inicio":"2026-10-05","semana_fin":"2026-10-11","estado":"pendiente","total_reportes":0,...}
+```
+
+Como todavía no hay worker (paso 55), el lote queda **pendiente** en la cola de Redis.
 
 ---
 
 ## 2. Por qué
 
-- **RF-14.1 / RN-41:** el profesor dispara **manualmente** la generación de los reportes de una semana. La API solo registra el lote y lo encola: **no espera a la IA**.
-- **RF-14.6:** los PDF generados se consultan y descargan después.
-- **RN-03:** cada profesor solo ve sus lotes y reportes; el administrador ve todos.
-- **¿Por qué mover `Almacenamiento` y los dobles?** Desde este paso hay varias piezas de infraestructura que comparten el servicio de tareas y el de reportes (y el generador del paso 54): el almacenamiento, el encolador y la IA. Sus interfaces quedan juntas en `reportes.go`, y sus dobles de prueba juntos en `reportes_test.go`. En Go cualquier archivo del paquete ve todo lo declarado en los demás, así que mover una declaración entre archivos del mismo paquete **no cambia el comportamiento**.
+- **RF-14.1:** el profesor dispara la generación **manualmente**.
+- **202 Accepted** es el código HTTP para "recibido, se procesará después". Con la cabecera `Location` el cliente sabe dónde consultar el avance (`GET /reportes/lotes/{id}`), sin esperar con la conexión abierta.
+- **RF-14.6:** los reportes terminados se descargan como PDF.
 
 ---
 
-## 3. Explicación detallada de `reportes.go`
+## 3. Explicación detallada
 
-### 3.1 Interfaces de infraestructura
-
-```go
-type Encolador interface {
-	EncolarLote(ctx context.Context, loteID string) error
-	EncolarReporte(ctx context.Context, reporteID string) error
-}
-
-type Almacenamiento interface {
-	Guardar(ctx context.Context, ruta string, contenido io.Reader) (int64, error)
-	Abrir(ctx context.Context, ruta string) (io.ReadCloser, error)
-	Eliminar(ctx context.Context, ruta string) error
-}
-```
-- `*cola.Cliente` (paso 47) cumple `Encolador` y `*almacenamiento.Local` (paso 38) cumple `Almacenamiento`. El servicio no conoce Redis ni el disco.
+### 3.1 Rutas
 
 ```go
-type RepositorioReportes interface {
-	CrearLote(...); ExisteLoteActivo(...); ObtenerLote(...); ListarLotes(...); IniciarLote(...); MarcarLoteFallido(...)
-	ListarPersonasParaReporte(...); CrearReportesPendientes(...); ObtenerReporte(...); ListarReportes(...)
-	MarcarReporteEnProceso(...); CompletarReporte(...); FallarReporte(...)
-	ObtenerDatosSemana(...)
+func (h *HandlerReportes) Registrar(g *gin.RouterGroup) {
+	r := g.Group("/reportes", RequiereRol(dominio.RolProfesor, dominio.RolAdministrador))
+	r.POST("/lotes", RequiereRol(dominio.RolProfesor), h.SolicitarLote)
+	r.GET("/lotes", h.ListarLotes)
+	r.GET("/lotes/:id", h.ObtenerLote)
+	r.GET("", h.ListarReportes)
+	r.GET("/:id", h.ObtenerReporte)
+	r.GET("/:id/pdf", h.DescargarPDF)
 }
 ```
-- Todo lo del repositorio del paso 46. Una sola interfaz porque la API y el worker (paso 54) usan el mismo repositorio, cada uno con sus métodos.
+- Todo el grupo es para profesores y administradores; solicitar un lote, solo para profesores. Los middleware se **acumulan**: el `POST` pasa por los dos `RequiereRol`.
 
-### 3.2 `SolicitarLote`
+### 3.2 Formatos
 
 ```go
-func (s *Reportes) SolicitarLote(ctx context.Context, actor auth.Actor, fechaSemana string) (dominio.LoteReportes, error) {
-	if !actor.TieneRol(dominio.RolProfesor) {
-		return dominio.LoteReportes{}, apperr.Prohibido("solo un profesor puede generar reportes")
-	}
-	fecha, err := dominio.ParsearFecha(fechaSemana)
-	if err != nil {
-		return dominio.LoteReportes{}, apperr.Validacion("semana debe ser una fecha con formato AAAA-MM-DD")
-	}
-	semana := dominio.InicioSemana(fecha)
-	if semana.After(s.reloj.SemanaActual()) {
-		return dominio.LoteReportes{}, apperr.Validacion("no se pueden generar reportes de semanas futuras")
-	}
-
-	activo, err := s.repo.ExisteLoteActivo(ctx, actor.UsuarioID, semana)
+type loteJSON struct {
+	ID                  string             `json:"id"`
 	...
-	if activo {
-		return dominio.LoteReportes{}, apperr.Conflicto("ya hay un lote en proceso para la semana del %s", semana.Format(dominio.FormatoFecha))
-	}
-
-	lote, err := s.repo.CrearLote(ctx, actor.UsuarioID, semana)
-	...
-	if err := s.encolador.EncolarLote(ctx, lote.ID); err != nil {
-		s.log.Error("no fue posible encolar el lote", "lote_id", lote.ID, "error", err)
-		_ = s.repo.MarcarLoteFallido(context.WithoutCancel(ctx), lote.ID, "no fue posible encolar el lote: "+err.Error())
-		return dominio.LoteReportes{}, apperr.Interno(err, "no fue posible iniciar la generación de reportes, intente de nuevo")
-	}
-	return lote, nil
+	Estado              dominio.EstadoLote `json:"estado"`
+	TotalReportes       int                `json:"total_reportes"`
+	ReportesCompletados int                `json:"reportes_completados"`
+	ReportesFallidos    int                `json:"reportes_fallidos"`
+	Error               string             `json:"error,omitempty"`
+	CreadoEn            time.Time          `json:"creado_en"`
+	FinalizadoEn        *time.Time         `json:"finalizado_en"`
+	Reportes            []reporteJSON      `json:"reportes,omitempty"`
 }
 ```
-1. **Solo profesores** (ni siquiera el administrador genera: los reportes son del profesor sobre **sus** personas).
-2. **RF-14.7:** cualquier fecha se normaliza al **lunes** de su semana. Se permite la semana en curso y las pasadas; las futuras no.
-3. **Un lote activo por semana:** si ya hay uno pendiente o en proceso para esa semana → **409**. Evita duplicar trabajo y gasto en la IA por doble clic.
-4. Se **registra** el lote (estado `pendiente`) y se **encola**.
-5. **Si Redis no responde,** el lote quedaría pendiente para siempre. Por eso se marca **fallido** (con el motivo) y se responde 500 con un mensaje para reintentar. El lote fallido no bloquea uno nuevo (no está activo).
-
-### 3.3 Consultas
+- `Reportes` solo se llena en el detalle de un lote (`omitempty` lo omite en el listado).
 
 ```go
-func (s *Reportes) ListarLotes(ctx context.Context, actor auth.Actor, f dominio.FiltroLotes) ([]dominio.LoteReportes, error) {
-	switch {
-	case actor.EsAdministrador():
-	case actor.TieneRol(dominio.RolProfesor):
-		f.ProfesorID = actor.UsuarioID // RN-03: solo sus propios lotes
-	default:
-		return nil, apperr.Prohibido("no tiene permiso para consultar reportes")
+func aReporteJSON(r dominio.ReporteSemanal) reporteJSON {
+	j := reporteJSON{...}
+	if r.Estado == dominio.ReporteCompletado {
+		j.URLDescarga = "/api/v1/reportes/" + r.ID + "/pdf"
 	}
-	return s.repo.ListarLotes(ctx, f)
+	return j
 }
 ```
-- El profesor siempre ve **solo lo suyo** (se sobrescribe cualquier `ProfesorID` que pida); el administrador puede filtrar por cualquiera. Igual en `ListarReportes`.
-- `ObtenerLote` devuelve el lote **y** sus reportes (para ver el avance de cada persona) si el actor puede verlo.
-- `ObtenerReporte` responde **404** (no 403) a otro profesor: no se revela que el reporte existe.
+- La URL de descarga solo aparece cuando el PDF existe.
+
+### 3.3 `SolicitarLote`
 
 ```go
-func (s *Reportes) AbrirPDF(ctx context.Context, actor auth.Actor, id string) (io.ReadCloser, dominio.ReporteSemanal, error) {
-	rep, err := s.ObtenerReporte(ctx, actor, id)
-	...
-	if rep.Estado != dominio.ReporteCompletado || rep.RutaPDF == "" {
-		return nil, rep, apperr.Conflicto("el reporte aún no está disponible (estado: %s)", rep.Estado)
-	}
-	archivo, err := s.almacenamiento.Abrir(ctx, rep.RutaPDF)
-	...
+type peticionLote struct {
+	// Cualquier fecha (AAAA-MM-DD) de la semana que se quiere reportar.
+	Semana string `json:"semana"`
 }
+...
+	if strings.TrimSpace(p.Semana) == "" {
+		responderError(c, h.log, apperr.Validacion("semana es obligatoria (AAAA-MM-DD)"))
+		return
+	}
+	lote, err := h.servicio.SolicitarLote(c.Request.Context(), ActorDe(c), p.Semana)
+	...
+	c.Header("Location", "/api/v1/reportes/lotes/"+lote.ID)
+	c.JSON(http.StatusAccepted, aLoteJSON(lote))
 ```
-- Descargar un reporte que todavía se está generando → **409** con su estado.
 
----
+### 3.4 Descarga del PDF con nombre legible
 
-## 4. Las pruebas (`reportes_test.go`)
+```go
+	nombre := fmt.Sprintf("reporte-%s-%s.pdf", nombreArchivo(rep.Persona), fecha(rep.SemanaInicio))
+	servirArchivo(c, archivo, rep.TamanoBytes, "application/pdf", nombre)
+```
+- El archivo se descarga como `reporte-jose-pena-2026-10-05.pdf`.
+- `nombreArchivo` (en `archivos.go`) quita las tildes reutilizando `quitarTildes` (paso 40), pasa a minúsculas, cambia espacios por guiones y descarta cualquier otro carácter. Un nombre vacío o raro termina en `persona`; uno como `../../etc` queda `etc` (nada de rutas).
+- Se usa `servirArchivo` (paso 40): descarga como adjunto, `nosniff`, sin caché.
 
-Dobles:
-- `repoFalso`: lotes y reportes en mapas; guarda los filtros recibidos y los lotes y reportes marcados como fallidos.
-- `encoladorFalso`: anota lo encolado y puede simular un error de Redis.
-- `almacenamientoFalso`: archivos en memoria (antes en `autenticacion_test.go`).
-- El bloque `var (...)` con `logPrueba`, los actores y `ahoraPrueba` (miércoles 14/10/2026), ahora aquí.
+### 3.5 `main.go`: conexión con Redis
+
+```go
+	clienteCola := cola.NuevoCliente(
+		asynq.RedisClientOpt{Addr: cfg.Redis.Direccion, Password: cfg.Redis.Password, DB: cfg.Redis.DB},
+		cola.Opciones{MaxReintentos: cfg.Worker.MaxReintentos, TimeoutReporte: cfg.Worker.TimeoutReporte},
+	)
+	defer func() {
+		if err := clienteCola.Cerrar(); err != nil {
+			log.Warn("cerrando el cliente de la cola", "error", err)
+		}
+	}()
+	...
+		Reportes:      servicio.NuevoReportes(reportes, clienteCola, almacen, reloj, log),
+	...
+		Salud: map[string]handler.ComprobadorSalud{
+			"postgres": db.Ping,
+			"redis":    func(context.Context) error { return clienteCola.Ping() },
+		},
+```
+- El cliente de la cola es el `Encolador` del servicio (paso 48).
+- El `defer` con una función anónima permite **registrar** el error al cerrar (en lugar de ignorarlo, lo que el linter `errcheck` señalaría).
+- `/salud` ahora comprueba **también Redis**. `clienteCola.Ping` no recibe contexto, así que se **adapta** con una función anónima a la forma `func(context.Context) error` de un `ComprobadorSalud`.
+
+```yaml
+  api:
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_DIRECCION: redis:6379
+    ...
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+```
+
+### 3.6 Pruebas
+
+En `router_test.go` (ya en su versión final):
+- `/api/v1/reportes` exige token;
+- un monitor no consulta reportes y un administrador no solicita lotes (403);
+- `TestNombresDeArchivo`: `"José Peña Núñez"` → `jose-pena-nunez`, `"  Ana  María "` → `ana-maria`, `"../../etc"` → `etc`, `""` → `persona`, y la cabecera `Content-Disposition` de un nombre con eñe.
+
+En `reportes_test.go`:
 
 | Prueba | Qué verifica |
 |---|---|
-| `TestSolicitarLoteNormalizaLaSemanaYEncola` | El jueves 08/10 se convierte en el lunes 05/10; el lote es del profesor y queda encolado. |
-| `TestSolicitarLoteValidaciones` | Un monitor (403), el administrador (403), fecha inválida (400), semana futura (400) y lote activo (409). |
-| `TestSolicitarLotePermiteLaSemanaEnCurso` | La semana actual sí se puede reportar. |
-| `TestSolicitarLoteMarcaFallidoSiNoPuedeEncolar` | Con Redis caído: 500 y el lote queda fallido. |
-| `TestListarLotesAplicaVisibilidad` | El profesor solo ve sus lotes; el administrador filtra por cualquier profesor; un monitor (403). |
-| `TestListarReportesAplicaVisibilidad` | Lo mismo para los reportes. |
-| `TestReporteDeOtroProfesorNoEsVisible` | Otro profesor recibe 404 en el reporte y en el lote; el dueño y el administrador sí los ven. |
-| `TestAbrirPDF` | Un reporte en proceso → 409; uno completado entrega su contenido. |
+| `TestSolicitarLoteResponde202` | 202, semana normalizada en la respuesta, `Location` correcto y la fecha original llega al servicio. |
+| `TestSolicitarLoteValidaElCuerpo` | Cuerpo vacío, `{}`, campo desconocido y semana numérica → 400. |
+| `TestErroresDelServicioSeTraducen` | Conflicto → 409 con su mensaje; regla de negocio → 422; error inesperado → 500 **sin** el detalle interno. |
+| `TestIdentificadoresInvalidosResponden400` | IDs que no son UUID y una semana `ayer` → 400. |
+| `TestObtenerLoteIncluyeURLDeDescarga` | El reporte completado trae su `url_descarga`. |
+| `TestDescargarPDF` | `application/pdf`, `nosniff`, nombre `reporte-jose-pena-2026-10-05.pdf` y el contenido. |
 
 ---
 
-## 5. Conceptos de este paso
+## 4. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Archivos de un paquete | Todos comparten el mismo espacio de nombres: mover una declaración entre ellos no cambia nada. |
-| Compensación | Si falla el encolado, se marca el lote como fallido para no dejarlo colgado. |
-| `_ =` sobre un error | Se ignora a propósito: el error principal ya se está informando. |
-| 409 por estado | El recurso existe pero su estado no permite la operación (aún no está listo). |
+| 202 Accepted + `Location` | Respuesta para trabajos asíncronos: dónde consultar el avance. |
+| Middleware acumulados | Los del grupo y los de la ruta se ejecutan en orden. |
+| Adaptar una función | `func(context.Context) error { return x.Ping() }`. |
+| `defer` con función anónima | Para registrar el error de un cierre. |
 
 ---
 
-## 6. Cómo comprobarlo
+## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/servicio/ -v -run 'SolicitarLote|Lotes|Reportes|PDF|OtroProfesor'
+make pruebas
+docker compose up --build -d --wait
+curl -s localhost:8080/salud      # {"estado":"ok","componentes":{"postgres":"ok","redis":"ok"}}
 ```
 
----
-
-## 7. Pasos para lograr esta versión desde el paso 47
-
-1. Crear `backend/internal/servicio/reportes.go` con `RepositorioReportes`, `Encolador`, `Almacenamiento`, `Reportes`, `NuevoReportes` y los seis métodos.
-2. Quitar de `servicio/tareas.go` la interfaz `Almacenamiento` (ahora está en `reportes.go`).
-3. Crear `backend/internal/servicio/reportes_test.go` con los dobles (`repoFalso`, `encoladorFalso`, `almacenamientoFalso`), el bloque `var (...)` de dobles compartidos, `nuevoServicio` y las ocho pruebas.
-4. Quitar de `autenticacion_test.go` el bloque de dobles compartidos y `almacenamientoFalso`.
-5. `make pruebas lint`
-6. Commit: `git add . && git commit -m "Paso 48: servicio de reportes"`
+Con el token de un profesor:
+1. `POST /api/v1/reportes/lotes` con `{"semana":"2026-10-08"}` → **202**, estado `pendiente`.
+2. Repetir → **409** "ya hay un lote en proceso para la semana del 2026-10-05".
+3. Con el token de un monitor → **403**.
+4. `docker compose exec redis redis-cli LLEN 'asynq:{reportes}:pending'` → `1` (el trabajo espera al worker del paso 55).
 
 ---
 
-## 8. Requisitos que atiende
+## 6. Pasos para lograr esta versión desde el paso 48
+
+1. En `archivos.go`: `nombreArchivo`.
+2. Crear `backend/internal/handler/reportes.go` y `reportes_test.go`.
+3. En `router.go`: campo `Reportes` y `&HandlerReportes{...}`.
+4. En `router_test.go`: `/api/v1/reportes` en las rutas protegidas, los dos casos de permisos y `TestNombresDeArchivo`.
+5. En `main.go`: imports `asynq` y `cola`; `reportes = repositorio.NuevoReportes(db)`; `clienteCola` con su `defer`; `Reportes: servicio.NuevoReportes(...)`; `"redis"` en `Salud`.
+6. En `docker-compose.yml`: `REDIS_DIRECCION: redis:6379` y la dependencia de `redis` en la API.
+7. `make pruebas lint`, `docker compose up --build -d --wait` y commit: `git add . && git commit -m "Paso 49: endpoints de reportes"`
+
+---
+
+## 7. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-14.1 / RN-41 Ejecución manual por lotes | `SolicitarLote` registra y encola, sin esperar a la IA. |
-| RF-14.6 Descarga posterior | `AbrirPDF`. |
-| RF-14.7 Semana concreta | Normalización al lunes; sin semanas futuras. |
-| RN-03 / RN-05 Visibilidad | Profesor: solo lo suyo; administrador: todo. |
+| RF-14.1 Ejecución manual por lotes | `POST /api/v1/reportes/lotes` → 202 y trabajo encolado. |
+| RF-14.6 Descarga posterior | `GET /api/v1/reportes/{id}/pdf`. |
+| RF-14.7 Semana concreta | `semana` normalizada al lunes. |
+| Stack: Asynq + Redis | La API encola en Redis y lo reporta en `/salud`. |
+| RN-03 / RN-05 Visibilidad | Profesor y administrador según el servicio. |

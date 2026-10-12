@@ -98,7 +98,7 @@ func TestSaludResponde503SiUnaDependenciaFalla(t *testing.T) {
 
 func TestRutasProtegidasExigenToken(t *testing.T) {
 	e := nuevoEntorno(t, nil)
-	for _, ruta := range []string{"/api/v1/tareas", "/api/v1/usuarios", "/api/v1/auth/yo", "/api/v1/seguimiento/personas"} {
+	for _, ruta := range []string{"/api/v1/reportes", "/api/v1/tareas", "/api/v1/usuarios", "/api/v1/auth/yo", "/api/v1/seguimiento/personas"} {
 		if w := e.peticion(http.MethodGet, ruta, "", ""); w.Code != http.StatusUnauthorized {
 			t.Errorf("%s sin token: estado = %d", ruta, w.Code)
 		}
@@ -155,17 +155,31 @@ func TestControlDeAccesoPorRol(t *testing.T) {
 	casos := []struct {
 		metodo, ruta, token string
 	}{
-		{http.MethodGet, "/api/v1/usuarios", monitor},                // solo administrador
-		{http.MethodPost, "/api/v1/periodos", profesor},              // solo administrador
-		{http.MethodPost, "/api/v1/espacios", monitor},               // solo profesor
-		{http.MethodPost, "/api/v1/vinculaciones", monitor},          // solo profesor
-		{http.MethodPut, "/api/v1/vinculaciones/" + uuidA, profesor}, // solo administrador
-		{http.MethodPost, "/api/v1/tareas", profesor},                // solo operativos
-		{http.MethodGet, "/api/v1/seguimiento/personas", monitor},    // profesor o administrador
+		{http.MethodGet, "/api/v1/usuarios", monitor},                                     // solo administrador
+		{http.MethodPost, "/api/v1/periodos", profesor},                                   // solo administrador
+		{http.MethodPost, "/api/v1/espacios", monitor},                                    // solo profesor
+		{http.MethodPost, "/api/v1/vinculaciones", monitor},                               // solo profesor
+		{http.MethodPut, "/api/v1/vinculaciones/" + uuidA, profesor},                      // solo administrador
+		{http.MethodPost, "/api/v1/tareas", profesor},                                     // solo operativos
+		{http.MethodGet, "/api/v1/seguimiento/personas", monitor},                         // profesor o administrador
+		{http.MethodGet, "/api/v1/reportes", monitor},                                     // profesor o administrador
+		{http.MethodPost, "/api/v1/reportes/lotes", e.token(t, dominio.RolAdministrador)}, // solo profesor
 	}
 	for _, c := range casos {
 		if w := e.peticion(c.metodo, c.ruta, c.token, `{}`); w.Code != http.StatusForbidden {
 			t.Errorf("%s %s: estado = %d, se esperaba 403", c.metodo, c.ruta, w.Code)
 		}
+	}
+}
+
+func TestNombresDeArchivo(t *testing.T) {
+	casos := map[string]string{"José Peña Núñez": "jose-pena-nunez", "  Ana  María ": "ana-maria", "../../etc": "etc", "": "persona"}
+	for entrada, esperado := range casos {
+		if got := nombreArchivo(entrada); got != esperado {
+			t.Errorf("nombreArchivo(%q) = %q, se esperaba %q", entrada, got, esperado)
+		}
+	}
+	if got := disposicionAdjunto("Informe Final ñ.pdf"); got != `attachment; filename="Informe_Final_n.pdf"; filename*=UTF-8''Informe%20Final%20%C3%B1.pdf` {
+		t.Errorf("Content-Disposition = %s", got)
 	}
 }

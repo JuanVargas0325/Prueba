@@ -12,8 +12,7 @@ import (
 // ComprobadorSalud verifica una dependencia externa (base de datos, Redis).
 type ComprobadorSalud func(ctx context.Context) error
 
-// Dependencias agrupa los servicios que la API expone. Cada módulo que se
-// construya (usuarios, períodos, espacios...) agrega aquí su servicio.
+// Dependencias agrupa los servicios que la API expone.
 type Dependencias struct {
 	Autenticacion ServicioAutenticacion
 	Usuarios      ServicioUsuarios
@@ -22,6 +21,7 @@ type Dependencias struct {
 	Vinculaciones ServicioVinculaciones
 	Tareas        ServicioTareas
 	Seguimiento   ServicioSeguimiento
+	Reportes      ServicioReportes
 
 	Tokens ValidadorTokens
 	Salud  map[string]ComprobadorSalud
@@ -69,6 +69,7 @@ func NuevoRouter(d Dependencias) *gin.Engine {
 		&HandlerVinculaciones{servicio: d.Vinculaciones, log: d.Log},
 		&HandlerTareas{servicio: d.Tareas, maxCuerpo: int64(d.MaxCuerpoArchivosMB) << 20, log: d.Log},
 		&HandlerSeguimiento{servicio: d.Seguimiento, log: d.Log},
+		&HandlerReportes{servicio: d.Reportes, log: d.Log},
 	}
 	for _, m := range modulos {
 		m.Registrar(protegidas)

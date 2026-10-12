@@ -107,3 +107,24 @@ func nombreASCII(nombre string) string {
 	}
 	return b.String()
 }
+
+// nombreArchivo convierte un nombre de persona en un texto seguro para un
+// nombre de archivo: sin tildes, en minúsculas y con guiones.
+func nombreArchivo(nombre string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(quitarTildes(nombre)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == ' ' || r == '-' || r == '_':
+			if b.Len() > 0 && !strings.HasSuffix(b.String(), "-") {
+				b.WriteByte('-')
+			}
+		}
+	}
+	resultado := strings.Trim(b.String(), "-")
+	if resultado == "" {
+		return "persona"
+	}
+	return resultado
+}

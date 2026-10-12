@@ -24,8 +24,8 @@ services:
     # ports:
     #   - "5433:5432"
 
-  # Broker de la cola de tareas asíncronas (Asynq). La API lo empieza a usar en
-  # el paso 49 y el worker en el paso 55.
+  # Broker de la cola de tareas asíncronas (Asynq): la API encola y el worker
+  # (paso 55) procesa.
   redis:
     image: redis:7-bookworm
     restart: unless-stopped
@@ -47,11 +47,14 @@ services:
     env_file: .env
     environment:
       POSTGRES_HOST: postgres
+      REDIS_DIRECCION: redis:6379
       ALMACENAMIENTO_RUTA: /data
     volumes:
       - archivos:/data
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     expose:
       - "8080"
