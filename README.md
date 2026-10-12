@@ -1,147 +1,177 @@
-# Paso 44 · Endpoints de seguimiento
+# Paso 45 · Dominio: lotes y reportes
 
-> Rama `paso-a-paso` · paso 44 de 65 · anterior: **Paso 43 · Servicio de seguimiento** · siguiente: **Paso 45 · Dominio: lotes y reportes**
+> Rama `paso-a-paso` · paso 45 de 65 · anterior: **Paso 44 · Endpoints de seguimiento** · siguiente: **Paso 46 · Repositorio de reportes**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Las vistas de seguimiento quedan disponibles por HTTP:
-
-| Método | Ruta | Rol | Descripción |
-|---|---|---|---|
-| GET | `/api/v1/seguimiento/personas` | profesor o administrador | Vista principal: personas a cargo, sus vinculaciones y la semana actual y la anterior. Filtros: `?espacio_id=` y, para el administrador, `?profesor_id=`. |
-| GET | `/api/v1/seguimiento/personas/{id}/semanas` | profesor de la persona, administrador o la propia persona | Detalle semana a semana con tareas y estado. Rango opcional `?desde=&hasta=`. |
-| GET | `/api/v1/seguimiento/personas/{id}/consolidado` | ídem | Resumen acumulado por vinculación. |
-| GET | `/api/v1/seguimiento/mi-historial` | cualquier usuario | El historial semanal del usuario autenticado. |
+Comienza el último módulo funcional: los **reportes semanales con IA**. Este paso modela sus conceptos en el dominio.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/handler/seguimiento.go` | **Nuevo.** Módulo de seguimiento con sus formatos JSON. |
-| `backend/internal/handler/formatos.go` | **Modificado.** `tareaResumenJSON`: forma corta de una tarea dentro de otras respuestas. |
-| `backend/internal/handler/router.go` | **Modificado.** Servicio `Seguimiento` y su módulo. |
-| `backend/internal/handler/router_test.go` | **Modificado.** La ruta exige token y un monitor no ve "personas a cargo". |
-| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso y `TestSeguimiento`. |
-| `backend/cmd/api/main.go` | **Modificado.** Servicio de seguimiento. |
-
-Ejemplo de la vista del profesor:
-
-```json
-[{"usuario":{"id":"75b5...","nombre":"Laura Martínez","correo":"laura@uniandes.edu.co"},
-  "horas_contratadas":4,
-  "vinculaciones":[{"id":"...","espacio":{"id":"...","nombre":"Desarrollo en la nube","tipo":"curso","estado":"activo"},"rol":"monitor","horas_semanales":4}],
-  "semana_actual":{"semana_inicio":"2026-10-05","semana_fin":"2026-10-11","estado":"en_curso","horas_contratadas":4,"horas_reportadas":3,"tareas":1},
-  "semana_anterior":{"semana_inicio":"2026-09-28","semana_fin":"2026-10-04","estado":"sin_reporte","horas_contratadas":4,"horas_reportadas":0,"tareas":0}}]
-```
+| `backend/internal/dominio/reporte.go` | **Nuevo.** Estados y entidades de `LoteReportes` y `ReporteSemanal`, el resultado de una generación, los filtros y los **datos de entrada** del reporte (`DatosSemanaPersona`) con sus totales. |
+| `backend/internal/dominio/semana_test.go` | **Modificado.** `TestTotalesDatosSemana`. |
 
 ---
 
 ## 2. Por qué
 
-- **RF-10:** la pantalla principal del profesor debe mostrar, por persona, sus vinculaciones, lo que reportó y si dejó semanas sin reporte. Con esta respuesta un frontend puede pintar una tabla con una fila por persona y un indicador rojo para `sin_reporte`.
-- **RF-11.3:** el monitor o asistente ve su propio historial con `mi-historial`, sin conocer su ID.
-- **Visibilidad en el servicio:** las rutas de detalle no exigen rol en el router porque **la misma ruta** sirve a tres actores distintos (la persona, su profesor y el administrador). La decisión la toma el servicio (paso 43).
+**RF-14** pide: generar los reportes **manualmente por lotes** (14.1), **uno por persona** (14.2), usando **solo** tareas, descripciones, observaciones y horas (14.3), en **PDF** (14.4), **almacenarlos** (14.5) para **descargarlos** después (14.6), **para una semana concreta** (14.7). Las reglas RN-41 a RN-46 agregan que el reporte **sintetiza, no evalúa**.
+
+Generar un reporte con IA tarda segundos o más, y un profesor puede tener muchas personas a cargo. Por eso el diseño es **asíncrono**: la API registra un **lote** y responde de inmediato; un **worker** (paso 55) genera los reportes en segundo plano y va actualizando sus estados. Para eso hacen falta estados claros.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Rutas
+### 3.1 Estados del lote
 
 ```go
-func (h *HandlerSeguimiento) Registrar(g *gin.RouterGroup) {
-	r := g.Group("/seguimiento")
-	r.GET("/personas", RequiereRol(dominio.RolProfesor, dominio.RolAdministrador), h.PersonasACargo)
-	// La visibilidad por persona la decide el servicio: la propia persona, su
-	// profesor (solo sus espacios) o el administrador.
-	r.GET("/personas/:id/semanas", h.SemanasPersona)
-	r.GET("/personas/:id/consolidado", h.Consolidado)
-	r.GET("/mi-historial", h.MiHistorial)
+type EstadoLote string
+
+const (
+	LotePendiente            EstadoLote = "pendiente"
+	LoteEnProceso            EstadoLote = "en_proceso"
+	LoteCompletado           EstadoLote = "completado"
+	LoteCompletadoConErrores EstadoLote = "completado_con_errores"
+	LoteFallido              EstadoLote = "fallido"
+)
+
+func (e EstadoLote) EstaActivo() bool {
+	return e == LotePendiente || e == LoteEnProceso
 }
 ```
 
-### 3.2 Formatos
+```
+pendiente ──► en_proceso ──► completado               (todos bien)
+    │              ├──────► completado_con_errores   (algunos fallaron)
+    │              └──────► fallido                  (todos fallaron)
+    └─────────────────────► fallido                  (no se pudo ni empezar)
+```
+- `EstaActivo`: un lote que todavía se procesa. Se usa para no lanzar dos lotes de la misma semana a la vez (paso 48) y para no reprocesar uno terminado (paso 54).
+
+### 3.2 Estados del reporte
 
 ```go
-type vinculacionResumenJSON struct {
-	ID             string      `json:"id"`
-	Espacio        espacioRef  `json:"espacio"`
-	Rol            dominio.Rol `json:"rol"`
-	HorasSemanales int         `json:"horas_semanales"`
-}
+type EstadoReporte string
 
-type resumenSemanaJSON struct {
-	SemanaInicio     string               `json:"semana_inicio"`
-	SemanaFin        string               `json:"semana_fin"`
-	Estado           dominio.EstadoSemana `json:"estado"`
-	HorasContratadas int                  `json:"horas_contratadas"`
-	HorasReportadas  int                  `json:"horas_reportadas"`
-	Tareas           int                  `json:"tareas"`
-}
+const (
+	ReportePendiente  EstadoReporte = "pendiente"
+	ReporteEnProceso  EstadoReporte = "en_proceso"
+	ReporteCompletado EstadoReporte = "completado"
+	ReporteFallido    EstadoReporte = "fallido"
+)
 
-func aResumenSemanaJSON(s *dominio.SemanaPersona) *resumenSemanaJSON {
-	if s == nil {
-		return nil
-	}
+func (e EstadoReporte) EsFinal() bool {
+	return e == ReporteCompletado || e == ReporteFallido
+}
+```
+- `EsFinal`: un reporte terminado (bien o mal) no se vuelve a generar si la cola entrega el trabajo dos veces.
+
+### 3.3 Entidades
+
+```go
+type LoteReportes struct {
+	ID                  string
+	ProfesorID          string
+	SemanaInicio        time.Time
+	Estado              EstadoLote
+	TotalReportes       int
+	ReportesCompletados int
+	ReportesFallidos    int
+	Error               string
+	CreadoEn            time.Time
+	ActualizadoEn       time.Time
+	FinalizadoEn        *time.Time
+}
+```
+- Los contadores permiten mostrar el avance ("7 de 10 listos").
+- `FinalizadoEn *time.Time`: puntero porque **puede no existir** (un lote en proceso no tiene fecha de fin). En JSON será `null`.
+
+```go
+type ReporteSemanal struct {
+	ID            string
+	LoteID        string
+	ProfesorID    string
+	UsuarioID     string
+	Persona       string // nombre de la persona reportada
+	SemanaInicio  time.Time
+	Estado        EstadoReporte
+	Resumen       string
+	RutaPDF       string
+	TamanoBytes   int64
+	Intentos      int
+	Error         string
+	ProveedorIA   string
+	ModeloIA      string
 	...
+	GeneradoEn    *time.Time
 }
 ```
-- Dentro de la vista de seguimiento la vinculación se muestra **resumida** (sin repetir la persona en cada una).
-- Si la persona no estaba vinculada esa semana, el servicio devuelve `nil` y el JSON muestra `"semana_actual": null`.
+- Guarda el **resumen** generado (para mostrarlo sin abrir el PDF), la **ruta del PDF** en el almacenamiento (paso 38), los **intentos** (la cola reintenta ante errores transitorios), el **error** si falló y **qué proveedor y modelo de IA** lo generaron (trazabilidad).
 
 ```go
-type semanaJSON struct {
-	resumenSemanaJSON
-	Vinculaciones []detalleVinculacionSemanaJSON `json:"vinculaciones"`
+type ResultadoReporte struct {
+	Resumen     string
+	RutaPDF     string
+	TamanoBytes int64
+	ProveedorIA string
+	ModeloIA    string
 }
 ```
-- **Embeber un struct en JSON:** `semanaJSON` incluye `resumenSemanaJSON` sin nombre de campo; al serializar, sus campos aparecen **al mismo nivel** (`semana_inicio`, `estado`, …, `vinculaciones`). Así se reutiliza el resumen y se le agrega el detalle.
+- Lo que se guarda cuando un reporte se genera con éxito, agrupado en un solo valor.
+
+### 3.4 Los datos de entrada del reporte
 
 ```go
-type tareaResumenJSON struct {
-	ID              string              `json:"id"`
-	Titulo          string              `json:"titulo"`
-	Descripcion     string              `json:"descripcion"`
-	Estado          dominio.EstadoTarea `json:"estado"`
-	HorasInvertidas int                 `json:"horas_invertidas"`
-	Observaciones   string              `json:"observaciones"`
-	Tardia          bool                `json:"tardia"`
+// TareaSemana es la información de una tarea que alimenta el reporte.
+// Solo contiene los insumos permitidos por RF-14.3 / RN-43.
+type TareaSemana struct {
+	Titulo        string
+	Descripcion   string
+	Estado        EstadoTarea
+	Horas         int
+	Observaciones string
+	Tardia        bool
+}
+
+type VinculacionSemana struct {
+	EspacioNombre    string
+	EspacioTipo      TipoEspacio
+	Rol              Rol
+	HorasContratadas int
+	Tareas           []TareaSemana
+}
+
+type DatosSemanaPersona struct {
+	UsuarioID     string
+	Persona       string
+	Correo        string
+	ProfesorID    string
+	Profesor      string
+	SemanaInicio  time.Time
+	Vinculaciones []VinculacionSemana
 }
 ```
-- En `formatos.go`: dentro de una semana, cada tarea se muestra en su forma corta (ya se sabe de qué vinculación y semana es).
+- **Tipos propios, no `dominio.Tarea`:** `TareaSemana` tiene **exactamente** los insumos que permite RF-14.3. Así es imposible que, por descuido, se le envíe a la IA un dato que no corresponde (por ejemplo, IDs internos). El diseño de los tipos **hace cumplir el requisito**.
+- `Persona`, `Correo` y `Profesor` se usan en el encabezado del **PDF**, pero **no se envían al modelo** (paso 51).
 
 ```go
-type consolidadoVinculacionJSON struct {
-	...
-	TareasPorEstado      map[dominio.EstadoTarea]int `json:"tareas_por_estado"`
-	PromedioHorasSemana  float64                     `json:"promedio_horas_semana"`
-}
+func (d DatosSemanaPersona) SemanaFin() time.Time { return FinSemana(d.SemanaInicio) }
+func (d DatosSemanaPersona) TotalTareas() int { ... }
+func (d DatosSemanaPersona) TotalHoras() int { ... }
+func (v VinculacionSemana) HorasReportadas() int { ... }
 ```
-- Un **mapa** se serializa como objeto JSON: `"tareas_por_estado": {"abierto": 2, "en_desarrollo": 0, "finalizado": 1}`.
+- Totales calculados que usarán el prompt, el modo simulado y el PDF.
 
-### 3.3 `mi-historial` reutiliza el detalle
+### 3.5 Filtros
 
-```go
-func (h *HandlerSeguimiento) SemanasPersona(c *gin.Context) {
-	id, err := parametroUUID(c, "id")
-	...
-	h.responderSemanas(c, id)
-}
+`FiltroLotes` (por profesor y semana) y `FiltroReportes` (por profesor, persona, lote y semana), ambos con `Paginacion`.
 
-func (h *HandlerSeguimiento) MiHistorial(c *gin.Context) {
-	h.responderSemanas(c, ActorDe(c).UsuarioID)
-}
-```
-- Las dos rutas comparten la misma función; la única diferencia es **de quién**: el ID de la ruta o el del usuario autenticado.
+### 3.6 Prueba
 
-### 3.4 Pruebas
-
-- `TestRutasProtegidasExigenToken` incluye `/api/v1/seguimiento/personas`; `TestControlDeAccesoPorRol`, que un monitor no ve personas a cargo (403).
-- `TestSeguimiento` (handler):
-  - la vista de personas incluye `"estado":"sin_reporte"` en la semana anterior y `"semana_actual":null` cuando no hay semana actual;
-  - `?desde=2026-09-01` llega al servicio y `hasta` queda en `nil`;
-  - `mi-historial` consulta al usuario autenticado (`usuario-1`);
-  - el consolidado responde 200.
+`TestTotalesDatosSemana`: dos vinculaciones con tareas de 2, 3 y 4 h → 3 tareas, 9 horas y la semana termina el domingo 11/10.
 
 ---
 
@@ -149,65 +179,37 @@ func (h *HandlerSeguimiento) MiHistorial(c *gin.Context) {
 
 | Concepto | Explicación |
 |---|---|
-| Struct embebido en JSON | Sus campos aparecen al mismo nivel que los del struct que lo contiene. |
-| `null` en JSON | Un puntero `nil` se serializa como `null`. |
-| Mapa → objeto JSON | `map[clave]valor` produce `{"clave": valor}`. |
-| Una ruta, varios actores | Permisos decididos por el servicio según la relación con el dato. |
+| Máquina de estados | Valores posibles y transiciones permitidas, documentadas en el tipo. |
+| Puntero para "puede no existir" | `*time.Time` (en JSON, `null`). |
+| Tipos que hacen cumplir requisitos | `TareaSemana` solo tiene los campos permitidos para la IA. |
+| Procesamiento asíncrono | Registrar el trabajo, responder de inmediato y procesar después. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-make pruebas
-docker compose up --build -d --wait
+cd backend
+go test ./internal/dominio/ -v -run TestTotalesDatosSemana
 ```
-
-Con la profesora, Laura vinculada a uno de sus cursos y algunas tareas (pasos 33 y 37):
-
-```bash
-curl -s localhost:8080/api/v1/seguimiento/personas -H "Authorization: Bearer $TOKEN_PROFESORA"
-curl -s "localhost:8080/api/v1/seguimiento/mi-historial?desde=2026-09-01" -H "Authorization: Bearer $TOKEN_LAURA"
-curl -s localhost:8080/api/v1/seguimiento/personas/<id de Laura>/consolidado -H "Authorization: Bearer $TOKEN_PROFESORA"
-curl -s -o /dev/null -w "%{http_code}" localhost:8080/api/v1/seguimiento/personas -H "Authorization: Bearer $TOKEN_LAURA"   # 403
-```
-
-Para ver semanas **sin reporte** en una prueba local, la vinculación debe existir desde semanas atrás (por la API se crea con la fecha de hoy). Se puede simular:
-
-```bash
-docker compose exec postgres psql -U seguimiento -d seguimiento -c "UPDATE vinculaciones SET creado_en = '2026-09-01'"
-```
-
-Los datos de demostración del paso 59 ya traen vinculaciones y tareas en varias semanas.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 43
+## 6. Pasos para lograr esta versión desde el paso 44
 
-1. En `formatos.go`: `tareaResumenJSON` y `aTareaResumenJSON`.
-2. Crear `backend/internal/handler/seguimiento.go` (interfaz, handler, `Registrar`, formatos y los cuatro endpoints con `responderSemanas`).
-3. En `router.go`: campo `Seguimiento` y `&HandlerSeguimiento{...}`.
-4. En `router_test.go`: `/api/v1/seguimiento/personas` en la lista de rutas protegidas y el caso del monitor.
-5. En `handler/modulos_test.go`: `servicioSeguimientoFalso` y `TestSeguimiento`.
-6. En `main.go`: `Seguimiento: servicio.NuevoSeguimiento(vinculaciones, tareas, usuarios, reloj)`.
-7. `make pruebas lint` y commit: `git add . && git commit -m "Paso 44: endpoints de seguimiento"`
+1. Crear `backend/internal/dominio/reporte.go` con los estados (y `EstaActivo`, `EsFinal`), `LoteReportes`, `ReporteSemanal`, `ResultadoReporte`, `FiltroLotes`, `FiltroReportes`, `TareaSemana`, `VinculacionSemana`, `DatosSemanaPersona` y los métodos de totales.
+2. En `semana_test.go`: `TestTotalesDatosSemana`.
+3. `make pruebas lint`
+4. Commit: `git add . && git commit -m "Paso 45: dominio de lotes y reportes"`
 
 ---
 
-## 7. Preparación para las próximas entregas
-
-- **El frontend de la Entrega 2** tiene aquí su pantalla principal: una llamada a `/seguimiento/personas` trae todo lo necesario para la tabla del profesor.
-- **Escenario de carga E2:** esta es la consulta que se mide en las pruebas de carga (paso 64), la más costosa de la API después del inicio de sesión.
-
----
-
-## 8. Requisitos que atiende
+## 7. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-10.1 / RF-10.2 Personas a cargo y sus vinculaciones | `GET /seguimiento/personas`. |
-| RF-10.3 / RF-10.6 Detalle semanal con horas | `GET /seguimiento/personas/{id}/semanas`. |
-| RF-10.4 Consolidado | `GET /seguimiento/personas/{id}/consolidado`. |
-| RF-11.3 Historial propio | `GET /seguimiento/mi-historial`. |
-| RF-09 Sin reporte | Estado `sin_reporte` en las semanas cerradas sin tareas. |
-| RF-12 Visibilidad | Según la relación del actor con la persona. |
+| RF-14.1 Ejecución por lotes | `LoteReportes` con estados y contadores. |
+| RF-14.2 Un reporte por persona | `ReporteSemanal`. |
+| RF-14.3 / RN-43 Solo insumos permitidos | `TareaSemana`. |
+| RF-14.5 / RF-14.6 Almacenar y descargar | `RutaPDF`. |
+| RF-14.7 Una semana concreta | `SemanaInicio`. |

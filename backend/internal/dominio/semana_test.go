@@ -67,3 +67,19 @@ func TestParsearFechaRechazaFormatoInvalido(t *testing.T) {
 		t.Fatal("se esperaba error con un formato inválido")
 	}
 }
+
+func TestTotalesDatosSemana(t *testing.T) {
+	d := DatosSemanaPersona{
+		SemanaInicio: fecha(t, "2026-10-05"),
+		Vinculaciones: []VinculacionSemana{
+			{Tareas: []TareaSemana{{Horas: 2}, {Horas: 3}}},
+			{Tareas: []TareaSemana{{Horas: 4}}},
+		},
+	}
+	if d.TotalTareas() != 3 || d.TotalHoras() != 9 {
+		t.Fatalf("totales incorrectos: tareas=%d horas=%d", d.TotalTareas(), d.TotalHoras())
+	}
+	if d.SemanaFin().Format(FormatoFecha) != "2026-10-11" {
+		t.Fatalf("SemanaFin incorrecta: %s", d.SemanaFin().Format(FormatoFecha))
+	}
+}
