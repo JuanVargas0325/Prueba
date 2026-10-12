@@ -1,116 +1,233 @@
-# Paso 42 · Consulta de tareas por vinculaciones
+# Paso 43 · Servicio de seguimiento
 
-> Rama `paso-a-paso` · paso 42 de 65 · anterior: **Paso 41 · Dominio del seguimiento** · siguiente: **Paso 43 · Servicio de seguimiento**
+> Rama `paso-a-paso` · paso 43 de 65 · anterior: **Paso 42 · Consulta de tareas por vinculaciones** · siguiente: **Paso 44 · Endpoints de seguimiento**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se agregó al repositorio de tareas una consulta pensada para el seguimiento: **todas** las tareas de un conjunto de vinculaciones, opcionalmente entre dos semanas.
+Se creó el caso de uso que arma las **vistas de seguimiento** combinando vinculaciones, tareas y los cálculos del dominio (paso 41).
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/repositorio/tareas.go` | **Modificado.** Nuevo método `ListarPorVinculaciones`, con su propia consulta liviana (`selectTareaPropia` y `escanearTareaPropia`). |
+| `backend/internal/servicio/seguimiento.go` | **Nuevo.** Servicio `Seguimiento` con `PersonasACargo`, `SemanasPersona` y `Consolidado`, más `vinculacionesVisibles`, `rangoSemanas`, `tareasPorPersona` e `idsDe`. |
+| `backend/internal/servicio/modulos_test.go` | **Modificado.** Listador falso de tareas y dos pruebas. |
 
 ---
 
 ## 2. Por qué
 
-El seguimiento (paso 43) necesita, para una persona o para todas las personas de un profesor, las tareas de **varias vinculaciones** a la vez, en un rango de semanas, **sin paginar** (para calcular estados y totales hacen falta todas). `Listar` (paso 35) no sirve: pagina, filtra por una sola vinculación y aplica visibilidad por actor. Una consulta específica y en **una sola ida** a la base de datos evita el problema "N+1" (una consulta por vinculación).
+| Vista | Requisito | Quién la usa |
+|---|---|---|
+| **Personas a cargo:** cada monitor y asistente con sus vinculaciones y cómo va en la semana actual y la anterior | RF-10.1, RF-10.2 | El profesor (vista principal) y el administrador |
+| **Semanas de una persona:** detalle semana a semana con tareas y estado (incluido "sin reporte") | RF-10.3, RF-10.6, RF-09, RF-11.3 | El profesor, el administrador y la propia persona (su historial) |
+| **Consolidado de una persona:** acumulado por vinculación | RF-10.4 | El profesor y el administrador |
 
-Además, es la consulta que **más filas** procesa del sistema: la vista principal del profesor lee las tareas de todas sus personas en cada carga. Por eso solo trae lo que el seguimiento usa.
+La visibilidad (RF-12, RN-03 a RN-05) se aplica eligiendo **qué vinculaciones** se consultan.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Una consulta liviana
+### 3.1 Dependencias mínimas
 
 ```go
-const selectTareaPropia = `
-	SELECT t.id, t.vinculacion_id, t.semana_inicio, t.titulo, t.descripcion, t.estado,
-	       t.horas_invertidas, t.observaciones, t.tardia
-	FROM tareas t`
+type ListadorVinculaciones interface {
+	Listar(ctx context.Context, f dominio.FiltroVinculaciones) ([]dominio.Vinculacion, error)
+}
 
-func escanearTareaPropia(fila pgx.Row) (dominio.Tarea, error) {
-	var t dominio.Tarea
-	var estado string
-	err := fila.Scan(&t.ID, &t.VinculacionID, &t.SemanaInicio, &t.Titulo, &t.Descripcion, &estado,
-		&t.HorasInvertidas, &t.Observaciones, &t.Tardia)
-	t.Estado = dominio.EstadoTarea(estado)
-	return t, err
+type ListadorTareasPorVinculacion interface {
+	ListarPorVinculaciones(ctx context.Context, vinculacionIDs []string, desde, hasta *time.Time) ([]dominio.Tarea, error)
+}
+
+type BuscadorUsuarios interface {
+	BuscarPorID(ctx context.Context, id string) (dominio.Usuario, error)
 }
 ```
-- `selectTarea` (paso 35) une `tareas` con `vinculaciones`, `usuarios` y `espacios` y cuenta los adjuntos de **cada** fila con una subconsulta. Eso es útil para mostrar una tarea suelta, pero el seguimiento ya tiene esos datos: los obtuvo al leer las **vinculaciones**. Repetirlos en cada una de cientos o miles de tareas es trabajo inútil para PostgreSQL y más datos viajando por la red.
-- `selectTareaPropia` lee **solo la tabla `tareas`**, con las columnas que usan el cálculo semanal, el detalle y el consolidado.
-- Los campos que no se leen (nombre del usuario, del espacio, cantidad de adjuntos...) quedan con su **valor cero** en la `dominio.Tarea`. El seguimiento no los usa.
-- **Efecto medido:** con 3.000 tareas extra en una semana, este cambio duplicó las peticiones por segundo de la vista del profesor (de 217 a 423 por segundo, junto con el cambio del paso 43). El detalle está en el paso 64.
+- Tres interfaces de **un solo método** cada una: el servicio solo lee.
 
-### 3.2 El método
+### 3.2 `PersonasACargo`: la vista principal del profesor
 
 ```go
-func (r *Tareas) ListarPorVinculaciones(ctx context.Context, vinculacionIDs []string, desde, hasta *time.Time) ([]dominio.Tarea, error) {
-	if len(vinculacionIDs) == 0 {
-		return []dominio.Tarea{}, nil
+type ResumenPersona struct {
+	dominio.PersonaACargo
+	SemanaActual   *dominio.SemanaPersona
+	SemanaAnterior *dominio.SemanaPersona
+}
+
+func (s *Seguimiento) PersonasACargo(ctx context.Context, actor auth.Actor, f FiltroPersonas) ([]ResumenPersona, error) {
+	filtro := dominio.FiltroVinculaciones{EspacioID: f.EspacioID, Paginacion: dominio.SinPaginar}
+	switch {
+	case actor.EsAdministrador():
+		filtro.ProfesorID = f.ProfesorID
+	case actor.TieneRol(dominio.RolProfesor):
+		filtro.ProfesorID = actor.UsuarioID // RN-03
+	default:
+		return nil, apperr.Prohibido("solo profesores y administradores consultan personas a cargo")
 	}
-	var w filtro
-	w.agregar("t.vinculacion_id = ANY(?::uuid[])", vinculacionIDs)
+
+	vinculaciones, err := s.vinculaciones.Listar(ctx, filtro)
+	...
+	actual := s.reloj.SemanaActual()
+	anterior := actual.AddDate(0, 0, -7)
+	tareas, err := s.tareas.ListarPorVinculaciones(ctx, idsDe(vinculaciones), &anterior, &actual)
+	...
+	personas := dominio.AgruparPorPersona(vinculaciones)
+	tareasDe := tareasPorPersona(vinculaciones, tareas)
+	resultado := make([]ResumenPersona, 0, len(personas))
+	for _, p := range personas {
+		r := ResumenPersona{PersonaACargo: p}
+		for _, semana := range dominio.ConstruirSemanas(p.Vinculaciones, tareasDe[p.UsuarioID], anterior, actual, s.reloj.Ahora(), s.reloj.Zona()) {
+			semana := semana
+			if semana.SemanaInicio.Equal(actual) {
+				r.SemanaActual = &semana
+			} else {
+				r.SemanaAnterior = &semana
+			}
+		}
+		resultado = append(resultado, r)
+	}
+	return resultado, nil
+}
+```
+- **Struct embebido:** `ResumenPersona` incluye `dominio.PersonaACargo` sin nombre de campo. Sus campos (`Nombre`, `Vinculaciones`...) se usan como propios: `r.Nombre`.
+- **Visibilidad:** el profesor solo ve sus personas (RN-03; se **ignora** el `ProfesorID` que pida); el administrador puede filtrar por cualquier profesor; los demás roles → 403.
+- **Dos consultas en total**, sin importar cuántas personas haya: las vinculaciones y las tareas de las dos últimas semanas (paso 42).
+- `SinPaginar` (paso 11): aquí sí se necesitan todas las vinculaciones del profesor.
+- Para cada persona se construyen solo dos semanas: la **actual** (qué lleva reportado) y la **anterior** (¿quedó sin reporte?). Es lo que un profesor necesita ver de un vistazo.
+- `semana := semana` crea una **copia** de la variable del ciclo antes de tomar su dirección con `&semana`, para que cada puntero apunte a su propia semana. (Desde Go 1.22 cada vuelta ya tiene su propia variable, pero la copia explícita deja clara la intención.)
+- Un puntero `nil` en `SemanaActual` o `SemanaAnterior` significa "no estaba vinculada esa semana".
+
+**Cada persona recibe solo sus tareas:**
+
+```go
+func tareasPorPersona(vinculaciones []dominio.Vinculacion, tareas []dominio.Tarea) map[string][]dominio.Tarea {
+	duenoDe := make(map[string]string, len(vinculaciones))
+	for _, v := range vinculaciones {
+		duenoDe[v.ID] = v.UsuarioID
+	}
+	resultado := map[string][]dominio.Tarea{}
+	for _, t := range tareas {
+		persona := duenoDe[t.VinculacionID]
+		resultado[persona] = append(resultado[persona], t)
+	}
+	return resultado
+}
+```
+- La consulta del paso 42 trae las tareas de **todas** las personas del profesor juntas. `ConstruirSemanas` (paso 41) agrupa las tareas que recibe; si se le pasaran todas a cada persona, cada una volvería a recorrer y agrupar las tareas de todos los demás para luego no usarlas.
+- Con 40 personas y 3.000 tareas eso eran unas **120.000** operaciones por petición; repartiéndolas una vez son unas **3.000**. Las pruebas de carga lo confirmaron: la vista del profesor pasó de ~1.270 a ~2.560 peticiones por segundo con datos normales, y de 46 a 217 con 3.000 tareas extra (paso 64). Es la mejora principal de la deuda técnica DT-08.
+- `duenoDe` es un mapa "vinculación → persona": permite saber de quién es cada tarea con una sola búsqueda.
+- `make(map[string]string, len(vinculaciones))` reserva desde el inicio espacio para todas las entradas.
+- `append` sobre una clave que aún no existe funciona: el mapa devuelve una lista vacía (`nil`) y `append` crea la lista.
+
+### 3.3 `SemanasPersona`: el detalle y el historial
+
+```go
+func (s *Seguimiento) SemanasPersona(ctx context.Context, actor auth.Actor, personaID string, desde, hasta *time.Time) (DetallePersona, error) {
+	inicio, fin, err := s.rangoSemanas(desde, hasta)
+	...
+	persona, vinculaciones, err := s.vinculacionesVisibles(ctx, actor, personaID)
+	...
+	tareas, err := s.tareas.ListarPorVinculaciones(ctx, idsDe(vinculaciones), &inicio, &fin)
+	...
+	return DetallePersona{
+		Persona: persona,
+		Semanas: dominio.ConstruirSemanas(vinculaciones, tareas, inicio, fin, s.reloj.Ahora(), s.reloj.Zona()),
+	}, nil
+}
+```
+
+```go
+func (s *Seguimiento) rangoSemanas(desde, hasta *time.Time) (time.Time, time.Time, error) {
+	actual := s.reloj.SemanaActual()
+	fin := actual
+	if hasta != nil && dominio.InicioSemana(*hasta).Before(actual) {
+		fin = dominio.InicioSemana(*hasta)
+	}
+	inicio := fin.AddDate(0, 0, -7*7) // 8 semanas por defecto
 	if desde != nil {
-		w.agregar("t.semana_inicio >= ?", *desde)
+		inicio = dominio.InicioSemana(*desde)
 	}
-	if hasta != nil {
-		w.agregar("t.semana_inicio <= ?", *hasta)
-	}
-	filas, err := r.db.Query(ctx, selectTareaPropia+w.where()+` ORDER BY t.semana_inicio DESC, t.creado_en`, w.args...)
-	if err != nil {
-		return nil, traducir(err, recursoTareas)
-	}
-	tareas, err := recolectar(filas, escanearTareaPropia)
-	return tareas, traducir(err, recursoTareas)
+	if inicio.After(fin) { ... 400 ... }
+	if fin.Sub(inicio) > time.Duration(dominio.MaxSemanasConsulta-1)*7*24*time.Hour { ... 400 ... }
+	return inicio, fin, nil
 }
 ```
+- Por defecto, **las últimas 8 semanas** (la actual y 7 anteriores). Nunca más allá de la semana actual. Máximo 53 semanas por consulta.
 
-- **Sin vinculaciones, sin consulta:** devuelve una lista vacía de inmediato. Una persona sin vinculaciones no tiene tareas.
-- **`= ANY(?::uuid[])`:** pgx envía la lista de Go (`[]string`) como un **arreglo** de PostgreSQL, y `::uuid[]` lo convierte a arreglo de UUID. `ANY` compara contra cada elemento. Es la forma eficiente y segura de hacer un `IN (...)` con una cantidad variable de valores **en un solo parámetro**, sin armar el SQL a mano.
-- **Rango opcional:** `desde` y `hasta` son punteros; `nil` = sin límite (el consolidado del paso 43 necesita todo el historial).
-- Usa el índice `tareas_vinculacion_semana (vinculacion_id, semana_inicio)` del paso 4, que cubre justamente este filtro.
-- No pagina y no aplica `VisiblePara`: la visibilidad ya se resolvió al elegir **qué vinculaciones** se consultan (paso 43).
+### 3.4 `vinculacionesVisibles`: quién puede ver a quién
+
+```go
+func (s *Seguimiento) vinculacionesVisibles(ctx context.Context, actor auth.Actor, personaID string) (dominio.Usuario, []dominio.Vinculacion, error) {
+	filtro := dominio.FiltroVinculaciones{UsuarioID: personaID, Paginacion: dominio.SinPaginar}
+	propio := actor.UsuarioID == personaID
+	switch {
+	case propio || actor.EsAdministrador():
+	case actor.TieneRol(dominio.RolProfesor):
+		filtro.ProfesorID = actor.UsuarioID
+	default:
+		return dominio.Usuario{}, nil, noEncontrado("persona")
+	}
+	persona, err := s.usuarios.BuscarPorID(ctx, personaID)
+	...
+	vinculaciones, err := s.vinculaciones.Listar(ctx, filtro)
+	...
+	if len(vinculaciones) == 0 && !propio && !actor.EsAdministrador() {
+		return dominio.Usuario{}, nil, noEncontrado("persona")
+	}
+	return persona, vinculaciones, nil
+}
+```
+- **La propia persona** ve **todas** sus vinculaciones (RF-11.3: su historial).
+- **El administrador** ve todo (RN-05).
+- **Un profesor** ve a la persona **solo a través de sus propios espacios** (RN-03): si Laura es monitora de dos profesores, cada uno ve únicamente su parte. Si no tiene ninguna vinculación con él → 404.
+- Un `case` vacío en un `switch` significa "no hacer nada en este caso".
+
+### 3.5 `Consolidado`
+
+- Las vinculaciones visibles + **todas** sus tareas (`nil, nil` = sin rango) → `dominio.ConstruirConsolidado` (paso 41).
 
 ---
 
-## 4. Conceptos de este paso
+## 4. Las pruebas
+
+El reloj marca el miércoles 14/10/2026 (semana actual: 12/10). Laura tiene una monitoría (4 h) con el profesor `prof-1` desde agosto y una tarea de 2 h esta semana.
+
+| Prueba | Qué verifica |
+|---|---|
+| `TestPersonasACargo` | Aunque el profesor pida `prof-2`, el filtro usa su propio ID (RN-03). Laura aparece con la semana actual (2 h reportadas) y la anterior **sin reporte**. Un monitor → 403. |
+| `TestSemanasPersonaVisibilidadYRango` | Por defecto 8 semanas, del 24/08 al 12/10. La propia Laura ve su historial (RF-11.3). Otro profesor → 404 (RN-03). Un monitor ajeno → 404 (RN-04). Rango invertido → 400. Rango de más de 53 semanas → 400. El consolidado del administrador suma las 2 h. |
+
+---
+
+## 5. Conceptos de Go de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Problema N+1 | Hacer una consulta por elemento en lugar de una para todos. |
-| `= ANY($1::uuid[])` | Comparar contra una lista enviada como un único parámetro de tipo arreglo. |
-| Índice compuesto | `(vinculacion_id, semana_inicio)` acelera filtros por ambas columnas. |
-| Retorno temprano | Si no hay nada que buscar, se responde sin tocar la base de datos. |
-| Valor cero | Un campo de un `struct` que no se asigna vale `""`, `0`, `false` o `nil`, según su tipo. |
+| Struct embebido | `ResumenPersona` incluye `dominio.PersonaACargo`; sus campos se promueven. |
+| Copia de la variable del ciclo | `semana := semana` antes de tomar `&semana`. |
+| `case` vacío | En un `switch`, un caso que solo detiene la evaluación. |
+| `t.Sub(u)` | Diferencia entre dos instantes (`time.Duration`). |
+| `make(map[K]V, n)` | Crea un mapa con espacio reservado para `n` entradas. |
+| `append` sobre un mapa | `m[k] = append(m[k], v)` funciona aunque `k` no exista todavía. |
 
 ---
 
-## 5. Cómo comprobarlo
+## 6. Cómo comprobarlo
 
 ```bash
-make lint
+cd backend
+go test ./internal/servicio/ -v -run 'PersonasACargo|SemanasPersona'
 ```
 
-Se ejercita a través del servicio de seguimiento (paso 43, con un doble en memoria), por HTTP (paso 44) y con las pruebas de integración (paso 58).
-
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 41
+## 7. Pasos para lograr esta versión desde el paso 42
 
-1. En `backend/internal/repositorio/tareas.go`, después de `Listar`, agregar `selectTareaPropia`, `escanearTareaPropia` y `ListarPorVinculaciones` (sección 3).
-2. `make lint`
-3. Commit: `git add . && git commit -m "Paso 42: consulta de tareas por vinculaciones"`
-
----
-
-## 7. Preparación para las próximas entregas
-
-- Esta consulta es la base del escenario "vista del profesor" de las pruebas de carga de todas las entregas. Si en la nube siguiera siendo el cuello de botella, el siguiente paso sería una consulta que devuelva directamente horas y cantidad de tareas por vinculación y semana (`GROUP BY`), a costa de un poco más de código en el dominio.
+1. Crear `backend/internal/servicio/seguimiento.go` con las tres interfaces, `FiltroPersonas`, `ResumenPersona`, `DetallePersona`, `ConsolidadoPersona`, `Seguimiento`, `NuevoSeguimiento`, los tres casos de uso y las funciones auxiliares.
+2. Al final de `modulos_test.go`, la sección `// --- seguimiento ---` con `listadorTareasFalso`, `entornoSeguimiento` y las dos pruebas.
+3. `make pruebas lint`
+4. Commit: `git add . && git commit -m "Paso 43: servicio de seguimiento"`
 
 ---
 
@@ -118,6 +235,9 @@ Se ejercita a través del servicio de seguimiento (paso 43, con un doble en memo
 
 | Requisito | Cómo |
 |---|---|
-| RF-10.3 / RF-10.4 Detalle y consolidado | Proporciona las tareas de todas las vinculaciones de una persona. |
-| RF-10.1 Personas a cargo | Tareas de todas las vinculaciones del profesor en dos semanas. |
-| RNF-01 Backend sólido | Una consulta por pantalla, no una por vinculación. |
+| RF-10.1 / RF-10.2 Personas a cargo | `PersonasACargo`. |
+| RF-10.3 / RF-10.6 Detalle semanal | `SemanasPersona`. |
+| RF-10.4 Consolidado | `Consolidado`. |
+| RF-11.3 Historial propio | `SemanasPersona` sobre el propio usuario. |
+| RF-09 Sin reporte | Semanas cerradas sin tareas. |
+| RF-12 / RN-03 a RN-05 Visibilidad | `vinculacionesVisibles` y filtro por profesor. |

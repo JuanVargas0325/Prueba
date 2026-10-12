@@ -679,3 +679,79 @@ func TestAgregarAdjuntosATareaModificable(t *testing.T) {
 		t.Error("el adjunto debería registrarse y guardarse")
 	}
 }
+
+// --- seguimiento ----------------------------------------------------------------------------------
+
+type listadorTareasFalso struct {
+	tareas       []dominio.Tarea
+	desde, hasta *time.Time
+}
+
+func (l *listadorTareasFalso) ListarPorVinculaciones(_ context.Context, _ []string, desde, hasta *time.Time) ([]dominio.Tarea, error) {
+	l.desde, l.hasta = desde, hasta
+	return l.tareas, nil
+}
+
+func entornoSeguimiento(t *testing.T) (*Seguimiento, *repoVinculacionesFalso, *listadorTareasFalso) {
+	vinculaciones := &repoVinculacionesFalso{vinculaciones: map[string]dominio.Vinculacion{
+		"v1": {ID: "v1", UsuarioID: "u1", UsuarioNombre: "Laura", ProfesorID: "prof-1", Rol: dominio.RolMonitor, HorasSemanales: 4,
+			EspacioEstado: dominio.EspacioActivo, EspacioFechaInicio: fechaP(t, "2026-08-03"), EspacioFechaCierre: fechaP(t, "2026-12-04"),
+			CreadoEn: fechaP(t, "2026-08-01")},
+	}}
+	usuarios := nuevoRepoUsuarios()
+	usuarios.usuarios["u1"] = dominio.Usuario{ID: "u1", Nombre: "Laura"}
+	tareas := &listadorTareasFalso{tareas: []dominio.Tarea{
+		{VinculacionID: "v1", SemanaInicio: fechaP(t, "2026-10-12"), HorasInvertidas: 2, Estado: dominio.TareaAbierta},
+	}}
+	return NuevoSeguimiento(vinculaciones, tareas, usuarios, RelojFijo(ahoraPrueba, time.UTC)), vinculaciones, tareas
+}
+
+func TestPersonasACargo(t *testing.T) {
+	s, repo, _ := entornoSeguimiento(t)
+	personas, err := s.PersonasACargo(context.Background(), profesor, FiltroPersonas{ProfesorID: "prof-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.filtro.ProfesorID != "prof-1" {
+		t.Error("el profesor solo ve a sus propias personas (RN-03)")
+	}
+	if len(personas) != 1 || personas[0].SemanaActual == nil || personas[0].SemanaActual.HorasReportadas != 2 ||
+		personas[0].SemanaAnterior == nil || personas[0].SemanaAnterior.Estado != dominio.SemanaSinReporte {
+		t.Fatalf("resumen inesperado: %+v", personas)
+	}
+	_, err = s.PersonasACargo(context.Background(), monitor, FiltroPersonas{})
+	esperarTipo(t, err, apperr.TipoProhibido)
+}
+
+func TestSemanasPersonaVisibilidadYRango(t *testing.T) {
+	s, _, tareas := entornoSeguimiento(t)
+	ctx := context.Background()
+	laura := auth.Actor{UsuarioID: "u1", Roles: []dominio.Rol{dominio.RolMonitor}}
+
+	d, err := s.SemanasPersona(ctx, profesor, "u1", nil, nil)
+	if err != nil || len(d.Semanas) != 8 {
+		t.Fatalf("por defecto se consultan 8 semanas: %d %v", len(d.Semanas), err)
+	}
+	if tareas.desde.Format(dominio.FormatoFecha) != "2026-08-24" || tareas.hasta.Format(dominio.FormatoFecha) != "2026-10-12" {
+		t.Errorf("rango inesperado: %v a %v", tareas.desde, tareas.hasta)
+	}
+	if _, err := s.SemanasPersona(ctx, laura, "u1", nil, nil); err != nil {
+		t.Errorf("la propia persona puede ver su historial (RF-11.3): %v", err)
+	}
+	_, err = s.SemanasPersona(ctx, otroProf, "u1", nil, nil)
+	esperarTipo(t, err, apperr.TipoNoEncontrado) // RN-03
+	_, err = s.SemanasPersona(ctx, monitor, "u1", nil, nil)
+	esperarTipo(t, err, apperr.TipoNoEncontrado) // RN-04
+
+	desde, hasta := fechaP(t, "2026-10-12"), fechaP(t, "2026-09-01")
+	_, err = s.SemanasPersona(ctx, profesor, "u1", &desde, &hasta)
+	esperarTipo(t, err, apperr.TipoValidacion)
+	muyAtras := fechaP(t, "2024-01-01")
+	_, err = s.SemanasPersona(ctx, profesor, "u1", &muyAtras, nil)
+	esperarTipo(t, err, apperr.TipoValidacion)
+
+	c, err := s.Consolidado(ctx, admin, "u1")
+	if err != nil || len(c.Vinculaciones) != 1 || c.Vinculaciones[0].TotalHoras != 2 {
+		t.Errorf("consolidado inesperado: %+v %v", c, err)
+	}
+}
