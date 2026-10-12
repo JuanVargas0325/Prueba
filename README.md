@@ -1,165 +1,114 @@
-# Paso 19 · Endpoints de usuarios
+# Paso 20 · Dominio: fechas y semanas
 
-> Rama `paso-a-paso` · paso 19 de 65 · anterior: **Paso 18 · Servicio de gestión de usuarios** · siguiente: **Paso 20 · Dominio: fechas y semanas**
+> Rama `paso-a-paso` · paso 20 de 65 · anterior: **Paso 19 · Endpoints de usuarios** · siguiente: **Paso 21 · Dominio: períodos académicos**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-El administrador ya puede gestionar usuarios por HTTP:
-
-| Método | Ruta | Rol | Descripción |
-|---|---|---|---|
-| POST | `/api/v1/usuarios` | administrador | Crea un usuario con sus roles (201 + cabecera `Location`). |
-| GET | `/api/v1/usuarios` | administrador | Lista usuarios. Filtros: `?rol=`, `?busqueda=`, `?limite=`, `?desplazamiento=`. |
-| GET | `/api/v1/usuarios/{id}` | administrador | Detalle de un usuario. |
-| PUT | `/api/v1/usuarios/{id}/roles` | administrador | Reemplaza sus roles. |
+Se agregaron al dominio las funciones para trabajar con **fechas de calendario** y **semanas de lunes a domingo**, la unidad de tiempo de todo el sistema.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/go.mod`, `go.sum` | Nueva dependencia `github.com/google/uuid v1.6.0` (validar identificadores). |
-| `backend/internal/handler/usuarios.go` | **Nuevo.** Módulo de usuarios. |
-| `backend/internal/handler/respuestas.go` | **Modificado.** `parametroUUID`, `consultaPaginacion` y la función genérica `convertir`. |
-| `backend/internal/handler/router.go` | **Modificado.** Servicio `Usuarios` en `Dependencias` y el módulo en la lista. |
-| `backend/internal/handler/router_test.go` | **Modificado.** El entorno guarda el gestor de tokens y emite tokens por rol (`e.token`); prueba de control de acceso por rol. |
-| `backend/internal/handler/modulos_test.go` | **Nuevo.** Pruebas de los módulos; la primera, del módulo de usuarios. |
-| `backend/cmd/api/main.go` | **Modificado.** Crea el servicio de usuarios. |
+| `backend/internal/dominio/semana.go` | **Nuevo.** `FormatoFecha`, `Fecha`, `ParsearFecha`, `InicioSemana`, `FinSemana`, `SemanaActual` y `SemanaCerrada`. |
+| `backend/internal/dominio/semana_test.go` | **Nuevo.** Pruebas con casos límite: domingo, cruce de año y cambio de día por zona horaria. |
 
 ---
 
 ## 2. Por qué
 
-- **RF-02.1 a RF-02.3 y RF-15.2** quedan accesibles para el administrador.
-- **Validar los identificadores en la entrada:** si alguien pide `/usuarios/123`, la base de datos fallaría al convertir `123` a UUID. Es mejor responder **400** con un mensaje claro antes de llegar a la base de datos.
-- **REST:** se usan los verbos y códigos estándar. `POST` crea y responde **201 Created** con la cabecera `Location` (dónde quedó el recurso); `PUT` reemplaza (los roles se envían completos).
+Casi todas las reglas del proyecto dependen de la semana:
+- **RF-08.1 / RN-29:** la semana operativa va de **lunes a domingo**.
+- **RF-08.2:** las tareas solo se editan mientras su semana está **activa**.
+- **RF-08.4 / RN-32:** registrar una tarea en una semana ya cerrada la marca como **reporte tardío**.
+- **RF-09:** una semana cerrada sin tareas queda **sin reporte**.
+- **RF-14:** los reportes con IA son de una semana concreta.
+
+Si cada módulo calculara las semanas a su manera, aparecerían diferencias sutiles (¿el domingo es fin o inicio de semana?, ¿en qué zona horaria?). Por eso se resuelve **una vez**, en el dominio, con pruebas de los casos difíciles.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 `usuarios.go` (handler)
+### 3.1 Cómo se representan las fechas
 
 ```go
-type ServicioUsuarios interface {
-	Crear(ctx context.Context, actor auth.Actor, n servicio.NuevoUsuario) (dominio.Usuario, error)
-	Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroUsuarios) ([]dominio.Usuario, error)
-	Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Usuario, error)
-	AsignarRoles(ctx context.Context, actor auth.Actor, id string, roles []dominio.Rol) (dominio.Usuario, error)
-}
-
-type HandlerUsuarios struct {
-	servicio ServicioUsuarios
-	log      *slog.Logger
-}
-
-func (h *HandlerUsuarios) Registrar(g *gin.RouterGroup) {
-	r := g.Group("/usuarios", RequiereRol(dominio.RolAdministrador))
-	r.POST("", h.Crear)
-	r.GET("", h.Listar)
-	r.GET("/:id", h.Obtener)
-	r.PUT("/:id/roles", h.AsignarRoles)
-}
+const FormatoFecha = "2006-01-02"
 ```
-- La misma anatomía del paso 17. Aquí **todo el grupo** exige el rol de administrador.
-- `/:id` es un **parámetro de ruta**: en `/usuarios/6f1c...`, `id` vale `6f1c...`.
+- En Go, los formatos de fecha se escriben **con una fecha de ejemplo fija**: el 2 de enero de 2006 a las 15:04:05 (1-2-3-4-5-6). `"2006-01-02"` significa "año de 4 dígitos, mes de 2, día de 2": el formato ISO `AAAA-MM-DD` que usa la API.
+
+> Las fechas sin hora (`DATE` en PostgreSQL) se representan como `time.Time` **a medianoche UTC**. Así una fecha no cambia de día al pasar entre zonas horarias.
+
+Un `time.Time` siempre tiene hora y zona. Si "12 de octubre" se guardara como medianoche de Bogotá y luego se convirtiera a UTC, quedaría "12 de octubre 05:00", y en otra zona podría verse como el 11. Al fijar todas las fechas a **medianoche UTC**, el día de calendario nunca se mueve.
+
+### 3.2 Funciones
 
 ```go
-type peticionUsuario struct {
-	Nombre   string        `json:"nombre"`
-	Correo   string        `json:"correo"`
-	Password string        `json:"password"`
-	Roles    []dominio.Rol `json:"roles"`
-}
-```
-- `[]dominio.Rol` se lee directamente del JSON (`["monitor","asistente_graduado"]`), porque `Rol` está basado en `string`. Que cada rol sea válido lo verifica el servicio.
-
-```go
-func (h *HandlerUsuarios) Crear(c *gin.Context) {
-	var p peticionUsuario
-	if err := leerJSON(c, &p); err != nil { ... }
-	u, err := h.servicio.Crear(c.Request.Context(), ActorDe(c), servicio.NuevoUsuario{...})
-	if err != nil { ... }
-	c.Header("Location", "/api/v1/usuarios/"+u.ID)
-	c.JSON(http.StatusCreated, aUsuarioJSON(u))
-}
-```
-
-```go
-func (h *HandlerUsuarios) Listar(c *gin.Context) {
-	usuarios, err := h.servicio.Listar(c.Request.Context(), ActorDe(c), dominio.FiltroUsuarios{
-		Rol:        dominio.Rol(c.Query("rol")),
-		Busqueda:   c.Query("busqueda"),
-		Paginacion: consultaPaginacion(c),
-	})
-	...
-	c.JSON(http.StatusOK, convertir(usuarios, aUsuarioJSON))
-}
-```
-- `c.Query("rol")` lee un parámetro de la consulta (`?rol=monitor`); devuelve `""` si no viene.
-
-### 3.2 `respuestas.go`: nuevas utilidades
-
-```go
-func parametroUUID(c *gin.Context, nombre string) (string, error) {
-	valor := c.Param(nombre)
-	if _, err := uuid.Parse(valor); err != nil {
-		return "", apperr.Validacion("%s debe ser un identificador válido", nombre)
+func Fecha(t time.Time, zona *time.Location) time.Time {
+	if zona != nil {
+		t = t.In(zona)
 	}
-	return valor, nil
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
 ```
-- Lee un parámetro de ruta y verifica que sea un UUID.
+- Convierte un **instante** (por ejemplo, "ahora") en la **fecha de calendario** que le corresponde en la zona dada.
+- Ejemplo de la prueba: el lunes 12 de octubre de 2026 a las 02:00 **UTC** todavía es **domingo 11** en Bogotá (UTC−5). `Fecha(instante, bogota)` devuelve 2026-10-11. Sin la zona horaria, un monitor que reporta el domingo a las 9 p. m. vería su tarea en la semana siguiente.
 
 ```go
-func consultaPaginacion(c *gin.Context) dominio.Paginacion {
-	limite, _ := strconv.Atoi(c.Query("limite"))
-	desplazamiento, _ := strconv.Atoi(c.Query("desplazamiento"))
-	return dominio.Paginacion{Limite: max(limite, 0), Desplazamiento: max(desplazamiento, 0)}
+func ParsearFecha(texto string) (time.Time, error) {
+	return time.ParseInLocation(FormatoFecha, strings.TrimSpace(texto), time.UTC)
 }
 ```
-- `strconv.Atoi` convierte texto a número. Si el texto no es un número, devuelve 0 (y se ignora el error con `_`).
-- `max(x, 0)` (función incorporada desde Go 1.21) evita negativos. Así nadie puede enviar `limite=-1` y obtener el `SinPaginar` interno (paso 11). El máximo de 200 lo aplica el repositorio.
+- Interpreta `"2026-10-08"` como medianoche UTC de ese día. Falla con otros formatos (`"14/10/2026"`).
 
 ```go
-func convertir[E, S any](entrada []E, f func(E) S) []S {
-	salida := make([]S, 0, len(entrada))
-	for _, e := range entrada {
-		salida = append(salida, f(e))
-	}
-	return salida
+func InicioSemana(fecha time.Time) time.Time {
+	d := time.Date(fecha.Year(), fecha.Month(), fecha.Day(), 0, 0, 0, 0, time.UTC)
+	desplazamiento := (int(d.Weekday()) + 6) % 7 // lunes=0 ... domingo=6
+	return d.AddDate(0, 0, -desplazamiento)
 }
 ```
-- **Genérica con dos tipos**: convierte una lista de `E` (por ejemplo `dominio.Usuario`) en una lista de `S` (`usuarioJSON`) aplicando `f` a cada elemento. Se usará en todos los listados.
-- `make([]S, 0, len(entrada))` crea una lista vacía con **capacidad** reservada: `append` no tendrá que redimensionarla.
-- Siempre devuelve una lista (nunca `nil`), así el JSON es `[]` y no `null`.
-
-### 3.3 `router.go`
+- Devuelve el **lunes** de la semana de cualquier fecha.
+- `Weekday()` numera los días a la manera estadounidense: domingo = 0, lunes = 1, …, sábado = 6. Con `(día + 6) % 7` se reacomoda a lunes = 0, …, domingo = 6, que es exactamente cuántos días hay que retroceder.
+  - jueves (4) → (4+6) % 7 = 3 → retrocede 3 días → lunes;
+  - domingo (0) → (0+6) % 7 = 6 → retrocede 6 días → el lunes anterior.
+- `%` es el resto de la división. `AddDate(0, 0, -n)` resta n días.
+- Toda semana se identifica por **su lunes**. Por eso la tabla `tareas` exige que `semana_inicio` sea lunes (paso 4).
 
 ```go
-type Dependencias struct {
-	Autenticacion ServicioAutenticacion
-	Usuarios      ServicioUsuarios
-	...
+func FinSemana(fecha time.Time) time.Time {
+	return InicioSemana(fecha).AddDate(0, 0, 6)
 }
-...
-	modulos := []modulo{
-		autenticacion,
-		&HandlerUsuarios{servicio: d.Usuarios, log: d.Log},
-	}
+
+func SemanaActual(ahora time.Time, zona *time.Location) time.Time {
+	return InicioSemana(Fecha(ahora, zona))
+}
+
+func SemanaCerrada(semanaInicio, ahora time.Time, zona *time.Location) bool {
+	return InicioSemana(semanaInicio).Before(SemanaActual(ahora, zona))
+}
 ```
-- Agregar un módulo = un campo en `Dependencias` + una línea en la lista. Ese será el patrón en cada paso de endpoints.
+- `FinSemana`: el domingo (lunes + 6 días).
+- `SemanaActual`: el lunes de la semana en curso **según la zona horaria**.
+- `SemanaCerrada`: una semana está cerrada si su lunes es anterior al lunes de la semana actual. Es la base de la tardanza (RN-32) y de la inmutabilidad de las tareas (RN-34).
+- Las funciones reciben `ahora` como parámetro en lugar de llamar a `time.Now()`: así las pruebas pueden fijar el "hoy" que quieran. En el paso 27 se agregará un **reloj inyectable** con la misma idea para los servicios.
 
-### 3.4 Pruebas
+### 3.3 Pruebas (`semana_test.go`)
 
-En `router_test.go`:
-- `entorno` guarda el gestor de tokens y `e.token(t, dominio.RolMonitor)` emite un token para el usuario ficticio `usuario-1` con los roles pedidos.
-- `uuidA` es un UUID fijo para las rutas de prueba.
-- `TestRutasProtegidasExigenToken` incluye `/api/v1/usuarios`.
-- **`TestControlDeAccesoPorRol`** (nueva): una tabla de casos *(método, ruta, token)* que deben responder **403**. Hoy: un monitor no puede listar usuarios. Cada módulo agregará sus casos.
+```go
+func fecha(t *testing.T, texto string) time.Time { ... }
+```
+- Auxiliar para escribir fechas legibles en las pruebas: `fecha(t, "2026-10-05")`. Se reutilizará en las pruebas de reglas.
 
-En `modulos_test.go` (nuevo):
-- `servicioUsuariosFalso`: servicio falso que guarda lo que recibió y devuelve un usuario **con un hash ficticio**.
-- `TestCrearUsuarioNoExponeElHash`: la respuesta de crear usuario **no** contiene ni `password` ni el hash; el servicio recibió los roles y la contraseña; y asignar roles responde 200.
+| Prueba | Casos |
+|---|---|
+| `TestInicioSemanaDevuelveLunes` | Lunes → el mismo; jueves → lunes; **domingo → el lunes anterior**; **1 de enero de 2026 (jueves) → 29 de diciembre de 2025** (cruce de año). |
+| `TestFinSemanaDevuelveDomingo` | Miércoles 7 → domingo 11. |
+| `TestFechaUsaLaZonaHoraria` | 02:00 UTC del lunes 12 es domingo 11 en Bogotá, y la semana actual es la del 5. |
+| `TestSemanaCerrada` | La semana en curso no está cerrada; la anterior sí. |
+| `TestParsearFechaRechazaFormatoInvalido` | `14/10/2026` es inválido. |
+
+Las pruebas usan un **mapa entrada → resultado esperado** y un ciclo: es el estilo de *pruebas por tabla*, muy común en Go.
 
 ---
 
@@ -167,54 +116,38 @@ En `modulos_test.go` (nuevo):
 
 | Concepto | Explicación |
 |---|---|
-| Parámetros de ruta | `/:id` en Gin; se leen con `c.Param("id")`. |
-| Parámetros de consulta | `?rol=x`; se leen con `c.Query("rol")`. |
-| Genéricos con varios tipos | `func convertir[E, S any](...)`. |
-| `make` con capacidad | `make([]T, 0, n)` reserva espacio para `n` elementos. |
-| `max` / `min` | Funciones incorporadas (Go 1.21+). |
-| `strconv.Atoi` | Texto → entero. |
+| Formato de fechas | Se escribe con la fecha de referencia `2006-01-02 15:04:05`. |
+| `time.Date(...)` | Construye una fecha con año, mes, día, hora y zona. |
+| `t.In(zona)` | El mismo instante visto en otra zona horaria. |
+| `AddDate(años, meses, días)` | Suma o resta tiempo de calendario. |
+| `Before` / `After` | Comparación de instantes. |
+| `%` | Resto de la división entera. |
+| Pruebas por tabla | Mapa o lista de casos recorrida en un ciclo. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-make pruebas
-docker compose up --build -d --wait
-TOKEN=...   # token del administrador (paso 17)
-
-curl -i -X POST localhost:8080/api/v1/usuarios -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"nombre":"Laura Martínez","correo":"Laura@uniandes.edu.co","password":"Clave123*","roles":["monitor","monitor","asistente_graduado"]}'
-# 201 Created · Location: /api/v1/usuarios/<id> · correo en minúsculas · roles sin repetir
-
-curl -s "localhost:8080/api/v1/usuarios?rol=monitor&busqueda=lau" -H "Authorization: Bearer $TOKEN"
-curl -s -X PUT localhost:8080/api/v1/usuarios/<id>/roles -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -d '{"roles":["monitor"]}'
-
-# Mismo correo otra vez → 409 conflicto
-# Con el token de Laura: GET /api/v1/usuarios → 403 prohibido
-# GET /api/v1/usuarios/no-uuid → 400 "id debe ser un identificador válido"
+cd backend
+go test ./internal/dominio/ -v -run 'Semana|Fecha'
 ```
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 18
+## 6. Pasos para lograr esta versión desde el paso 19
 
-1. `go get github.com/google/uuid@v1.6.0 && go mod tidy` (desde `backend/`).
-2. En `respuestas.go` agregar `parametroUUID`, `consultaPaginacion` y `convertir`.
-3. Crear `backend/internal/handler/usuarios.go` (interfaz, handler, `Registrar`, `peticionUsuario`, `peticionRoles` y los cuatro endpoints).
-4. En `router.go`: campo `Usuarios ServicioUsuarios` y `&HandlerUsuarios{...}` en la lista de módulos.
-5. En `router_test.go`: campo `tokens` en `entorno`, método `token`, constante `uuidA`, `/api/v1/usuarios` en la prueba de rutas protegidas y la nueva `TestControlDeAccesoPorRol`.
-6. Crear `backend/internal/handler/modulos_test.go` con `servicioUsuariosFalso` y `TestCrearUsuarioNoExponeElHash`.
-7. En `main.go`: `Usuarios: servicio.NuevoUsuarios(usuarios, log)`.
-8. `make pruebas lint`, probar con `curl` y commit: `git add . && git commit -m "Paso 19: endpoints de usuarios"`
+1. Crear `backend/internal/dominio/semana.go` con `FormatoFecha`, el comentario sobre fechas a medianoche UTC y las seis funciones.
+2. Crear `backend/internal/dominio/semana_test.go` con el auxiliar `fecha` y las cinco pruebas.
+3. `make pruebas lint`
+4. Commit: `git add . && git commit -m "Paso 20: dominio de fechas y semanas"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- **`Location` en los 201** y listados paginados son convenciones que el frontend (Entrega 2) puede aprovechar directamente.
-- **La tabla de `TestControlDeAccesoPorRol`** documenta, en forma ejecutable, quién puede hacer qué. Cualquier cambio de permisos que la rompa se detecta en CI.
+- **Todo depende de `APP_ZONA_HORARIA`, no de la zona del servidor.** Las máquinas de la nube suelen estar en UTC; gracias a esto, las semanas se siguen calculando en hora de Bogotá aunque la API corra en otra región.
+- La futura notificación de los viernes (fuera del alcance de la Entrega 1) podrá usar estas mismas funciones para saber qué semana está por cerrar.
 
 ---
 
@@ -222,8 +155,6 @@ curl -s -X PUT localhost:8080/api/v1/usuarios/<id>/roles -H "Authorization: Bear
 
 | Requisito | Cómo |
 |---|---|
-| RF-02.1 Crear usuarios | `POST /api/v1/usuarios`. |
-| RF-02.2 Asignar roles | `PUT /api/v1/usuarios/{id}/roles`. |
-| RF-02.3 Consulta global | `GET /api/v1/usuarios` con filtros y paginación. |
-| RF-01.2 Control de acceso por rol | Grupo exclusivo del administrador, probado en `TestControlDeAccesoPorRol`. |
-| RF-15.2 Administración | Todo el módulo es del administrador. |
+| RF-08.1 / RN-29 Semana de lunes a domingo | `InicioSemana`, `FinSemana`. |
+| RF-08.2 Semana activa | `SemanaActual` con zona horaria. |
+| RN-32 Tardanza | `SemanaCerrada` (se usará en el paso 34). |
