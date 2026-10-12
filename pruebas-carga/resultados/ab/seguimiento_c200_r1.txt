@@ -1,0 +1,44 @@
+This is ApacheBench, Version 2.3 <$Revision: 1923142 $>
+Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
+Licensed to The Apache Software Foundation, http://www.apache.org/
+
+Benchmarking nginx (be patient)
+Finished 60800 requests
+
+
+Server Software:        nginx
+Server Hostname:        nginx
+Server Port:            80
+
+Document Path:          /api/v1/seguimiento/personas
+Document Length:        26743 bytes
+
+Concurrency Level:      200
+Time taken for tests:   15.000 seconds
+Complete requests:      60800
+Failed requests:        0
+Keep-Alive requests:    0
+Total transferred:      1634404608 bytes
+HTML transferred:       1626074323 bytes
+Requests per second:    4053.31 [#/sec] (mean)
+Time per request:       49.342 [ms] (mean)
+Time per request:       0.247 [ms] (mean, across all concurrent requests)
+Transfer rate:          106406.03 [Kbytes/sec] received
+
+Connection Times (ms)
+              min  mean[+/-sd] median   max
+Connect:        0    0   0.4      0       7
+Processing:     5   49   4.2     48      80
+Waiting:        2   48   4.1     48      77
+Total:         12   49   4.1     49      80
+
+Percentage of the requests served within a certain time (ms)
+  50%     49
+  66%     50
+  75%     51
+  80%     52
+  90%     54
+  95%     57
+  98%     60
+  99%     62
+ 100%     80 (longest request)

@@ -1,176 +1,122 @@
-# Paso 63 · Scripts de pruebas de carga
+# Paso 64 · Resultados de las pruebas de carga
 
-> Rama `paso-a-paso` · paso 63 de 65 · anterior: **Paso 62 · SonarQube** · siguiente: **Paso 64 · Resultados de las pruebas de carga**
+> Rama `paso-a-paso` · paso 64 de 65 · anterior: **Paso 63 · Scripts de pruebas de carga** · siguiente: **Paso 65 · README final**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se agregaron las herramientas para medir la **capacidad** del sistema: cuántas peticiones por segundo atiende y cuánto tarda en responder a medida que aumentan los usuarios simultáneos. Siguen el tutorial de análisis de capacidad del curso.
+Se ejecutó la medición completa con los scripts del paso 63 y se versionaron sus resultados: **45 corridas** (3 escenarios × 5 niveles de concurrencia × 3 repeticiones de 15 s).
 
-| Archivo | Cambio |
+| Archivo o carpeta | Contenido |
 |---|---|
-| `pruebas-carga/datos_carga.sql` | **Nuevo.** Escenario de carga: 1 profesora, 40 monitores y 800 tareas. |
-| `pruebas-carga/ejecutar.sh` | **Nuevo.** Ejecuta Apache Benchmark (`ab`) por niveles de concurrencia y mide CPU y memoria. |
-| `pruebas-carga/analizar.py` | **Nuevo.** Resume los resultados en tablas y gráficas (Markdown + Mermaid). |
-| `.gitignore` | **Modificado.** Ignora los archivos temporales que genera el script. |
+| `pruebas-carga/resultados/ab/*.txt` (45) | Salida completa de Apache Benchmark de cada corrida. |
+| `pruebas-carga/resultados/stats/*.csv` (45) | Muestras de CPU y memoria de la API y PostgreSQL durante cada corrida. |
+| `pruebas-carga/resultados/resumen.csv` | Una fila por corrida con las métricas principales. |
+| `pruebas-carga/resultados/resumen.md` | Tablas (media ± desviación) y gráficas Mermaid que genera `analizar.py`. |
 
-En este paso solo están las herramientas. Los resultados de la corrida completa se suben en el paso 64.
+No hay código nuevo: son **evidencias**.
 
 ---
 
 ## 2. Por qué
 
-- **La entrega pide un análisis de capacidad**: escenarios, niveles de carga, métricas (throughput, tiempos de respuesta, errores, uso de recursos) y conclusiones.
-- Con un script, la prueba es **reproducible**: cualquiera del equipo obtiene números comparables, y en las próximas entregas se puede repetir contra la nube para comparar.
-
-### Conceptos
-
-| Término | Significado |
-|---|---|
-| **Concurrencia** | Cuántos clientes envían peticiones **al mismo tiempo**. Cada uno envía otra apenas recibe la respuesta. |
-| **Throughput** (peticiones/s, RPS) | Cuántas respuestas por segundo da el sistema. |
-| **Latencia media** | Tiempo promedio de respuesta. |
-| **Percentil 95 (p95)** | El 95 % de las peticiones tardó esto o menos. Representa la experiencia de "casi todos" mejor que la media, que esconden los casos lentos. |
-| **Punto de saturación** | El nivel a partir del cual el throughput deja de crecer y solo crece la latencia: el sistema ya está al máximo y las peticiones hacen fila. |
+- La entrega pide **resultados** del análisis de capacidad, no solo el plan. Versionar los archivos crudos (`ab/` y `stats/`) permite que cualquiera **verifique** las cifras del informe o las recalcule con otro criterio.
+- Quedan como **línea base**: en la Entrega 2 se repiten los mismos escenarios en la nube y se comparan con estos números.
 
 ---
 
-## 3. Explicación detallada
+## 3. Explicación de los archivos
 
-### 3.1 `datos_carga.sql`: el escenario
+### 3.1 Un archivo de `ab/` (por ejemplo `login_c100_r1.txt` = login, 100 usuarios, repetición 1)
 
-Representa a **una profesora con un curso grande a mitad del semestre**: 40 monitores, cada uno con 2 tareas por semana durante 10 semanas (800 tareas). Es el caso más pesado de la vista principal del profesor.
+Las líneas importantes que produce Apache Benchmark:
 
-```sql
-INSERT INTO usuarios (id, nombre, correo, password_hash)
-SELECT md5('monitor-carga-' || i)::uuid, 'Monitor de Carga ' || i, 'monitor.carga.' || i || '@uniandes.edu.co',
-       crypt('Carga123*', gen_salt('bf', 10))
-FROM generate_series(1, 40) AS i
-ON CONFLICT (id) DO NOTHING;
-```
-- **`generate_series(1, 40)`** produce las filas 1, 2, …, 40. El `SELECT` crea un usuario por cada una. Así se generan muchos datos sin escribirlos uno a uno.
-- `||` concatena texto en SQL.
-- **`md5('monitor-carga-' || i)::uuid`**: un UUID **determinista** (siempre el mismo para el mismo `i`): el hash MD5 tiene 128 bits, igual que un UUID. Gracias a esto, el script es idempotente (`ON CONFLICT DO NOTHING`) y `ejecutar.sh` puede calcular el ID de la vinculación con `md5('vinculacion-carga-1')`.
-- Contraseña de todos: `Carga123*`, con hash bcrypt (`pgcrypto`, como en el paso 59).
+| Línea | Significado |
+|---|---|
+| `Complete requests` | Peticiones completadas en los 15 s. |
+| `Failed requests` | Cuidado: incluye respuestas de **distinto tamaño** (`Length`), que en una API JSON no son errores. El script solo cuenta `Connect`, `Receive` y `Exceptions`. |
+| `Non-2xx responses` | Respuestas con código de error HTTP. Si no aparece, no hubo ninguna. |
+| `Requests per second` | Throughput. |
+| `Time per request (mean)` | Latencia media vista por cada cliente. |
+| `Percentage of the requests served within a certain time` | Percentiles: la fila `95%` es el p95. |
 
-```sql
-FROM generate_series(1, 40) AS i, generate_series(0, 9) AS s, generate_series(1, 2) AS n
-```
-Combina las tres series (**producto cartesiano**): 40 monitores × 10 semanas × 2 tareas = **800** filas. El estado y las horas varían con `%` (módulo) para que los datos no sean todos iguales.
+### 3.2 Un archivo de `stats/`
 
-### 3.2 `ejecutar.sh`: la medición
+Cada línea es una muestra de `docker stats`: `cpu_api,cpu_bd,mem_api_mb,mem_bd_mb`. La CPU está en porcentaje de **un núcleo** (1.600 % = 16 núcleos). Se toman los máximos.
 
-**Configuración** (cada valor se puede cambiar con variables de entorno):
+### 3.3 Resultados principales (de `resumen.md`)
 
-```bash
-NIVELES=${NIVELES:-"10 50 100 150 200"}    # usuarios concurrentes
-REPETICIONES=${REPETICIONES:-3}             # corridas por nivel
-DURACION=${DURACION:-15}                    # segundos por corrida
-ESCENARIOS=${ESCENARIOS:-"login seguimiento tareas"}
-RED=${RED:-seguimiento_default}
-```
-`${VAR:-valor}` significa "usa `$VAR` si existe; si no, `valor`". En total son 3 escenarios × 5 niveles × 3 repeticiones = **45 corridas** (~15 minutos).
+| Escenario | Throughput máximo | p95 con 100 usuarios | p95 con 200 usuarios | Errores |
+|---|---|---|---|---|
+| E1 · Inicio de sesión | ~239 peticiones/s (desde 50 usuarios) | 601 ms | 1.292 ms | 0 % |
+| E2 · Vista del profesor | ~4.060 peticiones/s | 33 ms | 57 ms | 0 % |
+| E3 · Registro de tareas | ~5.240 peticiones/s | 22 ms | 44 ms | 0 % |
 
-**Los tres escenarios:**
+### 3.4 Cómo leerlos
 
-| Escenario | Petición | Por qué |
-|---|---|---|
-| E1 `login` | `POST /api/v1/auth/login` | Lo más intensivo en CPU: bcrypt es lento **a propósito** (paso 12). |
-| E2 `seguimiento` | `GET /api/v1/seguimiento/personas` (profesora) | La vista más consultada y la de más trabajo en la base de datos. |
-| E3 `tareas` | `POST /api/v1/tareas` (monitor) | La escritura más frecuente. |
+- **E1 está limitado por CPU.** Desde 50 usuarios el throughput no sube y la API usa ~1.600 % de CPU (todos los núcleos): cada login calcula **bcrypt**, que es lento a propósito para frenar ataques de fuerza bruta (paso 12). A partir de ahí solo crece la espera. Lo confirma la **ley de Little**: usuarios = throughput × tiempo de respuesta → 200 / 237 ≈ 0,84 s, igual a la media medida (843 ms).
+- **E2 escala bien gracias a los pasos 42 y 43.** Sigue subiendo hasta 200 usuarios (~4.060 peticiones/s, p95 de 57 ms) con la CPU de la API en ~690 % de los 1.600 % disponibles.
+- **E3 es el más eficiente:** un `INSERT` simple con validaciones. Se estabiliza en ~5.200 peticiones/s desde 50 usuarios, con PostgreSQL en ~350 % de CPU por las escrituras.
+- **La memoria no es un problema:** la API usa menos de 60 MB.
 
-**Preparación:**
-```bash
-set -euo pipefail
-export MSYS_NO_PATHCONV=1
-```
-- `set -e`: detener el script ante el primer error. `-u`: error si se usa una variable no definida. `-o pipefail`: un `a | b` falla si falla `a`.
-- `MSYS_NO_PATHCONV=1`: en Git Bash de Windows, evita que rutas como `/cuerpos` se conviertan en `C:/Program Files/Git/cuerpos`.
+### 3.5 El efecto de la optimización del seguimiento (deuda técnica DT-08)
 
-```bash
-psql "DELETE FROM tareas WHERE titulo = 'Tarea de carga'" >/dev/null
-TOKEN_PROFESORA=$(token profesora.carga@uniandes.edu.co)
-```
-- Borra las tareas creadas por corridas anteriores de E3: cada ejecución parte del **mismo estado**.
-- Obtiene los tokens JWT una sola vez. `sed -E 's/.*"token":"([^"]+)".*/\1/'` extrae el token del JSON sin depender de otras herramientas.
+Antes de los pasos 42 y 43, la vista del profesor traía cada tarea con datos de otras tablas y cada persona reagrupaba las tareas de **todas** las demás. Para medir el efecto, se ejecutó también el escenario E2 con el código anterior, en el **mismo equipo y el mismo día**:
 
-**Una corrida (`ejecutar_ab`):**
-```bash
-docker run --rm --network "$RED" -v "$DIR/cuerpos:/cuerpos:ro" "$IMAGEN_AB" \
-    ab -t "$DURACION" -n 1000000 -c "$c" -k -r "${args[@]}"
-```
-- **Apache Benchmark (`ab`)** se ejecuta desde la imagen `httpd` (el servidor Apache la incluye), así que no hay que instalarlo.
-- **`--network "$RED"`**: el contenedor de `ab` entra a la red interna de Docker Compose y le pega a `http://nginx`. Así **no mide la red de Windows/Docker Desktop**, que agregaría ruido.
-- `-t 15 -n 1000000`: dura 15 s (el `-n` alto hace que el límite sea el tiempo). `-c`: concurrencia. `-k`: keep-alive (reutiliza conexiones, como un navegador). `-r`: no abortar si hay errores de conexión.
-- `"${args[@]}"`: expande el arreglo de argumentos del escenario, cada uno como palabra separada.
+| Usuarios | Antes: peticiones/s | Después: peticiones/s | Antes: p95 | Después: p95 |
+|---:|---:|---:|---:|---:|
+| 10 | 984 | 3.174 | 13 ms | 4 ms |
+| 50 | 1.249 | 3.627 | 73 ms | 20 ms |
+| 100 | 1.307 | 3.781 | 105 ms | 33 ms |
+| 200 | 1.378 | 4.063 | 173 ms | 57 ms |
 
-**Medición de recursos en paralelo:**
-```bash
-muestrear "$parar" > "$RESULTADOS/stats/$nombre.csv" &
-...
-touch "$parar"
-wait "$muestreo"
-```
-- `&` ejecuta `muestrear` **en segundo plano** mientras corre `ab`. `muestrear` repite `docker stats --no-stream` (CPU y memoria de la API y PostgreSQL) hasta que aparece el archivo `.parar`.
-- `awk` convierte las unidades (`GiB`, `MiB`, `KiB`) a MB.
-- La CPU puede superar el 100 %: **100 % = un núcleo**. 800 % significa 8 núcleos ocupados.
+- **Unas 3 veces más peticiones por segundo y un tercio del tiempo de respuesta** en todos los niveles.
+- Con **3.000 tareas extra** en la semana (un profesor con mucha actividad), la diferencia es mayor: de 46 a 423 peticiones/s con 10 usuarios (de 216 a 24 ms por petición).
 
-**Resumen de la corrida:** otro `awk` lee la salida de `ab` (`Requests per second`, percentiles 50/90/95/99/100) y los máximos de CPU/memoria, y agrega una línea a `resultados/resumen.csv`. Detalle: `ab` cuenta como *Failed requests* las respuestas de distinto **tamaño** que la primera. En una API JSON eso es normal, así que el script solo cuenta como errores los de conexión, excepciones y respuestas no 2xx.
+**Nota sobre la comparación con la primera medición.** La primera versión de estos resultados se tomó otro día, con el equipo más cargado: el inicio de sesión, cuyo código no cambió, daba ~190 peticiones/s y hoy da ~239. Por eso la comparación de DT-08 se hizo midiendo ambas versiones del código en las mismas condiciones, y no contra los números viejos. Es la misma regla que exige el curso para comparar entregas: misma herramienta, mismos parámetros y mismo entorno.
+- Las desviaciones entre repeticiones son bajas (menos del 3 % en la mayoría): las mediciones son confiables.
 
-### 3.3 `analizar.py`: el informe
-
-- Agrupa las 3 repeticiones de cada (escenario, concurrencia) y calcula **media ± desviación estándar** (`statistics.mean` / `stdev`). Una desviación pequeña indica una medición estable.
-- Escribe `resultados/resumen.md` con una tabla por escenario y dos gráficas **Mermaid** (`xychart-beta`): throughput y p95 frente a la concurrencia. GitHub dibuja las gráficas Mermaid directamente en el Markdown.
-- Solo usa la biblioteca estándar de Python (no hay que instalar nada con `pip`).
-
-### 3.4 `.gitignore`
-
-```gitignore
-# Cuerpos de petición que genera el script de pruebas de carga
-pruebas-carga/cuerpos/
-pruebas-carga/resultados/stats/.parar
-```
-`cuerpos/` (los JSON que envía `ab`) y la marca `.parar` son temporales; no se versionan.
+El análisis completo (criterios de aceptación, capacidad máxima y siguientes pasos) está en la página de la wiki **Entrega 1 – Pruebas de carga**.
 
 ---
 
 ## 4. Cómo comprobarlo
 
-```bash
-docker compose up --build -d --wait
-docker compose exec -T postgres psql -U seguimiento -d seguimiento < pruebas-carga/datos_carga.sql
-
-# Corrida corta para probar (≈ 15 s):
-NIVELES="10" REPETICIONES=1 DURACION=3 bash pruebas-carga/ejecutar.sh
-python pruebas-carga/analizar.py
-```
-Salida de la corrida corta al construir este paso (equipo de desarrollo, 10 usuarios):
-```
-login,10,1,399,0,132.46,...        → ~132 peticiones/s, 0 errores
-seguimiento,10,1,1701,0,566.77,... → ~567 peticiones/s, 0 errores
-tareas,10,1,8651,0,2882.84,...     → ~2883 peticiones/s, 0 errores
-```
-Para la medición completa, ejecute el script sin variables.
-
-**Atención:** el script usa el proyecto de Compose `seguimiento` (el `name:` de `docker-compose.yml`). Si levantó el sistema con otro nombre (`docker compose -p otro`), use `COMPOSE_PROJECT_NAME=otro RED=otro_default bash pruebas-carga/ejecutar.sh`.
+- Abra `pruebas-carga/resultados/resumen.md` en GitHub: las gráficas Mermaid se dibujan solas.
+- Recalcular el resumen desde los datos crudos:
+  ```bash
+  python pruebas-carga/analizar.py
+  git diff pruebas-carga/resultados/resumen.md   # no debe cambiar
+  ```
 
 ---
 
-## 5. Pasos para lograr esta versión desde el paso 62
+## 5. Pasos para lograr esta versión desde el paso 63
 
-1. Crear la carpeta `pruebas-carga/` con `datos_carga.sql`, `ejecutar.sh` y `analizar.py` (sección 3).
-2. Agregar al final de `.gitignore` las dos líneas de la sección 3.4.
-3. Cargar los datos y hacer una corrida corta (sección 4). Borrar la carpeta `pruebas-carga/resultados` que genera la corrida de prueba; los resultados reales se agregan en el paso 64.
-4. Commit: `git add . && git commit -m "Paso 63: scripts de pruebas de carga"`
+1. Levantar el sistema y cargar los datos:
+   ```bash
+   docker compose up --build -d --wait
+   docker compose exec -T postgres psql -U seguimiento -d seguimiento < pruebas-carga/datos_carga.sql
+   ```
+2. Cerrar los programas pesados del equipo (afectan las mediciones) y ejecutar la medición completa (~17 minutos):
+   ```bash
+   bash pruebas-carga/ejecutar.sh
+   python pruebas-carga/analizar.py
+   ```
+3. Commit: `git add . && git commit -m "Paso 64: resultados de las pruebas de carga"`
+
+Los números dependen del equipo: si repite la medición, sus valores serán otros. Lo importante es la **forma** de las curvas y qué recurso se satura.
 
 ---
 
 ## 6. Preparación para las próximas entregas
 
-- **Comparar local vs. nube:** en las próximas entregas, `API_HOST` y `RED` permiten apuntar el mismo script a otra instalación. Desde una máquina virtual de prueba en la nube se usa `ab` directamente contra la IP del balanceador, con los mismos escenarios y niveles, para que los números sean comparables.
-- **Escalado:** si al agregar instancias de la API (autoescalado) el punto de saturación de E1 se mueve hacia arriba, eso demuestra que el escalado horizontal funciona. La API no guarda estado (JWT, paso 12), por eso se puede escalar.
-- `datos_carga.sql` usa IDs deterministas, así que también se puede cargar en Cloud SQL sin duplicar.
+- **Esta es la línea base.** En la Entrega 2 (máquina virtual en GCP + Cloud SQL) se repiten exactamente estos escenarios. Conviene guardar esos resultados en otra carpeta, por ejemplo `pruebas-carga/resultados-entrega2/`, para comparar lado a lado.
+- Lo que los datos ya sugieren para las próximas entregas:
+  1. **E1 (inicio de sesión)** es el límite real: está ligado a la CPU por bcrypt. Es el escenario ideal para demostrar el **autoscaling por CPU** de la Entrega 3: varias instancias de la API detrás del balanceador multiplican su capacidad (la API no guarda estado).
+  2. En una VM pequeña, el pool de conexiones de pgx es de 4 (lo calcula según los núcleos); si E2 o E3 esperan por conexiones, se ajusta con `pool_max_conns` en `DATABASE_URL`.
+- Desde la Entrega 2, el enunciado exige k6, Locust, Artillery o JMeter en lugar de `ab`. La comparación y la recomendación están en la wiki (**Entrega 1 – Pruebas de carga**, sección 6).
 
 ---
 
@@ -178,5 +124,5 @@ Para la medición completa, ejecute el script sin variables.
 
 | Requisito | Cómo |
 |---|---|
-| Análisis de capacidad (Entrega 1) | Escenarios, niveles, repeticiones y métricas automatizadas. |
-| Métricas: throughput, tiempos de respuesta, errores, CPU y memoria | Columnas de `resumen.csv`. |
+| Análisis de capacidad: resultados y evidencias (Entrega 1) | Archivos crudos y resumen versionados. |
+| Comparación entre entregas | Línea base reproducible. |
