@@ -1,211 +1,197 @@
-# Paso 8 · Integración continua con GitHub Actions
+# Paso 9 · Errores de aplicación (`apperr`)
 
-> Rama `paso-a-paso` · paso 8 de 65 · anterior: **Paso 7 · Nginx** · siguiente: **Paso 9 · Errores de aplicación**
+> Rama `paso-a-paso` · paso 9 de 65 · anterior: **Paso 8 · Integración continua** · siguiente: **Paso 10 · Router por módulos y middleware de registro**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Cada `push` y cada *pull request* ejecutan automáticamente en GitHub una revisión del código: formato, análisis estático y pruebas.
+Se creó el paquete `apperr` con los **tipos de error** que usarán todas las capas del sistema.
 
 | Archivo | Cambio |
 |---|---|
-| `.github/workflows/ci.yml` | **Nuevo.** Pipeline con dos trabajos: `calidad` (gofmt + golangci-lint) y `pruebas` (go test con detector de carreras y cobertura). |
-| `backend/.golangci.yml` | **Nuevo.** Configuración del linter. |
-| `Makefile` | **Modificado.** Nuevos objetivos `pruebas`, `lint` y `formato`, que ejecutan lo mismo localmente con Docker. |
+| `backend/internal/apperr/apperr.go` | **Nuevo.** Tipo `Error` con una categoría (`Tipo`) y un mensaje para el usuario, más funciones para crearlos y reconocerlos. |
 
-En la pestaña **Actions** del repositorio aparece una ejecución por cada push, en verde (todo bien) o en rojo (algo falló), con el detalle de cada paso.
+Todavía nadie usa el paquete. Lo usarán el dominio (paso 11), los repositorios (paso 13), los servicios (paso 14) y el handler, que traduce cada tipo a un código HTTP (paso 17).
 
 ---
 
 ## 2. Por qué
 
-- **Entregable de la Entrega 1:** "pipeline de GitHub Actions para validación automática de pruebas" (enunciado, `06-pruebas.md` y `07-alcance.md`).
-- **Desde el principio y no al final:** si el pipeline existe desde el paso 8, cada funcionalidad que se agregue en los pasos siguientes queda validada en el momento. Un error se detecta en el commit que lo introdujo, cuando es fácil de corregir.
-- **Disciplina de equipo:** nadie depende de "en mi computador funciona". El pipeline corre en una máquina limpia de GitHub.
-- **Lint y formato** evitan discusiones de estilo y detectan errores comunes antes de ejecutar el código.
+La aplicación tendrá tres capas (sección 4): **presentación** (handler, HTTP), **servicio** (reglas y casos de uso) y **datos** (repositorios, SQL). Cuando algo sale mal en una capa interna, la capa HTTP tiene que decidir qué código responder:
+
+- un correo inválido → **400** (el cliente envió datos incorrectos);
+- una tarea que no existe → **404**;
+- superar las 22 horas de asistencia graduada → **422** (los datos son válidos, pero violan una regla de negocio);
+- un fallo de la base de datos → **500**.
+
+Sin un vocabulario común, el servicio tendría que conocer los códigos HTTP (y entonces ya no sería independiente de HTTP), o el handler tendría que adivinar a partir del texto del error. `apperr` resuelve eso: las capas internas dicen **qué clase de problema** ocurrió y solo el handler decide el código HTTP.
 
 ---
 
-## 3. Explicación detallada
+## 3. Explicación detallada de `apperr.go`
 
-### 3.1 `.github/workflows/ci.yml`
+### 3.1 Los tipos de error
 
-GitHub Actions ejecuta los archivos `.yml` de `.github/workflows/`. Cada archivo es un *workflow* compuesto por *jobs* (trabajos), y cada job por *steps* (pasos).
+```go
+type Tipo string
 
-```yaml
-name: CI
-
-on:
-  push:
-    branches: ["**"]
-  pull_request:
-    branches: [main]
+const (
+	TipoValidacion    Tipo = "validacion"     // 400
+	TipoNoAutenticado Tipo = "no_autenticado" // 401
+	TipoProhibido     Tipo = "prohibido"      // 403
+	TipoNoEncontrado  Tipo = "no_encontrado"  // 404
+	TipoConflicto     Tipo = "conflicto"      // 409
+	TipoReglaNegocio  Tipo = "regla_negocio"  // 422
+	TipoInterno       Tipo = "interno"        // 500
+)
 ```
-- `on` define **cuándo** se ejecuta: en cada push a cualquier rama (`"**"`) y en cada *pull request* hacia `main`.
 
-```yaml
-permissions:
-  contents: read
+- `type Tipo string` crea un **tipo nuevo** basado en `string`. Aunque por dentro es texto, el compilador no deja mezclarlo con cualquier string por accidente.
+- `const ( ... )` agrupa constantes. El texto de cada una es el que verá el cliente en el campo `"error"` del JSON.
+
+| Tipo | Cuándo se usa | Ejemplo en este proyecto |
+|---|---|---|
+| `validacion` (400) | Los datos de la petición son incorrectos. | Fecha con formato inválido, correo mal escrito, título vacío. |
+| `no_autenticado` (401) | No se sabe quién es el usuario. | Credenciales incorrectas, token vencido. |
+| `prohibido` (403) | Se sabe quién es, pero no tiene permiso. | Un monitor intenta crear un usuario. |
+| `no_encontrado` (404) | El recurso no existe **o el usuario no debe saber que existe**. | Un profesor consulta el reporte de otro profesor. |
+| `conflicto` (409) | Choca con el estado actual. | Correo ya registrado, vinculación duplicada, lote ya en proceso. |
+| `regla_negocio` (422) | Datos válidos que violan una regla del dominio. | Más de 22 h de asistencia, editar una tarea de una semana cerrada. |
+| `interno` (500) | Fallo inesperado. | La base de datos no responde. |
+
+### 3.2 La estructura `Error`
+
+```go
+type Error struct {
+	Tipo    Tipo
+	Mensaje string
+	Causa   error
+}
+
+func (e *Error) Error() string {
+	if e.Causa != nil {
+		return fmt.Sprintf("%s: %s: %v", e.Tipo, e.Mensaje, e.Causa)
+	}
+	return fmt.Sprintf("%s: %s", e.Tipo, e.Mensaje)
+}
+
+func (e *Error) Unwrap() error { return e.Causa }
 ```
-- El pipeline solo necesita **leer** el código. Dar el mínimo de permisos es una buena práctica de seguridad.
 
-#### Job `calidad`
+- **En Go, `error` es una interfaz** con un único método: `Error() string`. Cualquier tipo que tenga ese método **es** un error (sección 4). `*Error` lo tiene, así que se puede devolver donde se espera un `error`.
+- `Mensaje` es un texto **apto para el usuario** ("la persona superaría el máximo de 22 horas...").
+- `Causa` guarda el error técnico original (por ejemplo, el de la base de datos) para los logs, **sin mostrárselo al cliente**.
+- `Unwrap()` permite que `errors.Is` y `errors.As` "miren adentro" y encuentren la causa.
+- `%v` en `Sprintf` imprime un valor en su forma por defecto.
 
-```yaml
-  calidad:
-    name: Formato y análisis estático
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
+### 3.3 Funciones constructoras
+
+```go
+func nuevo(tipo Tipo, formato string, args ...any) *Error {
+	return &Error{Tipo: tipo, Mensaje: fmt.Sprintf(formato, args...)}
+}
+
+func Validacion(formato string, args ...any) *Error {
+	return nuevo(TipoValidacion, formato, args...)
+}
+// ... NoAutenticado, Prohibido, NoEncontrado, Conflicto, ReglaNegocio
 ```
-- `runs-on: ubuntu-latest`: GitHub presta una máquina virtual Linux limpia para cada ejecución.
-- `actions/checkout` descarga el código del commit.
-- `actions/setup-go` instala Go **en la versión que dice `go.mod`** (1.26) y guarda en caché las dependencias según `go.sum`. Así hay una sola fuente de verdad para la versión de Go.
 
-```yaml
-      - name: Verificar formato (gofmt)
-        working-directory: backend
-        run: |
-          sin_formato=$(gofmt -l .)
-          if [ -n "$sin_formato" ]; then
-            echo "Archivos sin formato (ejecute gofmt -w .):"
-            echo "$sin_formato"
-            exit 1
-          fi
+- Se usan así: `apperr.Validacion("el campo %s es obligatorio", "titulo")`.
+- `args ...any` es un parámetro **variádico**: acepta cualquier cantidad de argumentos de cualquier tipo (`any`), como `Printf`.
+
+```go
+func Interno(causa error, formato string, args ...any) *Error {
+	e := nuevo(TipoInterno, formato, args...)
+	e.Causa = causa
+	return e
+}
 ```
-- `gofmt` es el formateador oficial de Go. `gofmt -l .` **lista** los archivos que no están formateados. Si la lista no está vacía (`-n`), el paso falla (`exit 1`) y muestra cuáles son.
-- En Go el formato no se discute: todo el código del mundo se ve igual. VS Code con la extensión de Go formatea al guardar.
 
-```yaml
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: latest
-          working-directory: backend
+- Para errores inesperados: guarda la causa técnica y un mensaje genérico para el usuario.
+
+### 3.4 Reconocer errores
+
+```go
+func TipoDe(err error) Tipo {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Tipo
+	}
+	return TipoInterno
+}
+
+func Es(err error, tipo Tipo) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Tipo == tipo
+}
 ```
-- **golangci-lint** ejecuta varios analizadores estáticos a la vez (usa la configuración de `backend/.golangci.yml`).
 
-#### Job `pruebas`
-
-```yaml
-  pruebas:
-    name: Pruebas unitarias
-    ...
-      - name: Pruebas con cobertura
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
-
-      - name: Resumen de cobertura
-        run: go tool cover -func=coverage.out | tail -n 1
-```
-- `go test ./...` ejecuta todas las pruebas de todos los paquetes.
-- `-race` activa el **detector de condiciones de carrera**: encuentra accesos simultáneos a la misma memoria desde varias goroutines sin sincronización. Es importante en un servidor web, donde muchas peticiones corren en paralelo.
-- `-coverprofile=coverage.out` registra qué líneas ejecutaron las pruebas; `-covermode=atomic` es el modo correcto cuando se usa `-race`.
-- `go tool cover -func` imprime la cobertura por función; `tail -n 1` muestra solo el total (por ejemplo, `total: (statements) 60.0%`).
-
-Los dos jobs corren **en paralelo** en máquinas distintas.
-
-### 3.2 `backend/.golangci.yml`
-
-```yaml
-version: "2"
-
-run:
-  # Incluye las pruebas de integración en el análisis.
-  build-tags:
-    - integracion
-
-linters:
-  # errcheck, govet, ineffassign, staticcheck y unused.
-  default: standard
-```
-- `version: "2"`: formato de configuración de golangci-lint v2.
-- `build-tags: integracion`: las pruebas de integración (paso 58) solo se compilan con esa etiqueta; así también se analizan.
-- `default: standard` activa el conjunto estándar:
-
-| Linter | Qué detecta |
-|---|---|
-| `errcheck` | Errores que se ignoran sin querer (por ejemplo, no revisar lo que devuelve `Close()`). |
-| `govet` | Construcciones sospechosas (formatos de `Printf` incorrectos, copias de candados...). |
-| `ineffassign` | Asignaciones que nunca se usan. |
-| `staticcheck` | Cientos de reglas: código obsoleto, condiciones imposibles, errores comunes. |
-| `unused` | Funciones, tipos, constantes o campos que nadie usa. |
-
-`unused` es la razón de una regla que se sigue en toda esta rama: **cada paso solo agrega código que ya se usa** (o que ya tiene pruebas). Una función escrita "por si acaso" haría fallar el lint.
-
-### 3.3 `Makefile`
-
-```makefile
-GO_IMG      := golang:1.26
-LINT_IMG    := golangci/golangci-lint:latest
-DOCKER_GO   := docker run --rm -v "$(CURDIR)/backend:/src" -v gomod:/go/pkg/mod -v gocache:/root/.cache/go-build -w /src
-```
-- Variables de `make`. `DOCKER_GO` es el prefijo para ejecutar comandos de Go dentro de Docker sobre la carpeta `backend`:
-  - `$(CURDIR)` es la carpeta actual;
-  - los volúmenes `gomod` y `gocache` guardan las dependencias descargadas y la caché de compilación entre ejecuciones, así la segunda vez es mucho más rápida.
-
-| Objetivo | Qué hace |
-|---|---|
-| `make pruebas` | `go test -race ./...` en un contenedor con Go 1.26. |
-| `make lint` | Verifica el formato y ejecuta golangci-lint, igual que el job `calidad`. |
-| `make formato` | Aplica `gofmt -w .` para corregir el formato. |
-
-Recomendación: ejecutar `make formato lint pruebas` antes de cada push. Si pasa localmente, pasará en GitHub.
+- `errors.As(err, &e)` busca, dentro de la cadena de errores envueltos, uno que sea de tipo `*Error`; si lo encuentra, lo copia en `e` y devuelve `true`. Funciona aunque el error haya sido envuelto con `fmt.Errorf("...: %w", err)` varias veces.
+- `TipoDe` devuelve la categoría (y considera **interno** cualquier error que no sea de `apperr`, por ejemplo uno de la base de datos que no se tradujo).
+- `Es` responde preguntas como `apperr.Es(err, apperr.TipoNoEncontrado)`. Lo usarán mucho las pruebas y algunos servicios.
 
 ---
 
-## 4. Conceptos de este paso
+## 4. Conceptos de Go de este paso
 
 | Concepto | Explicación |
 |---|---|
-| CI (integración continua) | Validar automáticamente cada cambio que llega al repositorio. |
-| Workflow / job / step | Archivo del pipeline / trabajo en una máquina / instrucción dentro del trabajo. |
-| Action | Paso reutilizable publicado por terceros (`uses: actions/checkout@v4`). |
-| Análisis estático | Revisar el código sin ejecutarlo. |
-| Condición de carrera | Dos goroutines acceden a la misma memoria a la vez y al menos una escribe. |
-| Cobertura | Porcentaje del código que ejecutan las pruebas. |
+| Tipo definido | `type Tipo string`: un tipo nuevo con `string` por debajo. |
+| Bloque `const` | Varias constantes relacionadas en `const ( ... )`. |
+| Interfaz | Conjunto de métodos. Un tipo la **implementa automáticamente** si tiene esos métodos; no hay que declararlo (`implements` no existe en Go). |
+| `error` | Interfaz estándar: `type error interface { Error() string }`. |
+| Receptor puntero | `func (e *Error) Error()`: el método pertenece a `*Error` (puntero). |
+| Variádicos | `args ...any` recibe 0 o más argumentos; se reenvían con `args...`. |
+| `any` | Alias de `interface{}`: cualquier tipo. |
+| `errors.As` / `errors.Is` | Buscan un tipo o un valor concreto en una cadena de errores envueltos. |
+
+### La arquitectura en tres capas que se está construyendo
+
+```
+handler      (presentación: HTTP, JSON, códigos de estado)   ← traduce apperr → HTTP
+   │
+servicio     (casos de uso, permisos, reglas)                ← crea errores apperr
+   │
+repositorio  (SQL, PostgreSQL)                               ← traduce errores de PostgreSQL → apperr
+   │
+dominio      (entidades y reglas puras, sin dependencias)    ← crea errores apperr
+```
+
+`apperr` no depende de ninguna capa; todas pueden usarlo.
 
 ---
 
 ## 5. Cómo comprobarlo
 
-Localmente (Git Bash, WSL o Linux):
+El paquete aún no tiene consumidores; se valida compilando y con el lint:
 
 ```bash
-make formato
-make lint       # "0 issues."
-make pruebas    # ok seguimiento/internal/config, ok seguimiento/internal/handler
+cd backend
+go build ./...
+go vet ./...
 ```
 
-En GitHub: haga push y abra la pestaña **Actions**. Verá el workflow **CI** con los jobs "Formato y análisis estático" y "Pruebas unitarias".
-
-Para ver un fallo a propósito: agregue espacios extra en cualquier `.go` y haga push. El paso "Verificar formato" fallará indicando el archivo.
+o `make lint` desde la raíz. Sus funciones se ejercitan en las pruebas de los pasos 11 en adelante.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 7
+## 6. Pasos para lograr esta versión desde el paso 8
 
-1. Crear `.github/workflows/ci.yml` con los jobs `calidad` y `pruebas` (sección 3.1).
-2. Crear `backend/.golangci.yml` (sección 3.2).
-3. Agregar al `Makefile` las variables `GO_IMG`, `LINT_IMG` y `DOCKER_GO`, los objetivos `pruebas`, `lint` y `formato`, y sumarlos a `.PHONY` (sección 3.3).
-4. Comprobar localmente: `make lint pruebas`.
-5. Commit y push:
-   ```bash
-   git add . && git commit -m "Paso 8: integración continua con GitHub Actions"
-   git push
-   ```
-6. Revisar la pestaña **Actions** en GitHub.
+1. Crear `backend/internal/apperr/apperr.go` con:
+   - el tipo `Tipo` y las 7 constantes;
+   - el struct `Error` y sus métodos `Error()` y `Unwrap()`;
+   - la función privada `nuevo` y las constructoras `Validacion`, `NoAutenticado`, `Prohibido`, `NoEncontrado`, `Conflicto`, `ReglaNegocio` e `Interno`;
+   - `TipoDe` y `Es`.
+2. `make lint` (o `go vet ./...`).
+3. Commit: `git add . && git commit -m "Paso 9: errores de aplicación"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- El pipeline crecerá en esta misma rama: PostgreSQL para pruebas de integración (paso 58), despliegue con Docker Compose y Newman (paso 61) y SonarQube (paso 62).
-- En entregas futuras se le puede agregar un job de **entrega continua**: construir la imagen y publicarla en Artifact Registry de GCP cuando se hace merge a `main`.
+- Si en entregas futuras aparece otra forma de exponer el sistema (por ejemplo, funciones serverless en la Entrega 4, o colas que reciben mensajes), los servicios seguirán devolviendo los mismos errores y solo esa nueva capa decidirá cómo presentarlos.
 
 ---
 
@@ -213,6 +199,6 @@ Para ver un fallo a propósito: agregue espacios extra en cualquier `.go` y haga
 
 | Requisito | Cómo |
 |---|---|
-| Entregable: pipeline de GitHub Actions | Workflow `CI` en cada push y pull request. |
-| 06-pruebas: ejecución automática de pruebas unitarias | Job `pruebas` con `-race` y cobertura. |
-| RNF-05 Mantenibilidad | Formato uniforme y análisis estático obligatorio. |
+| RNF-05 Mantenibilidad | Errores con un vocabulario común entre capas. |
+| RNF-06 Consistencia | Las reglas de negocio violadas se distinguen de los datos inválidos (422 frente a 400). |
+| RNF-03 Seguridad básica | El mensaje para el cliente está separado de la causa técnica, que no se expone. |
