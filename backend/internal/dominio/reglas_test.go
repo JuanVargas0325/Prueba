@@ -37,6 +37,31 @@ func TestCodigoPeriodo(t *testing.T) {
 	}
 }
 
+func TestEspacioFechasYEstado(t *testing.T) {
+	p := PeriodoAcademico{Codigo: "2026-20", FechaInicio: fecha(t, "2026-08-01"), FechaCierre: fecha(t, "2026-12-15")}
+	e := Espacio{Nombre: "Nube", Tipo: EspacioCurso, FechaInicio: fecha(t, "2026-08-03"), FechaCierre: fecha(t, "2026-12-04"), Estado: EspacioActivo}
+	if err := e.ValidarFechasEnPeriodo(p); err != nil {
+		t.Fatal(err)
+	}
+	fuera := e
+	fuera.FechaCierre = fecha(t, "2027-01-10")
+	if fuera.ValidarFechasEnPeriodo(p) == nil {
+		t.Error("las fechas deben estar dentro del período")
+	}
+	invertido := e
+	invertido.FechaCierre = fecha(t, "2026-08-01")
+	if invertido.ValidarFechasEnPeriodo(p) == nil {
+		t.Error("el cierre no puede ser anterior al inicio")
+	}
+	if !e.IncluyeSemana(fecha(t, "2026-08-05")) || e.IncluyeSemana(fecha(t, "2026-12-09")) {
+		t.Error("cálculo de semanas del espacio incorrecto")
+	}
+	e.Estado = EspacioCerrado
+	if !apperr.Es(e.PermiteRegistros(), apperr.TipoReglaNegocio) {
+		t.Error("un espacio cerrado no admite registros (RN-09)")
+	}
+}
+
 func TestNormalizarCorreoYPassword(t *testing.T) {
 	if c, err := NormalizarCorreo("  Ana.Perez@Uniandes.EDU.co "); err != nil || c != "ana.perez@uniandes.edu.co" {
 		t.Errorf("correo normalizado = %q, %v", c, err)
