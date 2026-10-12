@@ -466,3 +466,184 @@ func TestVisibilidadDeVinculaciones(t *testing.T) {
 		t.Errorf("la persona vinculada puede ver su vinculación: %v", err)
 	}
 }
+
+// --- tareas ----------------------------------------------------------------------------------
+
+type repoTareasFalso struct {
+	tareas     map[string]dominio.Tarea
+	creada     dominio.Tarea
+	adjuntos   []dominio.Adjunto
+	errCrear   error
+	eliminadas []string
+}
+
+func (r *repoTareasFalso) Crear(_ context.Context, t dominio.Tarea, adjuntos []dominio.Adjunto) (dominio.Tarea, error) {
+	if r.errCrear != nil {
+		return dominio.Tarea{}, r.errCrear
+	}
+	r.creada, r.adjuntos = t, adjuntos
+	return t, nil
+}
+
+func (r *repoTareasFalso) Obtener(_ context.Context, id string) (dominio.Tarea, error) {
+	t, ok := r.tareas[id]
+	if !ok {
+		return t, apperr.NoEncontrado("tarea no encontrada")
+	}
+	return t, nil
+}
+
+func (r *repoTareasFalso) Listar(context.Context, dominio.FiltroTareas) ([]dominio.Tarea, error) {
+	return nil, nil
+}
+
+func (r *repoTareasFalso) Actualizar(_ context.Context, t dominio.Tarea) (dominio.Tarea, error) {
+	r.tareas[t.ID] = t
+	return t, nil
+}
+
+func (r *repoTareasFalso) Eliminar(_ context.Context, id string) ([]string, error) {
+	r.eliminadas = append(r.eliminadas, id)
+	return []string{"adjuntos/" + id + "/a.pdf"}, nil
+}
+
+func (r *repoTareasFalso) AgregarAdjuntos(_ context.Context, _ string, adjuntos []dominio.Adjunto, _ int) error {
+	r.adjuntos = append(r.adjuntos, adjuntos...)
+	return nil
+}
+
+func (r *repoTareasFalso) ObtenerAdjunto(context.Context, string, string) (dominio.Adjunto, error) {
+	return dominio.Adjunto{}, nil
+}
+
+func (r *repoTareasFalso) EliminarAdjunto(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+type lectorVinculacionesFalso struct {
+	vinculaciones map[string]dominio.Vinculacion
+}
+
+func (l lectorVinculacionesFalso) Obtener(_ context.Context, id string) (dominio.Vinculacion, error) {
+	v, ok := l.vinculaciones[id]
+	if !ok {
+		return v, apperr.NoEncontrado("vinculación no encontrada")
+	}
+	return v, nil
+}
+
+// El reloj de prueba marca el miércoles 14 de octubre de 2026 (semana del 12 al 18).
+func entornoTareas(t *testing.T) (*Tareas, *repoTareasFalso) {
+	vinculaciones := lectorVinculacionesFalso{vinculaciones: map[string]dominio.Vinculacion{
+		"v1": {ID: "v1", UsuarioID: "mon-1", ProfesorID: "prof-1", EspacioTipo: dominio.EspacioCurso, EspacioEstado: dominio.EspacioActivo,
+			EspacioFechaInicio: fechaP(t, "2026-08-03"), EspacioFechaCierre: fechaP(t, "2026-12-04")},
+		"cerrada": {ID: "cerrada", UsuarioID: "mon-1", EspacioTipo: dominio.EspacioCurso, EspacioEstado: dominio.EspacioCerrado,
+			EspacioFechaInicio: fechaP(t, "2026-08-03"), EspacioFechaCierre: fechaP(t, "2026-12-04")},
+		"ajena": {ID: "ajena", UsuarioID: "otra-persona", EspacioEstado: dominio.EspacioActivo,
+			EspacioFechaInicio: fechaP(t, "2026-08-03"), EspacioFechaCierre: fechaP(t, "2026-12-04")},
+	}}
+	repo := &repoTareasFalso{tareas: map[string]dominio.Tarea{}}
+	return NuevoTareas(repo, vinculaciones, RelojFijo(ahoraPrueba, time.UTC), logPrueba), repo
+}
+
+func nuevaTarea(t *testing.T, vinculacion, semana string) NuevaTarea {
+	return NuevaTarea{VinculacionID: vinculacion, Semana: fechaP(t, semana),
+		Datos: dominio.DatosTarea{Titulo: "Calificar", Estado: dominio.TareaEnDesarrollo, HorasInvertidas: 3}}
+}
+
+func TestCrearTareaEnLaSemanaActual(t *testing.T) {
+	s, repo := entornoTareas(t)
+	tarea, err := s.Crear(context.Background(), monitor, nuevaTarea(t, "v1", "2026-10-15"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tarea.SemanaInicio.Format(dominio.FormatoFecha) != "2026-10-12" || tarea.Tardia || tarea.ID == "" || repo.creada.HorasInvertidas != 3 {
+		t.Errorf("tarea inesperada: %+v", tarea)
+	}
+}
+
+func TestCrearTareaSinSemanaUsaLaSemanaActual(t *testing.T) {
+	s, _ := entornoTareas(t)
+	n := nuevaTarea(t, "v1", "2026-10-15")
+	n.Semana = time.Time{}
+	tarea, err := s.Crear(context.Background(), monitor, n)
+	if err != nil || tarea.SemanaInicio.Format(dominio.FormatoFecha) != "2026-10-12" {
+		t.Fatalf("debería usarse la semana actual: %+v %v", tarea, err)
+	}
+}
+
+func TestCrearTareaEnSemanaPasadaEsTardia(t *testing.T) {
+	s, _ := entornoTareas(t)
+	tarea, err := s.Crear(context.Background(), monitor, nuevaTarea(t, "v1", "2026-10-07"))
+	if err != nil || !tarea.Tardia {
+		t.Fatalf("una tarea de una semana cerrada debe marcarse tardía (RN-32): %+v %v", tarea, err)
+	}
+}
+
+func TestCrearTareaValidaciones(t *testing.T) {
+	s, _ := entornoTareas(t)
+	ctx := context.Background()
+	casos := []struct {
+		nombre string
+		n      NuevaTarea
+		tipo   apperr.Tipo
+	}{
+		{"vinculación ajena (RN-04)", nuevaTarea(t, "ajena", "2026-10-14"), apperr.TipoValidacion},
+		{"vinculación inexistente", nuevaTarea(t, "x", "2026-10-14"), apperr.TipoValidacion},
+		{"espacio cerrado (RN-09)", nuevaTarea(t, "cerrada", "2026-10-14"), apperr.TipoReglaNegocio},
+		{"semana futura", nuevaTarea(t, "v1", "2026-10-19"), apperr.TipoValidacion},
+		{"fuera de las fechas del espacio", nuevaTarea(t, "v1", "2026-07-20"), apperr.TipoValidacion},
+	}
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			_, err := s.Crear(ctx, monitor, c.n)
+			esperarTipo(t, err, c.tipo)
+		})
+	}
+	sinTitulo := nuevaTarea(t, "v1", "2026-10-14")
+	sinTitulo.Datos.Titulo = " "
+	_, err := s.Crear(ctx, monitor, sinTitulo)
+	esperarTipo(t, err, apperr.TipoValidacion)
+}
+
+func TestModificarTareas(t *testing.T) {
+	s, repo := entornoTareas(t)
+	ctx := context.Background()
+	base := dominio.Tarea{UsuarioID: "mon-1", ProfesorID: "prof-1", EspacioEstado: dominio.EspacioActivo, Titulo: "x"}
+	actual, pasada, tardia, cerrada := base, base, base, base
+	actual.ID, actual.SemanaInicio = "actual", fechaP(t, "2026-10-12")
+	pasada.ID, pasada.SemanaInicio = "pasada", fechaP(t, "2026-10-05")
+	tardia.ID, tardia.SemanaInicio, tardia.Tardia = "tardia", fechaP(t, "2026-10-12"), true
+	cerrada.ID, cerrada.SemanaInicio, cerrada.EspacioEstado = "cerrada", fechaP(t, "2026-10-12"), dominio.EspacioCerrado
+	for _, x := range []dominio.Tarea{actual, pasada, tardia, cerrada} {
+		repo.tareas[x.ID] = x
+	}
+	datos := dominio.DatosTarea{Titulo: "Editada", Estado: dominio.TareaFinalizada, HorasInvertidas: 5}
+
+	editada, err := s.Actualizar(ctx, monitor, "actual", datos)
+	if err != nil || editada.Titulo != "Editada" || editada.Estado != dominio.TareaFinalizada {
+		t.Fatalf("la tarea de la semana activa se puede editar: %+v %v", editada, err)
+	}
+	if !s.Modificable(monitor, repo.tareas["actual"]) || s.Modificable(profesor, repo.tareas["actual"]) {
+		t.Error("solo la persona dueña puede modificar la tarea")
+	}
+
+	for id, tipo := range map[string]apperr.Tipo{
+		"pasada":  apperr.TipoReglaNegocio, // RN-34
+		"tardia":  apperr.TipoReglaNegocio, // RN-33
+		"cerrada": apperr.TipoReglaNegocio, // RN-09
+	} {
+		_, err := s.Actualizar(ctx, monitor, id, datos)
+		esperarTipo(t, err, tipo)
+		esperarTipo(t, s.Eliminar(ctx, monitor, id), tipo)
+	}
+
+	_, err = s.Actualizar(ctx, profesor, "actual", datos)
+	esperarTipo(t, err, apperr.TipoProhibido) // el profesor la ve, pero no la edita
+	_, err = s.Actualizar(ctx, otroProf, "actual", datos)
+	esperarTipo(t, err, apperr.TipoNoEncontrado) // otro profesor ni siquiera la ve
+
+	if err := s.Eliminar(ctx, monitor, "actual"); err != nil || len(repo.eliminadas) != 1 {
+		t.Errorf("la tarea de la semana activa se puede eliminar: %v", err)
+	}
+}

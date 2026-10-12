@@ -1,172 +1,205 @@
-# Paso 35 · Repositorio de tareas
+# Paso 36 · Servicio de tareas
 
-> Rama `paso-a-paso` · paso 35 de 65 · anterior: **Paso 34 · Dominio de tareas** · siguiente: **Paso 36 · Servicio de tareas**
+> Rama `paso-a-paso` · paso 36 de 65 · anterior: **Paso 35 · Repositorio de tareas** · siguiente: **Paso 37 · Endpoints de tareas**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el repositorio de las tareas semanales y de los metadatos de sus adjuntos (tablas `tareas` y `tarea_adjuntos`).
+Se creó el caso de uso del **registro semanal de tareas**: los monitores y asistentes registran tareas en sus vinculaciones, las editan o eliminan mientras la semana está activa, y cada usuario consulta lo que le corresponde. Los adjuntos se agregarán en el paso 39.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/repositorio/tareas.go` | **Nuevo.** `Crear`, `Obtener`, `Listar`, `Actualizar`, `Eliminar`, `AgregarAdjuntos`, `ObtenerAdjunto`, `EliminarAdjunto` e `insertarAdjuntos`. |
-| `backend/internal/repositorio/comun.go` | **Modificado.** Constantes `recursoTarea`, `recursoTareas`, `recursoAdjunto` y `recursoAdjuntos`. |
+| `backend/internal/servicio/tareas.go` | **Nuevo.** Servicio `Tareas` con `Crear`, `Listar`, `Obtener`, `Actualizar`, `Eliminar` y `Modificable`, más `obtenerModificable`, `verificarModificable` y `espacioDe`. |
+| `backend/internal/servicio/modulos_test.go` | **Modificado.** Repositorio falso de tareas, lector falso de vinculaciones y cinco pruebas. |
 
 ---
 
 ## 2. Por qué
 
-- El servicio de tareas (paso 36) y el de adjuntos (paso 39) necesitan persistir.
-- **Defensa en profundidad para RN-33:** aunque el servicio ya impide modificar una tarea tardía, el repositorio **tampoco** la modifica ni la borra. Si algún día otro código llamara al repositorio sin pasar por el servicio, la regla se seguiría cumpliendo.
-- **Operaciones atómicas:** una tarea y sus adjuntos se guardan juntos; el número máximo de adjuntos se controla con bloqueo para que dos subidas simultáneas no lo superen.
+| Requisito | Cómo lo resuelve el servicio |
+|---|---|
+| RF-06.1 / RN-21 Registrar tareas en **una vinculación propia** | Verifica que la vinculación sea del actor. |
+| RF-06.6 Varias tareas por semana | No hay límite por semana. |
+| RF-08.1 Semana de lunes a domingo | Cualquier fecha se normaliza al lunes. |
+| RF-08.3 Semanas pasadas | Se aceptan. |
+| RF-08.4 / RN-32 Tardanza | Si la semana ya cerró, la tarea se marca `Tardia`. |
+| RF-06.7, RF-06.8 / RN-30, RN-33, RN-34 | Editar o eliminar solo si es propia, la semana sigue activa, no es tardía y el espacio no está cerrado. |
+| RN-09 Espacio cerrado | No admite tareas nuevas ni cambios. |
+| RF-10.5, RF-11.2, RF-12 Visibilidad | Cada uno ve las suyas; el profesor, las de sus espacios; el administrador, todas. |
 
 ---
 
-## 3. Explicación detallada de `tareas.go`
+## 3. Explicación detallada
 
-### 3.1 Consulta base
+### 3.1 Dependencias
 
 ```go
-const selectTarea = `
-	SELECT t.id, t.vinculacion_id, v.usuario_id, u.nombre, v.espacio_id, e.nombre, e.tipo, e.estado, e.profesor_id, v.rol,
-	       t.semana_inicio, t.titulo, t.descripcion, t.estado, t.horas_invertidas, t.observaciones, t.tardia,
-	       (SELECT count(*) FROM tarea_adjuntos a WHERE a.tarea_id = t.id),
-	       t.creado_en, t.actualizado_en
-	FROM tareas t
-	JOIN vinculaciones v ON v.id = t.vinculacion_id
-	JOIN usuarios u ON u.id = v.usuario_id
-	JOIN espacios e ON e.id = v.espacio_id`
+type RepositorioTareas interface {
+	Crear(ctx context.Context, t dominio.Tarea, adjuntos []dominio.Adjunto) (dominio.Tarea, error)
+	Obtener(ctx context.Context, id string) (dominio.Tarea, error)
+	Listar(ctx context.Context, f dominio.FiltroTareas) ([]dominio.Tarea, error)
+	Actualizar(ctx context.Context, t dominio.Tarea) (dominio.Tarea, error)
+	Eliminar(ctx context.Context, id string) ([]string, error)
+}
+
+type LectorVinculaciones interface {
+	Obtener(ctx context.Context, id string) (dominio.Vinculacion, error)
+}
+
+type NuevaTarea struct {
+	VinculacionID string
+	Semana        time.Time // cualquier fecha de la semana (se normaliza al lunes); cero = semana en curso
+	Datos         dominio.DatosTarea
+}
 ```
-- Desde la vinculación se llega a la **persona**, al **espacio** y a su **profesor**: lo necesario para mostrar la tarea y para aplicar la visibilidad.
-- `(SELECT count(*) ...)` es una **subconsulta escalar**: cuenta los adjuntos de cada tarea sin traerlos (útil en los listados).
+- Del repositorio de tareas (paso 35) se usan por ahora cinco métodos; el paso 39 agregará los de adjuntos.
+- `Semana` en su **valor cero** (`time.Time{}`) significa "la semana en curso": el caso más común es registrar lo de esta semana sin indicarla.
 
 ### 3.2 `Crear`
 
 ```go
-func (r *Tareas) Crear(ctx context.Context, t dominio.Tarea, adjuntos []dominio.Adjunto) (dominio.Tarea, error) {
-	err := enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx,
-			`INSERT INTO tareas (id, vinculacion_id, semana_inicio, titulo, descripcion, estado, horas_invertidas, observaciones, tardia)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, ...)
-		if err != nil {
-			return traducir(err, recursoTarea)
-		}
-		return insertarAdjuntos(ctx, tx, adjuntos)
-	})
-	...
-	return r.Obtener(ctx, t.ID)
-}
-```
-- **El ID lo trae la tarea** (lo genera el servicio, paso 36). Así el servicio conoce el ID **antes** de guardar y puede ubicar los archivos de los adjuntos en una carpeta con ese ID (paso 39).
-- Tarea y adjuntos en una transacción: no puede quedar una tarea con la mitad de sus adjuntos.
-- Una `semana_inicio` que no sea lunes viola el `CHECK` → 400 (lo comprueba la prueba de integración).
-
-### 3.3 `Obtener` y `Listar`
-
-- `Obtener` trae la tarea **y** la lista de sus adjuntos (segunda consulta, ordenada por fecha de creación).
-- `Listar` aplica `VisiblePara` (`e.profesor_id = ? OR v.usuario_id = ?`: el profesor del espacio o la propia persona) y los filtros por usuario, espacio, vinculación y semana. Orden: de la semana más reciente a la más antigua.
-
-### 3.4 `Actualizar` y `Eliminar` con la regla RN-33 en SQL
-
-```go
-func (r *Tareas) Actualizar(ctx context.Context, t dominio.Tarea) (dominio.Tarea, error) {
-	etiqueta, err := r.db.Exec(ctx,
-		`UPDATE tareas SET titulo = $2, descripcion = $3, estado = $4, horas_invertidas = $5, observaciones = $6,
-		        actualizado_en = now()
-		 WHERE id = $1 AND tardia = FALSE`, ...)
-	...
-	if etiqueta.RowsAffected() == 0 {
-		return t, apperr.ReglaNegocio("la tarea no se puede modificar")
+func (s *Tareas) Crear(ctx context.Context, actor auth.Actor, n NuevaTarea) (dominio.Tarea, error) {
+	v, err := s.vinculaciones.Obtener(ctx, n.VinculacionID)
+	if apperr.Es(err, apperr.TipoNoEncontrado) || (err == nil && v.UsuarioID != actor.UsuarioID) {
+		// Solo se registran tareas en vinculaciones propias (RN-04, RN-21).
+		return dominio.Tarea{}, apperr.Validacion("la vinculación indicada no existe o no le pertenece")
 	}
-	return r.Obtener(ctx, t.ID)
+	...
+	espacio := espacioDe(v)
+	if err := espacio.PermiteRegistros(); err != nil { ... }
+
+	semana := s.reloj.SemanaActual()
+	if !n.Semana.IsZero() {
+		semana = dominio.InicioSemana(n.Semana)
+	}
+	if err := dominio.ValidarSemanaDeRegistro(semana, s.reloj.Ahora(), s.reloj.Zona()); err != nil { ... }
+	if !espacio.IncluyeSemana(semana) {
+		return dominio.Tarea{}, apperr.Validacion("la semana del %s está fuera de las fechas del %s (%s a %s)", ...)
+	}
+	datos, err := n.Datos.Normalizar()
+	...
+	t := dominio.Tarea{
+		ID:            uuid.NewString(),
+		VinculacionID: v.ID,
+		SemanaInicio:  semana,
+		Tardia:        dominio.SemanaCerrada(semana, s.reloj.Ahora(), s.reloj.Zona()),
+	}
+	t.Aplicar(datos)
+
+	creada, err := s.repo.Crear(ctx, t, nil)
+	...
 }
 ```
-- `AND tardia = FALSE`: una tarea tardía no se actualiza aunque se pida. Si no se modificó ninguna fila → 422.
-- Solo cambian los campos **editables**; la semana y la vinculación no se tocan (RN-26).
+1. **La vinculación debe ser del actor.** Una vinculación ajena se responde igual que una inexistente ("no existe o no le pertenece"), sin revelar si existe.
+2. **El espacio no puede estar cerrado** (RN-09, 422). `espacioDe(v)` arma un `dominio.Espacio` con los datos que trae la vinculación, para reutilizar sus reglas sin otra consulta.
+3. **La semana:** la actual por defecto o el lunes de la fecha indicada. No futura y dentro de las fechas del espacio.
+4. **Los datos** se validan con el dominio (paso 34).
+5. **El ID se genera aquí** (`uuid.NewString()`, paso 35).
+6. **`Tardia`** se calcula con la hora del reloj: `true` si la semana ya cerró (RN-32). Es la única forma en que una tarea queda tardía; el usuario no puede marcarla.
+7. Se guarda sin adjuntos (`nil`).
+
+### 3.3 Consultar
 
 ```go
-func (r *Tareas) Eliminar(ctx context.Context, id string) ([]string, error) {
-	var rutas []string
-	err := enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
-		filas, err := tx.Query(ctx, `SELECT ruta_almacenamiento FROM tarea_adjuntos WHERE tarea_id = $1`, id)
-		...
-		rutas, err = pgx.CollectRows(filas, pgx.RowTo[string])
-		...
-		etiqueta, err := tx.Exec(ctx, `DELETE FROM tareas WHERE id = $1 AND tardia = FALSE`, id)
-		...
-		if etiqueta.RowsAffected() == 0 {
-			return apperr.ReglaNegocio("la tarea no se puede eliminar")
-		}
-		return nil
-	})
-	return rutas, err
+func (s *Tareas) Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroTareas) ([]dominio.Tarea, error) {
+	f.VisiblePara = visiblePara(actor)
+	return s.repo.Listar(ctx, f)
+}
+
+func (s *Tareas) Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Tarea, error) {
+	t, err := s.repo.Obtener(ctx, id)
+	...
+	if t.UsuarioID != actor.UsuarioID && !puedeVerDeProfesor(actor, t.ProfesorID) {
+		return dominio.Tarea{}, noEncontrado("tarea")
+	}
+	return t, nil
 }
 ```
-- Antes de borrar, recoge las **rutas de los archivos** adjuntos y las devuelve: el servicio los borrará del almacenamiento (la base de datos no puede borrar archivos). Los registros de adjuntos se borran solos por el `ON DELETE CASCADE` (paso 4).
-- `pgx.CollectRows(filas, pgx.RowTo[string])`: utilidad genérica de pgx que convierte cada fila (de una sola columna) en un `string`.
+- Ven una tarea: la persona que la registró, el profesor del espacio y el administrador. Los demás reciben 404.
 
-### 3.5 Adjuntos
+### 3.4 Modificar
 
 ```go
-func (r *Tareas) AgregarAdjuntos(ctx context.Context, tareaID string, adjuntos []dominio.Adjunto, maximo int) error {
-	return enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
-		var id string
-		if err := tx.QueryRow(ctx, `SELECT id FROM tareas WHERE id = $1 FOR UPDATE`, tareaID).Scan(&id); err != nil {
-			return traducir(err, recursoTarea)
-		}
-		var actuales int
-		... SELECT count(*) FROM tarea_adjuntos WHERE tarea_id = $1 ...
-		if actuales+len(adjuntos) > maximo {
-			return apperr.ReglaNegocio("una tarea admite máximo %d adjuntos (ya tiene %d)", maximo, actuales)
-		}
-		return insertarAdjuntos(ctx, tx, adjuntos)
-	})
+func (s *Tareas) verificarModificable(actor auth.Actor, t dominio.Tarea) error {
+	if t.UsuarioID != actor.UsuarioID {
+		return apperr.Prohibido("solo la persona que registró la tarea puede modificarla")
+	}
+	if t.EspacioEstado == dominio.EspacioCerrado {
+		return apperr.ReglaNegocio("el %s %q está cerrado y solo admite consultas", t.EspacioTipo, t.EspacioNombre)
+	}
+	return t.PuedeModificarse(s.reloj.Ahora(), s.reloj.Zona())
+}
+
+func (s *Tareas) obtenerModificable(ctx context.Context, actor auth.Actor, id string) (dominio.Tarea, error) {
+	t, err := s.Obtener(ctx, actor, id)
+	if err != nil {
+		return t, err
+	}
+	return t, s.verificarModificable(actor, t)
 }
 ```
-- Mismo patrón que las vinculaciones (paso 31): **bloquear** la tarea (`FOR UPDATE`), contar, validar y escribir. Dos subidas simultáneas no pueden superar el máximo.
-- `ObtenerAdjunto` y `EliminarAdjunto` filtran por adjunto **y** tarea: no se puede pedir el adjunto de otra tarea cambiando el ID en la URL. `DELETE ... RETURNING ruta_almacenamiento` borra y devuelve la ruta del archivo en una sola operación.
+- Cuatro condiciones: puede **verla** (si no, 404); es **suya** (el profesor la ve pero no la edita: 403); el espacio **no está cerrado** (422); y el dominio lo permite (**no tardía**, **semana activa**: 422).
+- `Actualizar` y `Eliminar` empiezan con `obtenerModificable`. `Actualizar` normaliza los datos, los aplica (`t.Aplicar`) y guarda; la semana y la vinculación no cambian (RN-26).
+
+```go
+func (s *Tareas) Modificable(actor auth.Actor, t dominio.Tarea) bool {
+	return s.verificarModificable(actor, t) == nil
+}
+```
+- Responde sí o no. El handler (paso 37) lo incluirá en cada tarea (`"modificable": true/false`) para que una interfaz sepa si mostrar los botones de editar y eliminar.
 
 ---
 
-## 4. Conceptos de este paso
+## 4. Las pruebas
+
+El reloj de prueba marca el **miércoles 14 de octubre de 2026** (semana del 12 al 18). `lectorVinculacionesFalso` tiene tres vinculaciones: `v1` (propia, espacio activo de agosto a diciembre), `cerrada` (propia, espacio cerrado) y `ajena` (de otra persona).
+
+| Prueba | Qué verifica |
+|---|---|
+| `TestCrearTareaEnLaSemanaActual` | Con la fecha 15/10 la semana queda en el lunes 12/10; no es tardía; se genera ID; las horas llegan al repositorio. |
+| `TestCrearTareaSinSemanaUsaLaSemanaActual` | Sin semana → semana actual (12/10). |
+| `TestCrearTareaEnSemanaPasadaEsTardia` | Una tarea del 07/10 (semana cerrada) queda **tardía** (RN-32). |
+| `TestCrearTareaValidaciones` | Vinculación ajena o inexistente (400), espacio cerrado (422), semana futura (400), semana fuera de las fechas del espacio (400) y título vacío (400). |
+| `TestModificarTareas` | La tarea de la semana activa se edita; `Modificable` es verdadero solo para su dueña. Pasada, tardía o de espacio cerrado → 422 al editar y al eliminar. El profesor la ve pero no la edita (403); otro profesor ni la ve (404); la dueña la elimina. |
+
+---
+
+## 5. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Subconsulta escalar | `(SELECT count(*) ...)` como columna. |
-| ID generado en la aplicación | El servicio crea el UUID antes de insertar. |
-| Regla repetida en SQL | `WHERE ... AND tardia = FALSE` como segunda barrera. |
-| `ON DELETE CASCADE` | Borrar la tarea borra los registros de sus adjuntos. |
-| `DELETE ... RETURNING` | Borrar y obtener datos de la fila borrada. |
-| `pgx.CollectRows` / `pgx.RowTo[T]` | Leer filas a una lista con genéricos. |
+| `t.IsZero()` | ¿Es el valor cero de `time.Time`? (fecha "no indicada"). |
+| `uuid.NewString()` | Genera un UUID aleatorio (versión 4). |
+| Reutilizar reglas con un valor armado | `espacioDe(v)` construye un `Espacio` para usar `PermiteRegistros` e `IncluyeSemana`. |
+| 404 → 403 → 422 | No verla, no ser dueño, regla de negocio: en ese orden. |
 
 ---
 
-## 5. Cómo comprobarlo
+## 6. Cómo comprobarlo
 
 ```bash
-make lint
+cd backend
+go test ./internal/servicio/ -v -run 'Tarea'
 ```
 
-En el paso 58, `TestTareasYAdjuntos` lo prueba contra PostgreSQL: creación con adjunto, `semana_inicio` que no es lunes (400), visibilidad por profesor y por persona, actualización, máximo de adjuntos (422), eliminación devolviendo las rutas y una tarea tardía que no se actualiza ni se elimina (422).
+---
+
+## 7. Pasos para lograr esta versión desde el paso 35
+
+1. Crear `backend/internal/servicio/tareas.go` con `RepositorioTareas` (cinco métodos), `LectorVinculaciones`, `NuevaTarea`, `Tareas`, `NuevoTareas(repo, vinculaciones, reloj, log)` y los métodos de la sección 3.
+2. En `modulos_test.go`, después de vinculaciones, la sección `// --- tareas ---` con `repoTareasFalso`, `lectorVinculacionesFalso`, `entornoTareas`, `nuevaTarea` y las cinco pruebas.
+3. `make pruebas lint`
+4. Commit: `git add . && git commit -m "Paso 36: servicio de tareas"`
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 34
-
-1. En `repositorio/comun.go`, agregar al bloque `recursoTarea = "tarea"`, `recursoTareas = "tareas"`, `recursoAdjunto = "adjunto"` y `recursoAdjuntos = "adjuntos"`.
-2. Crear `backend/internal/repositorio/tareas.go` con `Tareas`, `NuevoTareas`, `selectTarea`, `escanearTarea`, `columnasAdjunto`, `escanearAdjunto` y los métodos de la sección 3.
-3. `make lint`
-4. Commit: `git add . && git commit -m "Paso 35: repositorio de tareas"`
-
----
-
-## 7. Requisitos que atiende
+## 8. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-06.1 a RF-06.3 Registrar tareas | `Crear`. |
-| RF-06.4 Adjuntos (metadatos) | `insertarAdjuntos`, `AgregarAdjuntos`, `ObtenerAdjunto`, `EliminarAdjunto`. |
-| RF-06.7 / RF-06.8 Editar y eliminar | `Actualizar`, `Eliminar`. |
-| RF-08.5 / RN-33 Tardía inmutable | `tardia = FALSE` en el `UPDATE` y el `DELETE`. |
-| RF-11.2 / RF-12 Visibilidad | `Listar` con `VisiblePara`. |
+| RF-06.1, RF-06.2, RF-06.6 | `Crear` en una vinculación propia; varias por semana. |
+| RF-06.7, RF-06.8 | `Actualizar`, `Eliminar`. |
+| RF-08.1 a RF-08.5 | Semana normalizada, pasadas permitidas, futuras no, tardanza e inmutabilidad. |
+| RN-09, RN-21, RN-26, RN-30, RN-32 a RN-34 | Ver tabla de la sección 2. |
+| RF-10.5, RF-11.2, RF-12 | `Listar` y `Obtener` con visibilidad. |
