@@ -1,229 +1,163 @@
-# Paso 34 · Dominio: tareas semanales
+# Paso 35 · Repositorio de tareas
 
-> Rama `paso-a-paso` · paso 34 de 65 · anterior: **Paso 33 · Endpoints de vinculaciones** · siguiente: **Paso 35 · Repositorio de tareas**
+> Rama `paso-a-paso` · paso 35 de 65 · anterior: **Paso 34 · Dominio de tareas** · siguiente: **Paso 36 · Servicio de tareas**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se modeló la **tarea semanal**: el registro de una actividad que un monitor o asistente hace en una de sus vinculaciones durante una semana, con sus estados y las reglas de tiempo (semana activa, tardanza, inmutabilidad).
+Se creó el repositorio de las tareas semanales y de los metadatos de sus adjuntos (tablas `tareas` y `tarea_adjuntos`).
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/dominio/tarea.go` | **Nuevo.** `EstadoTarea`, entidad `Tarea`, `DatosTarea` con `Normalizar`, `Aplicar`, `ValidarSemanaDeRegistro`, `PuedeModificarse`, `FiltroTareas` y la entidad `Adjunto`. |
-| `backend/internal/dominio/reglas_test.go` | **Modificado.** Pruebas de normalización, modificabilidad y semanas de registro. |
+| `backend/internal/repositorio/tareas.go` | **Nuevo.** `Crear`, `Obtener`, `Listar`, `Actualizar`, `Eliminar`, `AgregarAdjuntos`, `ObtenerAdjunto`, `EliminarAdjunto` e `insertarAdjuntos`. |
+| `backend/internal/repositorio/comun.go` | **Modificado.** Constantes `recursoTarea`, `recursoTareas`, `recursoAdjunto` y `recursoAdjuntos`. |
 
 ---
 
 ## 2. Por qué
 
-| Requisito | Regla |
-|---|---|
-| RF-06.1 a RF-06.3 / RN-20 a RN-22 | Cada tarea pertenece a **una** vinculación y tiene título, descripción, estado, horas y observaciones. |
-| RF-06.5 / RN-24 | Las horas son **enteras**. |
-| RF-07 / RN-27 y RN-28 | Estados cerrados: **abierto**, **en desarrollo**, **finalizado**. |
-| RF-06.7, RF-06.8, RF-08.2 / RN-30 | Editar y eliminar solo mientras la semana está **activa**. |
-| RF-08.3 | Se puede registrar en semanas **pasadas**. |
-| RF-08.4 / RN-32 | Registrar en una semana cerrada marca la tarea como **reporte tardío**. |
-| RF-08.5 / RN-33 | Un reporte tardío **no se puede modificar ni eliminar**. |
-| RN-34 | Las tareas de semanas cerradas no se modifican. |
-
-Todas son reglas puras sobre fechas y datos: van en el dominio.
+- El servicio de tareas (paso 36) y el de adjuntos (paso 39) necesitan persistir.
+- **Defensa en profundidad para RN-33:** aunque el servicio ya impide modificar una tarea tardía, el repositorio **tampoco** la modifica ni la borra. Si algún día otro código llamara al repositorio sin pasar por el servicio, la regla se seguiría cumpliendo.
+- **Operaciones atómicas:** una tarea y sus adjuntos se guardan juntos; el número máximo de adjuntos se controla con bloqueo para que dos subidas simultáneas no lo superen.
 
 ---
 
-## 3. Explicación detallada
+## 3. Explicación detallada de `tareas.go`
 
-### 3.1 Estados
-
-```go
-type EstadoTarea string
-
-const (
-	TareaAbierta      EstadoTarea = "abierto"
-	TareaEnDesarrollo EstadoTarea = "en_desarrollo"
-	TareaFinalizada   EstadoTarea = "finalizado"
-)
-
-var EstadosTarea = []EstadoTarea{TareaAbierta, TareaEnDesarrollo, TareaFinalizada}
-
-func (e EstadoTarea) Texto() string {
-	if e == TareaEnDesarrollo {
-		return "en desarrollo"
-	}
-	return string(e)
-}
-```
-- Coinciden con el `CHECK` de la tabla `tareas` (paso 4). `EstadosTarea` sirve para recorrerlos (por ejemplo, contar tareas por estado en el consolidado, paso 41). `Texto` es la versión legible para el PDF.
-
-### 3.2 La entidad
+### 3.1 Consulta base
 
 ```go
-type Tarea struct {
-	ID               string
-	VinculacionID    string
-	UsuarioID        string
-	UsuarioNombre    string
-	EspacioID        string
-	EspacioNombre    string
-	EspacioTipo      TipoEspacio
-	EspacioEstado    EstadoEspacio
-	ProfesorID       string
-	Rol              Rol
-	SemanaInicio     time.Time // siempre un lunes
-	Titulo           string
-	Descripcion      string
-	Estado           EstadoTarea
-	HorasInvertidas  int // horas enteras (RN-24)
-	Observaciones    string
-	Tardia           bool // RN-32
-	CantidadAdjuntos int
-	Adjuntos         []Adjunto
-	CreadoEn         time.Time
-	ActualizadoEn    time.Time
-}
+const selectTarea = `
+	SELECT t.id, t.vinculacion_id, v.usuario_id, u.nombre, v.espacio_id, e.nombre, e.tipo, e.estado, e.profesor_id, v.rol,
+	       t.semana_inicio, t.titulo, t.descripcion, t.estado, t.horas_invertidas, t.observaciones, t.tardia,
+	       (SELECT count(*) FROM tarea_adjuntos a WHERE a.tarea_id = t.id),
+	       t.creado_en, t.actualizado_en
+	FROM tareas t
+	JOIN vinculaciones v ON v.id = t.vinculacion_id
+	JOIN usuarios u ON u.id = v.usuario_id
+	JOIN espacios e ON e.id = v.espacio_id`
 ```
-- Una tarea se identifica por su vinculación; el resto (persona, espacio, profesor, rol) lo traerá el repositorio con `JOIN` (paso 35) para mostrarla y para decidir permisos.
-- **La semana se guarda como su lunes** (`SemanaInicio`).
-- `HorasInvertidas int`: las horas enteras (RN-24) se garantizan con el **tipo**.
-- `Adjuntos` y `CantidadAdjuntos`: la entidad ya contempla la evidencia; la funcionalidad de adjuntos se completa en los pasos 38 a 40.
+- Desde la vinculación se llega a la **persona**, al **espacio** y a su **profesor**: lo necesario para mostrar la tarea y para aplicar la visibilidad.
+- `(SELECT count(*) ...)` es una **subconsulta escalar**: cuenta los adjuntos de cada tarea sin traerlos (útil en los listados).
 
-### 3.3 Datos editables y su validación
+### 3.2 `Crear`
 
 ```go
-type DatosTarea struct {
-	Titulo          string
-	Descripcion     string
-	Estado          EstadoTarea
-	HorasInvertidas int
-	Observaciones   string
-}
-
-func (d DatosTarea) Normalizar() (DatosTarea, error) {
-	var err error
-	if d.Titulo, err = Texto("el título", d.Titulo, true, LongitudMaxTitulo); err != nil {
-		return d, err
-	}
-	if d.Descripcion, err = Texto("la descripción", d.Descripcion, false, LongitudMaxDescripcion); err != nil { ... }
-	if d.Observaciones, err = Texto("las observaciones", d.Observaciones, false, LongitudMaxObservaciones); err != nil { ... }
-	if d.Estado == "" {
-		d.Estado = TareaAbierta
-	}
-	if !d.Estado.EsValido() {
-		return d, apperr.Validacion("estado inválido: use abierto, en_desarrollo o finalizado")
-	}
-	if d.HorasInvertidas < 0 || d.HorasInvertidas > MaxHorasPorTarea {
-		return d, apperr.Validacion("las horas invertidas deben ser un número entero entre 0 y %d", MaxHorasPorTarea)
-	}
-	return d, nil
+func (r *Tareas) Crear(ctx context.Context, t dominio.Tarea, adjuntos []dominio.Adjunto) (dominio.Tarea, error) {
+	err := enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO tareas (id, vinculacion_id, semana_inicio, titulo, descripcion, estado, horas_invertidas, observaciones, tardia)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, ...)
+		if err != nil {
+			return traducir(err, recursoTarea)
+		}
+		return insertarAdjuntos(ctx, tx, adjuntos)
+	})
+	...
+	return r.Obtener(ctx, t.ID)
 }
 ```
-- Separar `DatosTarea` (lo que el usuario puede escribir) de `Tarea` (todo lo demás) deja claro **qué es editable**: la semana, la vinculación y la marca de tardanza no lo son.
-- `if d.Titulo, err = Texto(...); err != nil`: asignación (no declaración) dentro del `if`.
-- El título es obligatorio; si no se indica estado, la tarea queda **abierta**; las horas van de 0 a 168 (las horas de una semana).
+- **El ID lo trae la tarea** (lo genera el servicio, paso 36). Así el servicio conoce el ID **antes** de guardar y puede ubicar los archivos de los adjuntos en una carpeta con ese ID (paso 39).
+- Tarea y adjuntos en una transacción: no puede quedar una tarea con la mitad de sus adjuntos.
+- Una `semana_inicio` que no sea lunes viola el `CHECK` → 400 (lo comprueba la prueba de integración).
+
+### 3.3 `Obtener` y `Listar`
+
+- `Obtener` trae la tarea **y** la lista de sus adjuntos (segunda consulta, ordenada por fecha de creación).
+- `Listar` aplica `VisiblePara` (`e.profesor_id = ? OR v.usuario_id = ?`: el profesor del espacio o la propia persona) y los filtros por usuario, espacio, vinculación y semana. Orden: de la semana más reciente a la más antigua.
+
+### 3.4 `Actualizar` y `Eliminar` con la regla RN-33 en SQL
 
 ```go
-func (t *Tarea) Aplicar(d DatosTarea) {
-	t.Titulo, t.Descripcion, t.Estado = d.Titulo, d.Descripcion, d.Estado
-	t.HorasInvertidas, t.Observaciones = d.HorasInvertidas, d.Observaciones
-}
-```
-- Receptor **puntero** (`*Tarea`): modifica la tarea original. Copia solo los campos editables.
-
-### 3.4 Reglas de tiempo
-
-```go
-func ValidarSemanaDeRegistro(semanaInicio, ahora time.Time, zona *time.Location) error {
-	if InicioSemana(semanaInicio).After(SemanaActual(ahora, zona)) {
-		return apperr.Validacion("no se pueden registrar tareas en semanas futuras")
+func (r *Tareas) Actualizar(ctx context.Context, t dominio.Tarea) (dominio.Tarea, error) {
+	etiqueta, err := r.db.Exec(ctx,
+		`UPDATE tareas SET titulo = $2, descripcion = $3, estado = $4, horas_invertidas = $5, observaciones = $6,
+		        actualizado_en = now()
+		 WHERE id = $1 AND tardia = FALSE`, ...)
+	...
+	if etiqueta.RowsAffected() == 0 {
+		return t, apperr.ReglaNegocio("la tarea no se puede modificar")
 	}
-	return nil
+	return r.Obtener(ctx, t.ID)
 }
 ```
-- Se permiten la semana actual y las **pasadas** (RF-08.3); las futuras no.
+- `AND tardia = FALSE`: una tarea tardía no se actualiza aunque se pida. Si no se modificó ninguna fila → 422.
+- Solo cambian los campos **editables**; la semana y la vinculación no se tocan (RN-26).
 
 ```go
-func (t Tarea) PuedeModificarse(ahora time.Time, zona *time.Location) error {
-	if t.Tardia {
-		return apperr.ReglaNegocio("los reportes tardíos no pueden modificarse ni eliminarse")
-	}
-	if SemanaCerrada(t.SemanaInicio, ahora, zona) {
-		return apperr.ReglaNegocio("la semana del %s ya cerró: sus tareas no pueden modificarse ni eliminarse",
-			InicioSemana(t.SemanaInicio).Format(FormatoFecha))
-	}
-	return nil
+func (r *Tareas) Eliminar(ctx context.Context, id string) ([]string, error) {
+	var rutas []string
+	err := enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
+		filas, err := tx.Query(ctx, `SELECT ruta_almacenamiento FROM tarea_adjuntos WHERE tarea_id = $1`, id)
+		...
+		rutas, err = pgx.CollectRows(filas, pgx.RowTo[string])
+		...
+		etiqueta, err := tx.Exec(ctx, `DELETE FROM tareas WHERE id = $1 AND tardia = FALSE`, id)
+		...
+		if etiqueta.RowsAffected() == 0 {
+			return apperr.ReglaNegocio("la tarea no se puede eliminar")
+		}
+		return nil
+	})
+	return rutas, err
 }
 ```
-- **RN-33:** una tarea tardía **nunca** se modifica (aunque su semana fuera la actual, caso que no ocurre en la práctica pero la regla lo cubre).
-- **RN-30 / RN-34:** si la semana ya cerró, tampoco.
-- Ambas son reglas de negocio (422). La marca `Tardia` la pone el servicio al crear (paso 36) con `SemanaCerrada` (paso 20).
+- Antes de borrar, recoge las **rutas de los archivos** adjuntos y las devuelve: el servicio los borrará del almacenamiento (la base de datos no puede borrar archivos). Los registros de adjuntos se borran solos por el `ON DELETE CASCADE` (paso 4).
+- `pgx.CollectRows(filas, pgx.RowTo[string])`: utilidad genérica de pgx que convierte cada fila (de una sola columna) en un `string`.
 
-### 3.5 Filtro y adjuntos
+### 3.5 Adjuntos
 
 ```go
-type FiltroTareas struct {
-	VisiblePara   string
-	UsuarioID     string
-	EspacioID     string
-	VinculacionID string
-	SemanaInicio  *time.Time
-	Paginacion
+func (r *Tareas) AgregarAdjuntos(ctx context.Context, tareaID string, adjuntos []dominio.Adjunto, maximo int) error {
+	return enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
+		var id string
+		if err := tx.QueryRow(ctx, `SELECT id FROM tareas WHERE id = $1 FOR UPDATE`, tareaID).Scan(&id); err != nil {
+			return traducir(err, recursoTarea)
+		}
+		var actuales int
+		... SELECT count(*) FROM tarea_adjuntos WHERE tarea_id = $1 ...
+		if actuales+len(adjuntos) > maximo {
+			return apperr.ReglaNegocio("una tarea admite máximo %d adjuntos (ya tiene %d)", maximo, actuales)
+		}
+		return insertarAdjuntos(ctx, tx, adjuntos)
+	})
 }
 ```
-- `SemanaInicio *time.Time`: puntero porque es **opcional** (sin semana = todas).
-
-```go
-type Adjunto struct {
-	ID                 string
-	TareaID            string
-	NombreOriginal     string
-	RutaAlmacenamiento string
-	TipoContenido      string
-	TamanoBytes        int64
-	CreadoEn           time.Time
-}
-```
-- Los **metadatos** de un archivo de evidencia (tabla `tarea_adjuntos`). El archivo en sí se guardará fuera de la base de datos (paso 38). `int64` porque un tamaño en bytes puede superar el rango de un `int` de 32 bits.
-
-### 3.6 Pruebas
-
-El "ahora" de las pruebas es el **miércoles 14 de octubre de 2026** (semana del 12 al 18).
-
-| Prueba | Casos |
-|---|---|
-| `TestDatosTareaNormalizar` | `"  Calificar  "` → `"Calificar"` y estado abierto por defecto. Inválidos: título vacío, estado `cerrado`, horas −1, horas 169 y título de 201 caracteres. |
-| `TestTareaPuedeModificarse` | Semana actual ✔; semana pasada ✘ (RN-34); tardía ✘ con el mensaje de "tardíos" (RN-33). |
-| `TestValidarSemanaDeRegistro` | El domingo 18 (semana actual) ✔; una semana pasada ✔ (RF-08.3); el lunes 19 (semana futura) ✘. |
+- Mismo patrón que las vinculaciones (paso 31): **bloquear** la tarea (`FOR UPDATE`), contar, validar y escribir. Dos subidas simultáneas no pueden superar el máximo.
+- `ObtenerAdjunto` y `EliminarAdjunto` filtran por adjunto **y** tarea: no se puede pedir el adjunto de otra tarea cambiando el ID en la URL. `DELETE ... RETURNING ruta_almacenamiento` borra y devuelve la ruta del archivo en una sola operación.
 
 ---
 
-## 4. Conceptos de Go de este paso
+## 4. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Asignación en el `if` | `if x, err = f(); err != nil` (sin `:=`, porque `x` ya existe). |
-| Asignación múltiple de campos | `t.A, t.B = d.A, d.B`. |
-| Receptor puntero para modificar | `func (t *Tarea) Aplicar(...)`. |
-| Puntero como opcional | `*time.Time` en un filtro. |
-| `int64` | Entero de 64 bits para tamaños en bytes. |
+| Subconsulta escalar | `(SELECT count(*) ...)` como columna. |
+| ID generado en la aplicación | El servicio crea el UUID antes de insertar. |
+| Regla repetida en SQL | `WHERE ... AND tardia = FALSE` como segunda barrera. |
+| `ON DELETE CASCADE` | Borrar la tarea borra los registros de sus adjuntos. |
+| `DELETE ... RETURNING` | Borrar y obtener datos de la fila borrada. |
+| `pgx.CollectRows` / `pgx.RowTo[T]` | Leer filas a una lista con genéricos. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/dominio/ -v -run 'Tarea|SemanaDeRegistro'
+make lint
 ```
+
+En el paso 58, `TestTareasYAdjuntos` lo prueba contra PostgreSQL: creación con adjunto, `semana_inicio` que no es lunes (400), visibilidad por profesor y por persona, actualización, máximo de adjuntos (422), eliminación devolviendo las rutas y una tarea tardía que no se actualiza ni se elimina (422).
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 33
+## 6. Pasos para lograr esta versión desde el paso 34
 
-1. Crear `backend/internal/dominio/tarea.go` con las constantes de límites (`LongitudMaxTitulo`, `LongitudMaxDescripcion`, `MaxHorasPorTarea`), `EstadoTarea` con sus constantes, `EstadosTarea`, `EsValido`, `Texto`, `Tarea`, `DatosTarea`, `Normalizar`, `Aplicar`, `ValidarSemanaDeRegistro`, `PuedeModificarse`, `FiltroTareas` y `Adjunto`.
-2. En `reglas_test.go`, después de `TestEspacioFechasYEstado`: `TestDatosTareaNormalizar`, `TestTareaPuedeModificarse` y `TestValidarSemanaDeRegistro`.
-3. `make pruebas lint`
-4. Commit: `git add . && git commit -m "Paso 34: dominio de tareas semanales"`
+1. En `repositorio/comun.go`, agregar al bloque `recursoTarea = "tarea"`, `recursoTareas = "tareas"`, `recursoAdjunto = "adjunto"` y `recursoAdjuntos = "adjuntos"`.
+2. Crear `backend/internal/repositorio/tareas.go` con `Tareas`, `NuevoTareas`, `selectTarea`, `escanearTarea`, `columnasAdjunto`, `escanearAdjunto` y los métodos de la sección 3.
+3. `make lint`
+4. Commit: `git add . && git commit -m "Paso 35: repositorio de tareas"`
 
 ---
 
@@ -231,10 +165,8 @@ go test ./internal/dominio/ -v -run 'Tarea|SemanaDeRegistro'
 
 | Requisito | Cómo |
 |---|---|
-| RF-06.3 / RN-22 Información mínima | `DatosTarea` y `Normalizar`. |
-| RF-06.5 / RN-24 Horas enteras | `HorasInvertidas int` y rango 0–168. |
-| RF-07 / RN-27 y RN-28 Estados | `EstadoTarea`. |
-| RF-08.2 / RN-30 Semana activa | `PuedeModificarse`. |
-| RF-08.3 Semanas anteriores | `ValidarSemanaDeRegistro`. |
-| RF-08.5 / RN-33 Tardía inmutable | `PuedeModificarse`. |
-| RN-34 Semanas cerradas | `PuedeModificarse`. |
+| RF-06.1 a RF-06.3 Registrar tareas | `Crear`. |
+| RF-06.4 Adjuntos (metadatos) | `insertarAdjuntos`, `AgregarAdjuntos`, `ObtenerAdjunto`, `EliminarAdjunto`. |
+| RF-06.7 / RF-06.8 Editar y eliminar | `Actualizar`, `Eliminar`. |
+| RF-08.5 / RN-33 Tardía inmutable | `tardia = FALSE` en el `UPDATE` y el `DELETE`. |
+| RF-11.2 / RF-12 Visibilidad | `Listar` con `VisiblePara`. |

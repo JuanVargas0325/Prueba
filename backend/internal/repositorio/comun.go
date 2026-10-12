@@ -35,6 +35,10 @@ const (
 	recursoEspacios      = "cursos y proyectos"
 	recursoVinculacion   = "vinculación"
 	recursoVinculaciones = "vinculaciones"
+	recursoTarea         = "tarea"
+	recursoTareas        = "tareas"
+	recursoAdjunto       = "adjunto"
+	recursoAdjuntos      = "adjuntos"
 )
 
 // enTransaccion ejecuta fn dentro de una transacción: confirma si fn termina
