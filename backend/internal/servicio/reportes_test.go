@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"seguimiento/internal/apperr"
 	"seguimiento/internal/auth"
 	"seguimiento/internal/dominio"
+	"seguimiento/internal/ia"
+	"seguimiento/internal/pdf"
 )
 
 // --- dobles de prueba -------------------------------------------------------
@@ -142,6 +145,25 @@ func (a *almacenamientoFalso) Abrir(_ context.Context, ruta string) (io.ReadClos
 func (a *almacenamientoFalso) Eliminar(_ context.Context, ruta string) error {
 	delete(a.archivos, ruta)
 	return nil
+}
+
+type resumidorFalso struct {
+	llamadas int
+	err      error
+}
+
+func (r *resumidorFalso) Resumir(context.Context, dominio.DatosSemanaPersona) (string, error) {
+	r.llamadas++
+	return "Resumen de prueba", r.err
+}
+func (r *resumidorFalso) Proveedor() string { return "falso" }
+func (r *resumidorFalso) Modelo() string    { return "modelo-falso" }
+
+type pdfFalso struct{ contenido pdf.Contenido }
+
+func (p *pdfFalso) Generar(c pdf.Contenido) ([]byte, error) {
+	p.contenido = c
+	return []byte("%PDF-falso"), nil
 }
 
 var (
@@ -291,5 +313,161 @@ func TestAbrirPDF(t *testing.T) {
 	defer func() { _ = r.Close() }()
 	if b, _ := io.ReadAll(r); string(b) != "%PDF" {
 		t.Errorf("contenido inesperado: %q", b)
+	}
+}
+
+// --- GeneradorReportes -------------------------------------------------------
+
+func nuevoGenerador() (*GeneradorReportes, *repoFalso, *encoladorFalso, *almacenamientoFalso, *resumidorFalso, *pdfFalso) {
+	repo, cola := nuevoRepoFalso(), &encoladorFalso{}
+	alm := &almacenamientoFalso{archivos: map[string][]byte{}}
+	res, gen := &resumidorFalso{}, &pdfFalso{}
+	g := NuevoGeneradorReportes(repo, cola, alm, res, gen, RelojFijo(ahoraPrueba, time.UTC), logPrueba)
+	return g, repo, cola, alm, res, gen
+}
+
+func semanaPrueba() time.Time { return time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC) }
+
+func TestProcesarLoteCreaYEncolaUnReportePorPersona(t *testing.T) {
+	g, repo, cola, _, _, _ := nuevoGenerador()
+	repo.lotes["l1"] = dominio.LoteReportes{ID: "l1", ProfesorID: "prof-1", SemanaInicio: semanaPrueba(), Estado: dominio.LotePendiente}
+	repo.personas = []string{"u1", "u2", "u3"}
+
+	if err := g.ProcesarLote(context.Background(), "l1"); err != nil {
+		t.Fatal(err)
+	}
+	if repo.lotes["l1"].TotalReportes != 3 || repo.lotes["l1"].Estado != dominio.LoteEnProceso {
+		t.Errorf("lote inesperado: %+v", repo.lotes["l1"])
+	}
+	if len(cola.reportes) != 3 {
+		t.Errorf("se esperaban 3 reportes encolados, hay %d", len(cola.reportes))
+	}
+}
+
+func TestProcesarLoteOmiteLotesTerminados(t *testing.T) {
+	g, repo, cola, _, _, _ := nuevoGenerador()
+	repo.lotes["l1"] = dominio.LoteReportes{ID: "l1", Estado: dominio.LoteCompletado}
+	repo.personas = []string{"u1"}
+	if err := g.ProcesarLote(context.Background(), "l1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(cola.reportes) != 0 {
+		t.Error("un lote terminado no debería volver a procesarse")
+	}
+}
+
+func TestProcesarLoteMarcaFallidoElReporteQueNoSePudoEncolar(t *testing.T) {
+	g, repo, cola, _, _, _ := nuevoGenerador()
+	repo.lotes["l1"] = dominio.LoteReportes{ID: "l1", ProfesorID: "prof-1", SemanaInicio: semanaPrueba(), Estado: dominio.LotePendiente}
+	repo.personas = []string{"u1"}
+	cola.err = errors.New("redis caído")
+	if err := g.ProcesarLote(context.Background(), "l1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := repo.fallidos["rep-u1"]; !ok {
+		t.Error("el reporte que no se pudo encolar debería quedar fallido")
+	}
+}
+
+func datosConTareas() dominio.DatosSemanaPersona {
+	return dominio.DatosSemanaPersona{
+		Persona: "Ana", SemanaInicio: semanaPrueba(),
+		Vinculaciones: []dominio.VinculacionSemana{{
+			EspacioNombre: "Curso", Rol: dominio.RolMonitor, HorasContratadas: 4,
+			Tareas: []dominio.TareaSemana{{Titulo: "Tarea", Estado: dominio.TareaFinalizada, Horas: 3}},
+		}},
+	}
+}
+
+func TestGenerarReporteCompleto(t *testing.T) {
+	g, repo, _, alm, res, gen := nuevoGenerador()
+	repo.reportes["r1"] = dominio.ReporteSemanal{ID: "r1", ProfesorID: "prof-1", UsuarioID: "u1", SemanaInicio: semanaPrueba(), Estado: dominio.ReportePendiente}
+	repo.datos = datosConTareas()
+
+	if err := g.GenerarReporte(context.Background(), "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if res.llamadas != 1 || gen.contenido.Resumen != "Resumen de prueba" {
+		t.Errorf("el resumen de IA debería usarse en el PDF: llamadas=%d contenido=%+v", res.llamadas, gen.contenido)
+	}
+	ruta := "reportes/2026-10-05/r1.pdf"
+	if string(alm.archivos[ruta]) != "%PDF-falso" {
+		t.Errorf("el PDF debería guardarse en %s", ruta)
+	}
+	resultado, ok := repo.completados["r1"]
+	if !ok || resultado.RutaPDF != ruta || resultado.TamanoBytes != int64(len("%PDF-falso")) ||
+		resultado.ProveedorIA != "falso" || resultado.ModeloIA != "modelo-falso" {
+		t.Errorf("resultado inesperado: %+v", resultado)
+	}
+	if len(repo.enProceso) != 1 {
+		t.Error("el reporte debería marcarse en proceso antes de generarse")
+	}
+}
+
+func TestGenerarReporteSinTareasNoConsultaLaIA(t *testing.T) {
+	g, repo, _, _, res, gen := nuevoGenerador()
+	repo.reportes["r1"] = dominio.ReporteSemanal{ID: "r1", SemanaInicio: semanaPrueba(), Estado: dominio.ReportePendiente}
+	repo.datos = dominio.DatosSemanaPersona{SemanaInicio: semanaPrueba()}
+
+	if err := g.GenerarReporte(context.Background(), "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if res.llamadas != 0 {
+		t.Error("sin tareas no debería llamarse al modelo de IA")
+	}
+	if gen.contenido.Resumen != ResumenSinTareas || repo.completados["r1"].ProveedorIA != "" {
+		t.Errorf("resultado inesperado: %+v", repo.completados["r1"])
+	}
+}
+
+func TestGenerarReporteOmiteReportesFinalizados(t *testing.T) {
+	g, repo, _, _, res, _ := nuevoGenerador()
+	repo.reportes["r1"] = dominio.ReporteSemanal{ID: "r1", Estado: dominio.ReporteCompletado}
+	if err := g.GenerarReporte(context.Background(), "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if res.llamadas != 0 || len(repo.completados) != 0 {
+		t.Error("un reporte finalizado no debería regenerarse")
+	}
+}
+
+func TestGenerarReportePropagaElErrorDeIA(t *testing.T) {
+	g, repo, _, _, res, _ := nuevoGenerador()
+	repo.reportes["r1"] = dominio.ReporteSemanal{ID: "r1", SemanaInicio: semanaPrueba(), Estado: dominio.ReportePendiente}
+	repo.datos = datosConTareas()
+	res.err = &ia.ErrorProveedor{Proveedor: "falso", Estado: 401, Mensaje: "clave inválida"}
+
+	err := g.GenerarReporte(context.Background(), "r1")
+	if err == nil || !EsErrorPermanente(err) {
+		t.Fatalf("un 401 del proveedor debería ser un error permanente: %v", err)
+	}
+	if len(repo.completados) != 0 {
+		t.Error("el reporte no debería completarse")
+	}
+
+	if err := g.RegistrarFalloReporte(context.Background(), "r1", err); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(repo.fallidos["r1"], "clave inválida") {
+		t.Errorf("la causa del fallo debería registrarse: %q", repo.fallidos["r1"])
+	}
+}
+
+func TestEsErrorPermanente(t *testing.T) {
+	casos := []struct {
+		err        error
+		permanente bool
+	}{
+		{apperr.NoEncontrado("x"), true},
+		{apperr.Validacion("x"), true},
+		{&ia.ErrorProveedor{Estado: 400}, true},
+		{&ia.ErrorProveedor{Estado: 429, Reintentable: true}, false},
+		{fmt.Errorf("envuelto: %w", &ia.ErrorProveedor{Estado: 503, Reintentable: true}), false},
+		{errors.New("timeout de red"), false},
+	}
+	for _, c := range casos {
+		if got := EsErrorPermanente(c.err); got != c.permanente {
+			t.Errorf("EsErrorPermanente(%v) = %v, se esperaba %v", c.err, got, c.permanente)
+		}
 	}
 }
