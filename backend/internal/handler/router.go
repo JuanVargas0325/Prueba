@@ -12,10 +12,13 @@ import (
 // ComprobadorSalud verifica una dependencia externa (base de datos, Redis).
 type ComprobadorSalud func(ctx context.Context) error
 
-// Dependencias agrupa lo que la API necesita. Cada módulo que se construya
-// (usuarios, períodos, espacios...) agrega aquí su servicio.
+// Dependencias agrupa los servicios que la API expone. Cada módulo que se
+// construya (usuarios, períodos, espacios...) agrega aquí su servicio.
 type Dependencias struct {
-	Salud map[string]ComprobadorSalud
+	Autenticacion ServicioAutenticacion
+
+	Tokens ValidadorTokens
+	Salud  map[string]ComprobadorSalud
 	// OrigenesCORS son los orígenes de los frontends que pueden usar la API.
 	OrigenesCORS []string
 	Log          *slog.Logger
@@ -45,10 +48,15 @@ func NuevoRouter(d Dependencias) *gin.Engine {
 	r.GET("/salud", salud(d.Salud))
 
 	api := r.Group("/api/v1")
-	// Los módulos se agregan a partir del paso 17 (inicio de sesión).
-	modulos := []modulo{}
+	autenticacion := &HandlerAutenticacion{servicio: d.Autenticacion, log: d.Log}
+	autenticacion.RegistrarPublicas(api)
+
+	protegidas := api.Group("", Autenticar(d.Tokens))
+	modulos := []modulo{
+		autenticacion,
+	}
 	for _, m := range modulos {
-		m.Registrar(api)
+		m.Registrar(protegidas)
 	}
 	return r
 }

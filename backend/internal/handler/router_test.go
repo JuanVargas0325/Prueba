@@ -9,11 +9,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"seguimiento/internal/auth"
 )
 
 // Utilidades compartidas por las pruebas de todos los módulos del handler.
+
+const secretoPrueba = "secreto-de-prueba-con-mas-de-32-caracteres"
 
 var logPrueba = slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -26,8 +31,9 @@ func nuevoEntorno(t *testing.T, configurar func(*Dependencias)) entorno {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	d := Dependencias{
-		Salud: map[string]ComprobadorSalud{"postgres": func(context.Context) error { return nil }},
-		Log:   logPrueba,
+		Tokens: auth.NuevoGestorTokens(secretoPrueba, time.Hour),
+		Salud:  map[string]ComprobadorSalud{"postgres": func(context.Context) error { return nil }},
+		Log:    logPrueba,
 	}
 	if configurar != nil {
 		configurar(&d)
@@ -35,13 +41,16 @@ func nuevoEntorno(t *testing.T, configurar func(*Dependencias)) entorno {
 	return entorno{router: NuevoRouter(d)}
 }
 
-func (e entorno) peticion(metodo, ruta, cuerpo string) *httptest.ResponseRecorder {
-	return e.peticionCon(metodo, ruta, "application/json", bytes.NewBufferString(cuerpo))
+func (e entorno) peticion(metodo, ruta, token, cuerpo string) *httptest.ResponseRecorder {
+	return e.peticionCon(metodo, ruta, token, "application/json", bytes.NewBufferString(cuerpo))
 }
 
-func (e entorno) peticionCon(metodo, ruta, tipo string, cuerpo io.Reader) *httptest.ResponseRecorder {
+func (e entorno) peticionCon(metodo, ruta, token, tipo string, cuerpo io.Reader) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(metodo, ruta, cuerpo)
 	req.Header.Set("Content-Type", tipo)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	w := httptest.NewRecorder()
 	e.router.ServeHTTP(w, req)
 	return w
@@ -58,20 +67,30 @@ func esperarEstado(t *testing.T, w *httptest.ResponseRecorder, estado int) {
 
 func TestSaludResponde200(t *testing.T) {
 	e := nuevoEntorno(t, nil)
-	esperarEstado(t, e.peticion(http.MethodGet, "/salud", ""), http.StatusOK)
+	esperarEstado(t, e.peticion(http.MethodGet, "/salud", "", ""), http.StatusOK)
 }
 
 func TestSaludResponde503SiUnaDependenciaFalla(t *testing.T) {
 	e := nuevoEntorno(t, func(d *Dependencias) {
 		d.Salud = map[string]ComprobadorSalud{"redis": func(context.Context) error { return errors.New("caído") }}
 	})
-	esperarEstado(t, e.peticion(http.MethodGet, "/salud", ""), http.StatusServiceUnavailable)
+	esperarEstado(t, e.peticion(http.MethodGet, "/salud", "", ""), http.StatusServiceUnavailable)
+}
+
+func TestRutasProtegidasExigenToken(t *testing.T) {
+	e := nuevoEntorno(t, nil)
+	for _, ruta := range []string{"/api/v1/auth/yo"} {
+		if w := e.peticion(http.MethodGet, ruta, "", ""); w.Code != http.StatusUnauthorized {
+			t.Errorf("%s sin token: estado = %d", ruta, w.Code)
+		}
+	}
+	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/auth/yo", "token-invalido", ""), http.StatusUnauthorized)
 }
 
 func TestRutaInexistenteYMetodoNoPermitido(t *testing.T) {
 	e := nuevoEntorno(t, nil)
-	esperarEstado(t, e.peticion(http.MethodGet, "/no-existe", ""), http.StatusNotFound)
-	esperarEstado(t, e.peticion(http.MethodDelete, "/salud", ""), http.StatusMethodNotAllowed)
+	esperarEstado(t, e.peticion(http.MethodGet, "/no-existe", "", ""), http.StatusNotFound)
+	esperarEstado(t, e.peticion(http.MethodDelete, "/salud", "", ""), http.StatusMethodNotAllowed)
 }
 
 func TestCORS(t *testing.T) {
