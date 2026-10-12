@@ -1,70 +1,140 @@
-# Paso 57 · Modelo local con Ollama
+# Paso 58 · Pruebas de integración de la capa de datos
 
-> Rama `paso-a-paso` · paso 57 de 65 · anterior: **Paso 56 · Panel de la cola** · siguiente: **Paso 58 · Pruebas de integración de la capa de datos**
+> Rama `paso-a-paso` · paso 58 de 65 · anterior: **Paso 57 · Modelo local con Ollama** · siguiente: **Paso 59 · Datos de demostración**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se agregó la opción de ejecutar un **modelo de lenguaje local** con **Ollama**, como perfil opcional de Docker Compose. Con este paso, `docker-compose.yml` y `.env.example` quedan en su **versión final**.
+Se agregaron **pruebas de integración**: ejecutan los repositorios contra un **PostgreSQL real** y verifican las consultas SQL, las restricciones, las transacciones y la concurrencia. Se ejecutan en GitHub Actions y con `make`.
 
 | Archivo | Cambio |
 |---|---|
-| `docker-compose.yml` | **Modificado.** Servicio `ollama` en el perfil `ollama`, volumen `modelos-ollama` y nota en el comentario inicial. |
-| `.env.example` | **Modificado.** Ejemplo de configuración para Ollama. |
+| `backend/internal/repositorio/integracion_test.go` | **Nuevo.** Siete pruebas contra PostgreSQL, compiladas solo con la etiqueta `integracion`. |
+| `.github/workflows/ci.yml` | **Modificado.** El job de pruebas levanta un PostgreSQL como **servicio** y ejecuta también las de integración. |
+| `Makefile` | **Modificado.** Objetivo `pruebas-integracion`. |
 
-No se modificó código Go: Ollama expone una API **compatible con OpenAI**, así que funciona con el proveedor `openai` del paso 52.
+Con este paso, **todo `backend/` queda idéntico a la versión final**.
 
 ---
 
 ## 2. Por qué
 
-- **El stack del curso** pide "un modelo pequeño" para los reportes, y el profesor indicó que puede ser **local** o en la nube.
-- **Ventajas de un modelo local:**
-  - **privacidad:** las descripciones de las tareas no salen de la máquina (mitiga la deuda técnica DT-03);
-  - **sin costo por uso** y **sin clave**;
-  - funciona sin internet.
-- **Desventajas:** consume CPU y memoria de la máquina (un modelo de 3 mil millones de parámetros pesa ~1,9 GB y necesita unos 3–4 GB de RAM) y es más lento y menos preciso que un modelo grande en la nube.
-- Al ser un perfil opcional, quien no lo use no descarga nada.
+- Las pruebas unitarias usan repositorios **falsos en memoria**: comprueban la lógica, pero no que el SQL sea correcto. Un error en una consulta, una columna mal escrita o un bloqueo que no funciona solo aparecen contra una base de datos real.
+- Lo más delicado del sistema vive en SQL: la **concurrencia de las reglas de horas** (paso 31), la **idempotencia** de los reportes (paso 46) y las barreras de la base de datos (tareas tardías inmutables, semana en lunes).
+- Esto saldaba la **deuda técnica DT-01** ("las consultas de `repositorio` no tenían pruebas automáticas contra una base de datos real").
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 `docker-compose.yml`
+### 3.1 Etiqueta de compilación
+
+```go
+//go:build integracion
+
+// Pruebas de integración de la capa de datos contra un PostgreSQL real.
+// Se ejecutan con:
+//
+//	DATABASE_URL_PRUEBAS=postgres://usuario:clave@localhost:5432/bd_pruebas?sslmode=disable \
+//	  go test -tags integracion ./internal/repositorio/...
+//
+// ¡Borran todos los datos de esa base de datos! Use una base exclusiva para pruebas.
+package repositorio_test
+```
+- `//go:build integracion` es una **etiqueta de compilación**: el archivo solo se compila con `go test -tags integracion`. Un `go test ./...` normal (rápido, sin base de datos) lo ignora.
+- `package repositorio_test` (con `_test`): es un **paquete de prueba externo**. Solo puede usar lo **exportado** de `repositorio`, como lo haría cualquier otro paquete. Así se prueban los repositorios a través de su interfaz pública.
+- La configuración `build-tags: integracion` de golangci-lint (paso 8) hace que el linter también lo revise.
+
+### 3.2 Preparación
+
+```go
+func conectar(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	url := os.Getenv("DATABASE_URL_PRUEBAS")
+	if url == "" {
+		t.Skip("DATABASE_URL_PRUEBAS no está definida")
+	}
+	...
+	t.Cleanup(db.Close)
+	if err := basedatos.Migrar(ctx, db, logPrueba); err != nil { ... }
+	_, err = db.Exec(ctx, `TRUNCATE usuarios, usuario_roles, periodos_academicos, espacios, vinculaciones,
+		vinculacion_rectificaciones, tareas, tarea_adjuntos, lotes_reportes, reportes_semanales CASCADE`)
+	...
+}
+```
+- Sin `DATABASE_URL_PRUEBAS`, la prueba se **omite** (`t.Skip`) en lugar de fallar.
+- Se usa una variable **distinta** de `DATABASE_URL` a propósito: así es imposible correr las pruebas contra la base de datos de desarrollo por error, porque **`TRUNCATE` borra todo** para que cada prueba empiece limpia.
+- `t.Cleanup(db.Close)` registra una limpieza que Go ejecuta al terminar la prueba.
+
+```go
+type escenario struct {
+	profesor, laura, andres dominio.Usuario
+	periodo                 dominio.PeriodoAcademico
+	curso, proyecto         dominio.Espacio
+}
+
+func crearEscenario(t *testing.T, db *pgxpool.Pool) escenario { ... }
+```
+- Un **escenario** reutilizable: una profesora, Laura (monitora y asistente), Andrés (monitor), un período 2026-20, un curso y un proyecto. Se crea **con los repositorios reales**, que así también quedan probados.
+
+### 3.3 Las pruebas
+
+| Prueba | Qué verifica contra PostgreSQL |
+|---|---|
+| `TestMigracionesSobreBaseVacia` | Sobre un esquema vacío (`DROP SCHEMA public CASCADE`), migrar **dos veces**: 1 migración registrada y 11 tablas, sin errores la segunda vez (paso 4). |
+| `TestUsuarios` | Búsqueda por correo sin distinguir mayúsculas y con sus 2 roles; correo repetido → conflicto; filtro por rol y búsqueda parcial (`ndr`); reemplazo de roles; ID inexistente → no encontrado. |
+| `TestEspaciosVisibilidadYCierre` | La profesora ve 2 espacios, Laura solo el curso donde está vinculada y Andrés ninguno; vienen el código del período y el nombre de la profesora (`JOIN`); cerrar dos veces → conflicto. |
+| `TestVinculacionesReglasYConcurrencia` | **Concurrencia:** dos goroutines vinculan a Laura como asistente con 12 h en dos espacios **a la vez** (24 h > 22 h): **exactamente una** falla con regla de negocio. Luego: duplicado → conflicto; rectificación 12 → 10 h con su historial; una rectificación a 23 h se rechaza y **no** cambia las horas. |
+| `TestTareasYAdjuntos` | Tarea con adjunto (trae persona, profesor y conteo de adjuntos); `semana_inicio` en miércoles → validación (el `CHECK` del paso 4); visibilidad; actualización; máximo de adjuntos; eliminar devuelve la ruta del archivo; una tarea **tardía** no se actualiza ni se elimina. |
+| `TestListarPorVinculaciones` | La consulta liviana del seguimiento (paso 42): con 3 tareas en 3 semanas, el rango 05/10–12/10 devuelve 2, de la más reciente a la más antigua y con sus datos propios (semana, estado, horas, título); sin rango devuelve las 3; sin vinculaciones, ninguna. Verifica contra PostgreSQL real que el SQL propio de esa consulta es correcto. |
+| `TestCreacionDeLoteDeReportes` | 2 personas y 2 reportes; el lote cuenta como activo; repetir la creación **no duplica**; los datos de la semana de Laura (1 tarea, 3 h, nombres). |
+| `TestFinalizacionDeReportes` | Un reporte completado (completarlo dos veces **no cuenta dos veces**) y otro fallido → lote `completado_con_errores` con contadores 1 y 1 y fecha de finalización. |
+
+La prueba de concurrencia usa `sync.WaitGroup`: `wg.Add(1)` por cada goroutine, `defer wg.Done()` dentro de cada una y `wg.Wait()` para esperar a que terminen las dos.
+
+### 3.4 En GitHub Actions
 
 ```yaml
-  ollama:
-    profiles: ["ollama"]
-    image: ollama/ollama:latest
-    volumes:
-      - modelos-ollama:/root/.ollama
-...
-volumes:
-  ...
-  modelos-ollama:
+  pruebas:
+    name: Pruebas unitarias y de integración
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_USER: pruebas
+          POSTGRES_PASSWORD: pruebas
+          POSTGRES_DB: pruebas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pruebas -d pruebas"
+          ...
+    env:
+      DATABASE_URL_PRUEBAS: postgres://pruebas:pruebas@localhost:5432/pruebas?sslmode=disable
+    ...
+      - name: Pruebas con cobertura
+        run: go test -race -tags integracion -covermode=atomic -coverprofile=coverage.out ./...
 ```
-- `profiles: ["ollama"]`: solo se levanta con `--profile ollama` (como Asynqmon, paso 56).
-- **No publica puertos:** el worker lo alcanza por la red interna en `http://ollama:11434`.
-- El volumen `modelos-ollama` guarda los modelos descargados (pueden pesar varios GB): no se vuelven a descargar al recrear el contenedor.
+- `services:` levanta un contenedor de PostgreSQL **al lado** del job, accesible en `localhost:5432`. Las `options` le dan un healthcheck: el job espera a que esté listo.
+- Las credenciales son de un contenedor desechable que solo existe durante el job; no son secretos reales.
+- Ahora el job ejecuta **unitarias e integración** juntas (`-tags integracion`).
 
-### 3.2 Configuración (`.env.example`)
+### 3.5 Localmente con `make`
 
-```dotenv
-# Ollama local (docker compose --profile ollama up -d
-#               docker compose exec ollama ollama pull qwen2.5:3b)
-# Use al menos un modelo de 3b: con qwen2.5:1.5b los resúmenes inventan datos.
-#   LLM_PROVEEDOR=openai
-#   LLM_URL_BASE=http://ollama:11434/v1
-#   LLM_API_KEY=
-#   LLM_MODELO=qwen2.5:3b
+```makefile
+pruebas-integracion: ## Pruebas unitarias y de integración contra un PostgreSQL temporal
+	-docker network create red-pruebas >/dev/null 2>&1
+	-docker rm -f pg-pruebas >/dev/null 2>&1
+	docker run -d --name pg-pruebas --network red-pruebas -e POSTGRES_USER=pruebas ... postgres:16-bookworm
+	sleep 5
+	$(DOCKER_GO) --network red-pruebas -e DATABASE_URL_PRUEBAS=postgres://pruebas:pruebas@pg-pruebas:5432/pruebas?sslmode=disable \
+		$(GO_IMG) go test -race -tags integracion -coverpkg=./internal/... -cover ./... ; status=$$?; docker rm -f pg-pruebas >/dev/null; exit $$status
 ```
-- `LLM_PROVEEDOR=openai` porque Ollama implementa `/v1/chat/completions` (paso 52).
-- `LLM_API_KEY` vacía: Ollama local no pide clave (el cliente del paso 52 no envía la cabecera si está vacía).
-- **`qwen2.5:3b` es el modelo recomendado:** es pequeño, tiene buen soporte para español y, en la prueba de la sección 5, sus resúmenes fueron fieles a las tareas. Se puede usar cualquier modelo del catálogo de Ollama, pero **no uno más pequeño** (ver sección 5.1).
-- "3b" significa 3 mil millones (*billions*) de **parámetros**: los números internos que el modelo aprendió. Más parámetros = más capacidad de seguir instrucciones, pero también más memoria y más lentitud.
-
-**La sección de IA completa de `.env.example`** ahora documenta cuatro formas de configurar el modelo: simulado (por defecto), un servicio compatible con OpenAI (Gemini, OpenAI, Groq), Ollama local y Anthropic.
+- Crea una red y un PostgreSQL **temporal**, ejecuta las pruebas en un contenedor de Go en esa red y **siempre** borra el PostgreSQL al final, guardando el código de salida de las pruebas (`status=$$?` ... `exit $$status`) para que `make` informe si fallaron.
+- El `-` al inicio de una línea le dice a `make` que ignore su error (por ejemplo, si la red ya existía).
+- `-coverpkg=./internal/...` cuenta la cobertura **entre paquetes**: por ejemplo, las migraciones de `basedatos` que ejecutan las pruebas de `repositorio`.
 
 ---
 
@@ -72,68 +142,47 @@ volumes:
 
 | Concepto | Explicación |
 |---|---|
-| Modelo local | El LLM corre en la misma máquina, sin enviar datos a terceros. |
-| API compatible | Un mismo cliente (paso 52) sirve para servicios en la nube y para Ollama. |
-| Perfiles de Compose | Servicios opcionales que no se levantan por defecto. |
+| Prueba de integración | Prueba varios componentes reales juntos (aquí, código + PostgreSQL). |
+| `//go:build etiqueta` | El archivo solo se compila si se pide esa etiqueta. |
+| Paquete `_test` externo | Prueba solo la API pública del paquete. |
+| `t.Skip` / `t.Cleanup` | Omitir una prueba / registrar una limpieza. |
+| `sync.WaitGroup` | Esperar a que terminen varias goroutines. |
+| Servicios en GitHub Actions | Contenedores auxiliares (bases de datos) para un job. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
-Se probó de punta a punta con los datos de demostración (paso 59). **No hubo que cambiar código**: solo el `.env`.
-
-Para probarlo:
-
 ```bash
-# 1. Levantar Ollama y descargar un modelo pequeño (una sola vez)
-docker compose --profile ollama up -d
-docker compose exec ollama ollama pull qwen2.5:3b   # ~1,9 GB, una sola vez
-
-# 2. En su .env
-#    LLM_PROVEEDOR=openai
-#    LLM_URL_BASE=http://ollama:11434/v1
-#    LLM_API_KEY=
-#    LLM_MODELO=qwen2.5:3b
-
-# 3. Reiniciar el worker para que lea la nueva configuración
-docker compose up -d worker
-docker compose logs worker | grep "proveedor de IA"
-# {"msg":"proveedor de IA configurado","proveedor":"openai","modelo":"qwen2.5:3b"}
+make pruebas-integracion
+# ok  seguimiento/internal/repositorio  ...
 ```
 
-Luego solicite un lote de reportes (paso 55). El resumen del PDF lo escribirá el modelo local; en CPU puede tardar decenas de segundos por reporte (el tiempo queda en el log `resumen generado`, campo `duracion_ms`). Si tarda más que `LLM_TIMEOUT` (2 min por defecto), auméntelo.
+O a mano, con un PostgreSQL de pruebas:
 
-### 5.1 Resultado de la prueba: el tamaño del modelo importa
+```bash
+DATABASE_URL_PRUEBAS=postgres://pruebas:pruebas@localhost:5432/pruebas?sslmode=disable \
+  go test -tags integracion -v ./internal/repositorio/
+```
 
-Se generaron los lotes de las semanas del 21/09 y del 28/09 de los datos de demostración con dos modelos (equipo de desarrollo, solo CPU):
-
-| Modelo | Descarga | Lote de 3 reportes | Calidad del resumen |
-|---|---|---|---|
-| `qwen2.5:1.5b` | ~1 GB | 10–15 s | **Mala.** Inventó datos: dijo que el lunes 21/09 era domingo, mencionó un reporte tardío que no existía y agregó detalles que no estaban en las tareas. En otro reporte **evaluó** a la persona ("debe ser motivo de consideración…"), lo que prohíbe RN-46. |
-| `qwen2.5:3b` | ~1,9 GB | 13–36 s | **Buena.** Fechas, horas, rol, estado y tardanza correctos. Los detalles que agrega salen de las descripciones de las tareas y no evalúa. |
-
-Ejemplo real con `qwen2.5:3b` (Laura Martínez, semana del 28/09):
-
-> Durante la semana del 2026-09-28 al 2026-10-04, la persona trabajó en el proyecto "Plataforma de analítica académica" en su rol de asistente graduado. Totalizaron 8 horas reportadas en este proyecto. La tarea principal consistía en el desarrollo del prototipo del tablero, que se enmarca en un estado de desarrollo con 8 horas de trabajo y se reportó tardía. […]
-
-**Por qué pasa:** el prompt (paso 51) le pide al modelo no inventar ni evaluar, pero un modelo muy pequeño no siempre sigue bien las instrucciones. Por eso el PDF incluye siempre la tabla de horas y el detalle de las tareas, que salen de la base de datos y no del modelo: aunque el resumen tuviera un error, los datos del reporte son exactos.
-
-Si una persona no registró tareas en la semana, **no se llama al modelo** y se usa un texto fijo ("No se registraron tareas…"). Por eso esos reportes no muestran proveedor ni modelo.
+Resultado esperado: las 7 pruebas en `PASS`. En GitHub, el job se llama "Pruebas unitarias y de integración".
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 56
+## 6. Pasos para lograr esta versión desde el paso 57
 
-1. En `docker-compose.yml`: el servicio `ollama` (después de `asynqmon`), el volumen `modelos-ollama` y la línea `--profile ollama` en el comentario inicial.
-2. En `.env.example`: el bloque de ejemplo de Ollama, entre el de Groq y el de Anthropic.
-3. `docker compose --profile ollama config --services` (debe listar `ollama`).
-4. Commit: `git add docker-compose.yml .env.example README.md && git commit -m "Paso 57: modelo local con Ollama"`
+1. Crear `backend/internal/repositorio/integracion_test.go` (sección 3).
+2. En `.github/workflows/ci.yml`: el servicio `postgres`, la variable `DATABASE_URL_PRUEBAS`, `-tags integracion` en el comando de pruebas, el nuevo nombre del job y el comentario inicial.
+3. En el `Makefile`: el objetivo `pruebas-integracion` y agregarlo a `.PHONY`.
+4. `make pruebas-integracion`
+5. Commit: `git add . && git commit -m "Paso 58: pruebas de integración de la capa de datos"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- **En la nube** un modelo local exige una máquina con suficiente memoria (o GPU); con `qwen2.5:3b`, unos 4 GB libres solo para el modelo. Un proveedor externo (Gemini, OpenAI, Anthropic) da mejor calidad sin consumir recursos de la máquina virtual. Es una decisión de costo frente a privacidad que el equipo debe documentar en la arquitectura (sección de IA) y en la deuda técnica (DT-03).
+- Antes de migrar a **Cloud SQL** (Entrega 2) se pueden ejecutar estas mismas pruebas contra una instancia de prueba en la nube: basta con apuntar `DATABASE_URL_PRUEBAS` a ella.
+- Cualquier optimización SQL futura queda cubierta por estas pruebas. Por ejemplo, la consulta liviana del seguimiento (paso 42, deuda técnica DT-08) tiene su propia prueba: si alguien cambia sus columnas o su filtro, el pipeline lo detecta.
 
 ---
 
@@ -141,5 +190,7 @@ Si una persona no registró tareas en la semana, **no se llama al modelo** y se 
 
 | Requisito | Cómo |
 |---|---|
-| Stack: LLM pequeño (local o en la nube) | Ollama como opción local, configurable sin cambiar código. |
-| RF-14.3 / privacidad | Con el modelo local los datos de las tareas no salen de la máquina. |
+| 06-pruebas: pruebas automáticas en el pipeline | Integración con PostgreSQL en GitHub Actions. |
+| RF-05.6 / RN-19 Reglas atómicas | Prueba de concurrencia real. |
+| RNF-06 Consistencia | Restricciones, transacciones e idempotencia verificadas en la base de datos. |
+| Deuda técnica DT-01 | Resuelta. |

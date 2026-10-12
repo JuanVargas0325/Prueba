@@ -1,9 +1,9 @@
 # Integración continua: se ejecuta en cada push y en cada pull request.
 #  1. calidad: formato (gofmt), análisis estático (golangci-lint, incluye go vet).
-#  2. pruebas: pruebas unitarias con detector de condiciones de carrera y cobertura.
+#  2. pruebas: pruebas unitarias y de integración (con PostgreSQL) con cobertura.
 #
-# En pasos posteriores se agregan PostgreSQL para las pruebas de integración (paso 58),
-# la prueba de punta a punta con Newman (paso 61) y el análisis con SonarQube (paso 62).
+# En pasos posteriores se agregan la prueba de punta a punta con Newman (paso 61) y el
+# análisis con SonarQube (paso 62).
 
 name: CI
 
@@ -45,8 +45,24 @@ jobs:
           working-directory: backend
 
   pruebas:
-    name: Pruebas unitarias
+    name: Pruebas unitarias y de integración
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_USER: pruebas
+          POSTGRES_PASSWORD: pruebas
+          POSTGRES_DB: pruebas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pruebas -d pruebas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL_PRUEBAS: postgres://pruebas:pruebas@localhost:5432/pruebas?sslmode=disable
     defaults:
       run:
         working-directory: backend
@@ -59,7 +75,7 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Pruebas con cobertura
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+        run: go test -race -tags integracion -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: Resumen de cobertura
         run: go tool cover -func=coverage.out | tail -n 1
