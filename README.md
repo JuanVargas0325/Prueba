@@ -1,200 +1,277 @@
-# Paso 46 · Repositorio de reportes
+# Paso 47 · Cola de tareas con Asynq y Redis
 
-> Rama `paso-a-paso` · paso 46 de 65 · anterior: **Paso 45 · Dominio de lotes y reportes** · siguiente: **Paso 47 · Cola de tareas con Asynq y Redis**
+> Rama `paso-a-paso` · paso 47 de 65 · anterior: **Paso 46 · Repositorio de reportes** · siguiente: **Paso 48 · Servicio de reportes**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el repositorio de lotes y reportes (tablas `lotes_reportes` y `reportes_semanales`) y la consulta que reúne los datos de la semana de una persona para su reporte.
+Se agregó la **cola de tareas asíncronas**: la API podrá dejar trabajos pendientes en Redis y un worker los ejecutará en segundo plano, con reintentos.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/repositorio/reportes.go` | **Nuevo.** Lotes (`CrearLote`, `ExisteLoteActivo`, `ObtenerLote`, `ListarLotes`, `IniciarLote`, `MarcarLoteFallido`), reportes (`ListarPersonasParaReporte`, `CrearReportesPendientes`, `ObtenerReporte`, `ListarReportes`, `MarcarReporteEnProceso`, `CompletarReporte`, `FallarReporte`) y datos de la semana (`ObtenerDatosSemana`). |
-| `backend/internal/repositorio/comun.go` | **Modificado.** Constantes `recursoLote`, `recursoLotes`, `recursoReporte` y `recursoReportes` (el bloque queda completo). |
+| `backend/go.mod`, `go.sum` | Nueva dependencia `github.com/hibiken/asynq v0.26.0` (trae el cliente de Redis). |
+| `backend/internal/cola/cola.go` | **Nuevo.** Cliente que **encola** trabajos (`EncolarLote`, `EncolarReporte`) y enrutador que los **ejecuta** (`NuevoMux`) con la política de reintentos. |
+| `backend/internal/cola/cola_test.go` | **Nuevo.** Pruebas del enrutamiento y de la política de fallos. |
+| `backend/internal/config/config.go` | **Modificado.** Secciones `Redis` (dirección, contraseña, base) y `Worker` (concurrencia, reintentos, tiempo máximo por reporte). |
+| `backend/internal/config/config_test.go` | **Modificado.** Valores por defecto y formatos de las nuevas variables. |
+| `docker-compose.yml` | **Modificado.** Servicio `redis` (Debian 12) con persistencia y healthcheck. |
+| `.env.example` | **Modificado.** Secciones `Redis` y `Generación de reportes (worker)`. |
 
 ---
 
 ## 2. Por qué
 
-La generación asíncrona (pasos 48 a 55) tiene una dificultad especial: **varios workers** pueden procesar reportes del mismo lote **al mismo tiempo**, y la cola puede **reintentar** o **entregar dos veces** el mismo trabajo. El repositorio debe garantizar que, pase lo que pase:
-- no se creen reportes duplicados;
-- un reporte terminado no se cuente dos veces;
-- el lote llegue a su estado final correcto exactamente una vez.
+- **Stack del curso:** Asynq sobre Redis (o RabbitMQ). Se eligió Redis por su simplicidad y porque Asynq es la librería de colas más usada en Go.
+- **RF-14.1 / RN-41:** los reportes se generan **por lotes**, y cada uno puede tardar varios segundos (llamada a la IA + PDF). Si la API los generara dentro de la petición HTTP, el profesor esperaría minutos, la conexión podría cortarse y un pico de solicitudes bloquearía la API. Con una cola:
+  1. la API **registra** el trabajo en Redis y responde de inmediato (202 Accepted);
+  2. un **worker** (otro proceso) toma los trabajos y los ejecuta;
+  3. si algo falla por un motivo transitorio (la IA saturada), **se reintenta** automáticamente con espera creciente.
+
+```
+API ──encola──► Redis (cola "reportes") ──entrega──► Worker ──► IA, PDF, almacenamiento
+```
 
 ---
 
-## 3. Explicación detallada
+## 3. Explicación detallada de `cola.go`
 
-### 3.1 Lotes
+### 3.1 Tipos de trabajo y su carga
 
 ```go
-func (r *Reportes) ExisteLoteActivo(ctx context.Context, profesorID string, semana time.Time) (bool, error) {
-	... SELECT EXISTS (... WHERE profesor_id = $1 AND semana_inicio = $2 AND estado IN ('pendiente', 'en_proceso')) ...
+const (
+	TipoProcesarLote   = "reportes:procesar_lote"
+	TipoGenerarReporte = "reportes:generar_reporte"
+	ColaReportes       = "reportes"
+)
+
+type cargaLote struct {
+	LoteID string `json:"lote_id"`
+}
+
+type cargaReporte struct {
+	ReporteID string `json:"reporte_id"`
 }
 ```
-- Para impedir que un profesor lance dos lotes de la misma semana a la vez (paso 48).
+- Dos clases de trabajo: **procesar un lote** (repartirlo en un trabajo por persona) y **generar el reporte** de una persona.
+- La **carga** de cada trabajo es un JSON mínimo con el **identificador**, no los datos. El worker lee todo lo demás de la base de datos en el momento de ejecutar, así trabaja siempre con datos actuales y la cola no guarda información personal.
+
+### 3.2 El cliente (lo usa la API)
 
 ```go
-func (r *Reportes) IniciarLote(ctx context.Context, id string, total int) error {
-	_, err := r.db.Exec(ctx,
-		`UPDATE lotes_reportes SET
-			total_reportes = $2,
-			estado = CASE WHEN $2 = 0 THEN 'completado' ELSE 'en_proceso' END,
-			finalizado_en = CASE WHEN $2 = 0 THEN now() ELSE NULL END,
-			actualizado_en = now()
-		 WHERE id = $1 AND estado IN ('pendiente', 'en_proceso')`, id, total)
+type Opciones struct {
+	MaxReintentos  int
+	TimeoutReporte time.Duration
+}
+
+type Cliente struct {
+	asynq *asynq.Client
+	op    Opciones
+}
+
+func NuevoCliente(redis asynq.RedisClientOpt, op Opciones) *Cliente { ... }
+func (c *Cliente) Cerrar() error { return c.asynq.Close() }
+func (c *Cliente) Ping() error { return c.asynq.Ping() }
+```
+- `Ping` se usará en `/salud` (paso 49): si Redis cae, la API se reporta degradada.
+
+```go
+func (c *Cliente) encolar(ctx context.Context, tipo string, carga any, id string, timeout time.Duration) error {
+	datos, err := json.Marshal(carga)
 	...
-}
-```
-- `CASE WHEN ... THEN ... ELSE ... END` es el "if" de SQL. Un lote sin personas queda **completado** de inmediato.
-- `WHERE ... estado IN ('pendiente', 'en_proceso')`: no modifica lotes ya terminados (si el trabajo se reintenta).
-
-### 3.2 ¿A quién se le hace reporte?
-
-```go
-func (r *Reportes) ListarPersonasParaReporte(ctx context.Context, profesorID string, inicio, fin time.Time) ([]string, error) {
-	... SELECT DISTINCT v.usuario_id::text
-	    FROM vinculaciones v JOIN espacios e ON e.id = v.espacio_id
-	    WHERE e.profesor_id = $1 AND e.fecha_inicio <= $3 AND e.fecha_cierre >= $2 ...
-}
-```
-- **RF-14.2:** un reporte por cada persona vinculada a algún espacio del profesor que estuvo vigente **esa semana** (intersección de fechas). `DISTINCT` evita repetir a quien está en dos espacios del mismo profesor.
-- `::text` convierte el UUID a texto en SQL.
-
-### 3.3 Crear reportes de forma idempotente
-
-```go
-func (r *Reportes) CrearReportesPendientes(ctx context.Context, loteID, profesorID string, semana time.Time, usuarioIDs []string) ([]string, error) {
-	if len(usuarioIDs) > 0 {
-		_, err := r.db.Exec(ctx,
-			`INSERT INTO reportes_semanales (lote_id, profesor_id, usuario_id, semana_inicio)
-			 SELECT $1, $2, u, $3 FROM unnest($4::uuid[]) AS u
-			 ON CONFLICT (lote_id, usuario_id) DO NOTHING`, ...)
-		...
+	_, err = c.asynq.EnqueueContext(ctx, asynq.NewTask(tipo, datos),
+		asynq.Queue(ColaReportes),
+		asynq.MaxRetry(c.op.MaxReintentos),
+		asynq.Timeout(timeout),
+		// El identificador evita encolar dos veces el mismo trabajo si una tarea se reintenta.
+		asynq.TaskID(id),
+		asynq.Retention(24*time.Hour),
+	)
+	if errors.Is(err, asynq.ErrTaskIDConflict) {
+		return nil // ya estaba en la cola
 	}
-	filas, err := r.db.Query(ctx, `SELECT id::text FROM reportes_semanales WHERE lote_id = $1 ORDER BY creado_en, id`, loteID)
 	...
 }
 ```
-- `unnest($4::uuid[])` convierte el arreglo de IDs en filas; un solo `INSERT` crea todos los reportes.
-- `ON CONFLICT (lote_id, usuario_id) DO NOTHING`: si el trabajo se ejecuta **dos veces**, la segunda no crea duplicados (usa el `UNIQUE` del paso 4). Esto es **idempotencia**: repetir la operación da el mismo resultado.
-- Devuelve **todos** los reportes del lote (también los de una ejecución anterior), para encolarlos (paso 54).
 
-### 3.4 Terminar un reporte y actualizar el lote en la misma transacción
+| Opción | Para qué |
+|---|---|
+| `Queue("reportes")` | Cola con nombre: separa estos trabajos de otros futuros. |
+| `MaxRetry(n)` | Cuántas veces reintentar ante un error (`REPORTE_MAX_REINTENTOS`, 3 por defecto). |
+| `Timeout(t)` | Tiempo máximo de ejecución: 1 minuto para repartir un lote y `REPORTE_TIMEOUT` (5 min) para generar un reporte. Si se supera, se cancela su `context` y cuenta como fallo. |
+| `TaskID("reporte:<id>")` | Identificador único: si se intenta encolar **otra vez** el mismo reporte (por ejemplo, porque el trabajo del lote se reintentó), Asynq lo rechaza con `ErrTaskIDConflict` y se ignora. **Evita duplicados en la cola.** |
+| `Retention(24h)` | Los trabajos terminados se conservan un día para consultarlos en el panel (paso 56). |
+
+### 3.3 El enrutador (lo usa el worker)
 
 ```go
-func (r *Reportes) CompletarReporte(ctx context.Context, id string, res dominio.ResultadoReporte) error {
-	return r.finalizarReporte(ctx,
-		`UPDATE reportes_semanales SET estado = 'completado', resumen = $2, ruta_pdf = $3, ...
-		 WHERE id = $1 AND estado NOT IN ('completado', 'fallido')
-		 RETURNING lote_id`,
-		[]any{id, res.Resumen, ...}, 1, 0)
-}
-
-func (r *Reportes) FallarReporte(ctx context.Context, id, motivo string) error {
-	return r.finalizarReporte(ctx, `UPDATE ... SET estado = 'fallido', error = $2 ... RETURNING lote_id`, ..., 0, 1)
+type Procesador interface {
+	ProcesarLote(ctx context.Context, loteID string) error
+	GenerarReporte(ctx context.Context, reporteID string) error
+	RegistrarFalloLote(ctx context.Context, loteID string, causa error) error
+	RegistrarFalloReporte(ctx context.Context, reporteID string, causa error) error
 }
 ```
+- Lo que el worker sabe hacer. Lo implementará el generador de reportes del servicio (paso 54). El paquete `cola` no conoce los reportes: solo conecta tipos de trabajo con métodos.
 
 ```go
-func (r *Reportes) finalizarReporte(ctx context.Context, sqlReporte string, args []any, completados, fallidos int) error {
-	return enTransaccion(ctx, r.db, func(tx pgx.Tx) error {
-		var loteID string
-		err := tx.QueryRow(ctx, sqlReporte, args...).Scan(&loteID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil // el reporte ya estaba en un estado final: nada que hacer
+func NuevoMux(p Procesador, esPermanente func(error) bool, log *slog.Logger) *asynq.ServeMux {
+	mux := asynq.NewServeMux()
+	mux.HandleFunc(TipoGenerarReporte, func(ctx context.Context, t *asynq.Task) error {
+		var carga cargaReporte
+		if err := json.Unmarshal(t.Payload(), &carga); err != nil || carga.ReporteID == "" {
+			return fmt.Errorf("carga inválida: %w", asynq.SkipRetry)
 		}
-		...
-		_, err = tx.Exec(ctx,
-			`UPDATE lotes_reportes l SET
-				reportes_completados = l.reportes_completados + $2,
-				reportes_fallidos    = l.reportes_fallidos + $3,
-				estado = CASE
-					WHEN l.estado = 'en_proceso'
-					 AND l.reportes_completados + $2 + l.reportes_fallidos + $3 >= l.total_reportes THEN
-						CASE
-							WHEN l.reportes_fallidos + $3 = 0 THEN 'completado'
-							WHEN l.reportes_completados + $2 = 0 THEN 'fallido'
-							ELSE 'completado_con_errores'
-						END
-					ELSE l.estado
-				END,
-				finalizado_en = ...
-			 WHERE l.id = $1`, loteID, completados, fallidos)
-		...
+		return ejecutar(ctx, log, "reporte_id", carga.ReporteID, esPermanente,
+			func(ctx context.Context) error { return p.GenerarReporte(ctx, carga.ReporteID) },
+			func(ctx context.Context, err error) error { return p.RegistrarFalloReporte(ctx, carga.ReporteID, err) })
 	})
+	... (igual para TipoProcesarLote) ...
+	return mux
 }
 ```
-- **Paso 1:** cambia el estado del reporte **solo si no estaba terminado** (`estado NOT IN (...)`). Si ya lo estaba, `RETURNING` no devuelve filas → `ErrNoRows` → no hace nada. Así un trabajo repetido **no cuenta dos veces**.
-- **Paso 2:** en la misma transacción suma 1 al contador correspondiente del lote y, si ya terminaron todos, fija el estado final: **completado** (ningún fallo), **fallido** (ningún éxito) o **completado con errores**.
-- **¿Por qué no hay carreras con varios workers?** El `UPDATE` del lote **bloquea su fila** hasta el final de la transacción. Si dos workers terminan reportes del mismo lote a la vez, PostgreSQL ejecuta esas dos actualizaciones **una después de la otra**, y cada una ve los contadores ya sumados por la anterior. Es el mismo principio del paso 31, pero con el bloqueo implícito del `UPDATE`.
-- Todo el cálculo ocurre **dentro de la base de datos** (`l.reportes_completados + $2`): no se lee el valor en Go para sumarle 1 y escribirlo (eso sí tendría carreras).
-- Los mensajes de error se recortan con `recortarTexto` (paso 31).
+- Un **mux** (como el router de Gin, pero para trabajos): según el tipo, llama al método correspondiente.
+- Una carga ilegible nunca va a funcionar por más que se reintente: se devuelve envuelta en `asynq.SkipRetry`, que le dice a Asynq **no reintentar**.
+- `esPermanente` es una **función** que decide si un error vale la pena reintentarlo; la definirá el servicio (paso 54) porque solo él sabe qué errores son permanentes.
 
-### 3.5 Los datos de la semana para el reporte
+### 3.4 La política de reintentos
 
 ```go
-func (r *Reportes) ObtenerDatosSemana(ctx context.Context, profesorID, usuarioID string, semana time.Time) (dominio.DatosSemanaPersona, error) {
-	... 1) nombre y correo de la persona y nombre del profesor ...
-	... 2) vinculaciones de la persona en espacios del profesor vigentes esa semana ...
-	... 3) tareas de esas vinculaciones en esa semana ...
+func ejecutar(ctx context.Context, log *slog.Logger, campo, id string, esPermanente func(error) bool,
+	trabajo func(context.Context) error, registrarFallo func(context.Context, error) error) error {
+
+	err := trabajo(ctx)
+	if err == nil {
+		return nil
+	}
+
+	reintento, _ := asynq.GetRetryCount(ctx)
+	maximo, _ := asynq.GetMaxRetry(ctx)
+	if !esPermanente(err) && reintento < maximo {
+		log.Warn("trabajo fallido, se reintentará", campo, id, "intento", reintento+1, "error", err)
+		return err
+	}
+
+	log.Error("trabajo fallido definitivamente", campo, id, "intento", reintento+1, "error", err)
+	// Se usa un contexto nuevo: el del trabajo puede haber expirado.
+	ctxFallo, cancelar := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancelar()
+	if errFallo := registrarFallo(ctxFallo, err); errFallo != nil {
+		log.Error("no fue posible registrar el fallo", campo, id, "error", errFallo)
+	}
+	return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 }
 ```
-- **RF-14.3:** solo lee los insumos permitidos (título, descripción, estado, horas, observaciones, si fue tardía), en los tipos del paso 45.
-- **Solo los espacios de ese profesor:** si Laura trabaja con dos profesores, cada uno recibe un reporte con **su** parte (RN-03).
-- Para la tercera consulta usa `= ANY($1::uuid[])` (paso 42) y un **mapa** `idVinculación → posición` para repartir cada tarea en su vinculación en una sola pasada.
-- `type fila struct{...}` dentro de la función: un **tipo local**, visible solo ahí, para leer la consulta intermedia.
+- **Error transitorio y quedan intentos** → se devuelve el error; Asynq **reintenta** con espera exponencial (cada vez más tiempo entre intentos).
+- **Error permanente** (por ejemplo, la clave de la IA es inválida) **o último intento** → se **registra el fallo** en la base de datos (el reporte queda `fallido` con el motivo) y se le dice a Asynq que no reintente.
+- `asynq.GetRetryCount` / `GetMaxRetry` leen del `context` cuántos intentos van y cuántos hay.
+- **`context.WithoutCancel(ctx)` + 10 s:** si el trabajo falló por **tiempo agotado**, su contexto ya está cancelado y cualquier consulta con él fallaría. Para poder guardar el fallo se crea un contexto nuevo (que conserva los valores pero no la cancelación) con su propio límite.
+- `fmt.Errorf("%w: %w", err, asynq.SkipRetry)`: desde Go 1.20 un error puede **envolver dos** errores a la vez; así se conserva la causa original **y** la marca de no reintentar.
+- Las funciones `trabajo` y `registrarFallo` llegan como parámetros (*closures* creadas en `NuevoMux`); `ejecutar` es la misma lógica para los dos tipos de trabajo.
+
+### 3.5 Pruebas (`cola_test.go`)
+
+Con un procesador falso, se entrega cada trabajo directamente al mux con `mux.ProcessTask` (sin Redis):
+
+| Prueba | Qué verifica |
+|---|---|
+| `TestMuxEnrutaCadaTipoDeTarea` | Cada tipo de trabajo llega al método correcto con su ID. |
+| `TestCargaInvalidaNoSeReintenta` | Una carga sin ID termina con `SkipRetry`. |
+| `TestErrorPermanenteRegistraElFalloSinReintentar` | Un error permanente registra el fallo y no se reintenta. |
+| `TestErrorTransitorioEnElUltimoIntentoRegistraElFallo` | Fuera del servidor de Asynq no hay datos de reintento, así que cuenta como último intento: también registra el fallo. |
 
 ---
 
-## 4. Conceptos de este paso
+## 4. Configuración y Docker
+
+```go
+type Redis struct {
+	Direccion string
+	Password  string
+	DB        int
+}
+
+type Worker struct {
+	Concurrencia   int
+	MaxReintentos  int
+	TimeoutReporte time.Duration
+}
+```
+
+| Variable | Por defecto | Uso |
+|---|---|---|
+| `REDIS_DIRECCION` | `localhost:6379` (Compose usará `redis:6379`) | Dónde está Redis. |
+| `REDIS_PASSWORD`, `REDIS_DB` | vacío, 0 | Credenciales y número de base de datos de Redis. |
+| `WORKER_CONCURRENCIA` | 2 | Reportes en paralelo por worker (paso 55). |
+| `REPORTE_MAX_REINTENTOS` | 3 | Reintentos ante errores transitorios. |
+| `REPORTE_TIMEOUT` | 5m | Tiempo máximo por reporte. |
+
+```yaml
+  redis:
+    image: redis:7-bookworm
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - datos-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+```
+- Redis 7 sobre **Debian 12**.
+- `--appendonly yes`: Redis escribe cada operación en un archivo en disco (en el volumen `datos-redis`). Si el contenedor se reinicia, **los trabajos pendientes no se pierden**.
+- No publica puertos: solo la API y el worker lo alcanzan por la red interna.
+
+---
+
+## 5. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Idempotencia | Repetir un trabajo no duplica ni cuenta dos veces (`ON CONFLICT DO NOTHING`, `WHERE estado NOT IN`). |
-| `CASE WHEN` | Condicionales dentro de SQL. |
-| `unnest(arreglo)` | Convierte un arreglo en filas. |
-| Bloqueo implícito del `UPDATE` | Serializa actualizaciones concurrentes de la misma fila. |
-| Aritmética en la base de datos | `x = x + 1` en SQL, nunca "leer, sumar y escribir" en la aplicación. |
-| Tipo local | `type fila struct{...}` declarado dentro de una función. |
+| Cola de mensajes | Desacopla quien pide un trabajo de quien lo ejecuta. |
+| Productor / consumidor | La API encola (productor); el worker procesa (consumidor). |
+| Reintentos con espera exponencial | Ante fallos transitorios, reintentar cada vez más espaciado. |
+| Error permanente vs. transitorio | Reintentar solo lo que puede funcionar después. |
+| Entrega "al menos una vez" | Un trabajo puede ejecutarse dos veces; por eso todo es idempotente (paso 46). |
+| `%w` doble | Un error que envuelve dos causas. |
+| `context.WithoutCancel` | Contexto que conserva valores pero ignora la cancelación del padre. |
 
 ---
 
-## 5. Cómo comprobarlo
+## 6. Cómo comprobarlo
 
 ```bash
-make lint
+make pruebas                       # incluye ok seguimiento/internal/cola
+docker compose up --build -d --wait
+docker compose ps                  # redis "(healthy)"
+docker compose exec redis redis-cli ping    # PONG
 ```
 
-En el paso 58, contra PostgreSQL:
-- `TestCreacionDeLoteDeReportes`: un lote con 2 personas crea 2 reportes; el lote en proceso cuenta como activo; repetir la creación **no duplica**; los datos de la semana de Laura traen 1 tarea, 3 horas, su nombre y el del profesor.
-- `TestFinalizacionDeReportes`: un reporte completado (completarlo **dos veces** no cuenta dos veces) y otro fallido dejan el lote en `completado_con_errores`, con 1 y 1 en los contadores y fecha de finalización; el reporte completado tiene 1 intento y su ruta de PDF.
+En el paso 49 la API empezará a encolar lotes y en el paso 55 el worker los procesará.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 45
+## 7. Pasos para lograr esta versión desde el paso 46
 
-1. En `repositorio/comun.go`, completar el bloque con `recursoLote = "lote de reportes"`, `recursoLotes = "lotes de reportes"`, `recursoReporte = "reporte"` y `recursoReportes = "reportes"`.
-2. Crear `backend/internal/repositorio/reportes.go` con las secciones de lotes, reportes y datos de la semana.
-3. `make lint`
-4. Commit: `git add . && git commit -m "Paso 46: repositorio de reportes"`
-
----
-
-## 7. Preparación para las próximas entregas
-
-- **Seguro con varios workers:** en la Entrega 3 se podrá escalar el número de workers (o usar más concurrencia) sin cambiar este código: la consistencia la garantiza PostgreSQL.
-- **Idempotente ante reintentos:** encaja con cualquier cola con entrega "al menos una vez" (Asynq aquí; Pub/Sub o Cloud Tasks en la Entrega 4).
+1. `go get github.com/hibiken/asynq@v0.26.0 && go mod tidy` (desde `backend/`).
+2. Crear `backend/internal/cola/cola.go` y `cola_test.go` (sección 3).
+3. En `config.go`: tipos `Redis` y `Worker`, campos en `Config` y su carga en `Cargar()`. En `config_test.go`: el valor por defecto de `REPORTE_MAX_REINTENTOS` y los formatos inválidos de `WORKER_CONCURRENCIA` y `REPORTE_TIMEOUT`.
+4. En `docker-compose.yml`: el servicio `redis` y el volumen `datos-redis`.
+5. En `.env.example` (y su `.env`): las secciones `Redis` (después de PostgreSQL) y `Generación de reportes (worker)` (al final).
+6. `make pruebas lint`, `docker compose up --build -d --wait` y commit: `git add . && git commit -m "Paso 47: cola de tareas con Asynq y Redis"`
 
 ---
 
-## 8. Requisitos que atiende
+## 8. Preparación para las próximas entregas
+
+- **Redis administrado:** en GCP puede usarse Memorystore for Redis cambiando solo `REDIS_DIRECCION` (y `REDIS_PASSWORD`).
+- **Escalar el procesamiento** (Entrega 3) es agregar workers o subir `WORKER_CONCURRENCIA`: la cola reparte el trabajo y la idempotencia del paso 46 evita inconsistencias.
+- **Entrega 4 (serverless):** el `Procesador` no depende de Asynq; los mismos métodos podrían invocarse desde Pub/Sub o Cloud Tasks reemplazando solo el paquete `cola`.
+
+---
+
+## 9. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-14.1 Ejecución por lotes | Lotes con estado y contadores, sin duplicar lotes activos. |
-| RF-14.2 Un reporte por persona | `ListarPersonasParaReporte` + `CrearReportesPendientes` idempotente. |
-| RF-14.3 / RN-43 Insumos permitidos | `ObtenerDatosSemana` solo lee esos campos. |
-| RF-14.5 Almacenar | Ruta y tamaño del PDF en `CompletarReporte`. |
-| RF-14.7 Semana concreta | Todas las consultas son por semana. |
+| Stack: Asynq + Redis | Cola `reportes` en Redis 7 (Debian 12). |
+| RF-14.1 / RN-41 Generación por lotes, asíncrona | Trabajos de lote y de reporte. |
+| RNF-01 Backend sólido | Reintentos, tiempos máximos y registro de fallos definitivos. |

@@ -24,6 +24,20 @@ services:
     # ports:
     #   - "5433:5432"
 
+  # Broker de la cola de tareas asíncronas (Asynq). La API lo empieza a usar en
+  # el paso 49 y el worker en el paso 55.
+  redis:
+    image: redis:7-bookworm
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - datos-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
     build:
       context: ./backend
@@ -55,4 +69,5 @@ services:
 
 volumes:
   datos-postgres:
+  datos-redis:
   archivos:

@@ -14,8 +14,8 @@ import (
 	"seguimiento/internal/almacenamiento"
 )
 
-// Config es la configuración de la aplicación. En los pasos siguientes se le
-// agregan Redis y la IA.
+// Config es la configuración compartida por la API y el worker. En el paso 51
+// se le agrega la configuración del modelo de IA.
 type Config struct {
 	Entorno     string // desarrollo | produccion
 	PuertoHTTP  string
@@ -25,11 +25,20 @@ type Config struct {
 	// frontend en el navegador puede llamar a la API.
 	OrigenesCORS []string
 
+	Redis Redis
 	JWT   JWT
 	Admin AdminInicial
 
 	Almacenamiento almacenamiento.Config
 	MaxAdjuntoMB   int
+
+	Worker Worker
+}
+
+type Redis struct {
+	Direccion string
+	Password  string
+	DB        int
 }
 
 type JWT struct {
@@ -42,6 +51,12 @@ type AdminInicial struct {
 	Nombre   string
 	Correo   string
 	Password string
+}
+
+type Worker struct {
+	Concurrencia   int
+	MaxReintentos  int
+	TimeoutReporte time.Duration
 }
 
 // EsDesarrollo indica si la aplicación corre en modo desarrollo.
@@ -67,6 +82,12 @@ func Cargar() (Config, error) {
 		errs = append(errs, errors.New("defina DATABASE_URL o POSTGRES_USER, POSTGRES_PASSWORD y POSTGRES_DB"))
 	}
 
+	c.Redis = Redis{
+		Direccion: texto("REDIS_DIRECCION", "localhost:6379"),
+		Password:  os.Getenv("REDIS_PASSWORD"),
+		DB:        entero("REDIS_DB", 0, &errs),
+	}
+
 	c.JWT = JWT{
 		Secreto:    os.Getenv("JWT_SECRETO"),
 		Expiracion: duracion("JWT_EXPIRACION", 8*time.Hour, &errs),
@@ -86,6 +107,12 @@ func Cargar() (Config, error) {
 		Ruta: texto("ALMACENAMIENTO_RUTA", "/data"),
 	}
 	c.MaxAdjuntoMB = entero("ADJUNTO_MAX_MB", 10, &errs)
+
+	c.Worker = Worker{
+		Concurrencia:   entero("WORKER_CONCURRENCIA", 2, &errs),
+		MaxReintentos:  entero("REPORTE_MAX_REINTENTOS", 3, &errs),
+		TimeoutReporte: duracion("REPORTE_TIMEOUT", 5*time.Minute, &errs),
+	}
 
 	return c, errors.Join(errs...)
 }
