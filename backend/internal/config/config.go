@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"seguimiento/internal/almacenamiento"
+	"seguimiento/internal/ia"
 )
 
-// Config es la configuración compartida por la API y el worker. En el paso 51
-// se le agrega la configuración del modelo de IA.
+// Config es la configuración compartida por la API y el worker.
 type Config struct {
 	Entorno     string // desarrollo | produccion
 	PuertoHTTP  string
@@ -32,6 +32,7 @@ type Config struct {
 	Almacenamiento almacenamiento.Config
 	MaxAdjuntoMB   int
 
+	LLM    ia.Config
 	Worker Worker
 }
 
@@ -108,6 +109,16 @@ func Cargar() (Config, error) {
 	}
 	c.MaxAdjuntoMB = entero("ADJUNTO_MAX_MB", 10, &errs)
 
+	c.LLM = ia.Config{
+		Proveedor:   strings.ToLower(texto("LLM_PROVEEDOR", ia.ProveedorSimulado)),
+		URLBase:     strings.TrimSpace(os.Getenv("LLM_URL_BASE")),
+		APIKey:      strings.TrimSpace(os.Getenv("LLM_API_KEY")),
+		Modelo:      strings.TrimSpace(os.Getenv("LLM_MODELO")),
+		MaxTokens:   entero("LLM_MAX_TOKENS", 0, &errs),
+		Temperatura: decimalOpcional("LLM_TEMPERATURA", &errs),
+		Timeout:     duracion("LLM_TIMEOUT", 2*time.Minute, &errs),
+	}
+
 	c.Worker = Worker{
 		Concurrencia:   entero("WORKER_CONCURRENCIA", 2, &errs),
 		MaxReintentos:  entero("REPORTE_MAX_REINTENTOS", 3, &errs),
@@ -179,4 +190,17 @@ func duracion(clave string, porDefecto time.Duration, errs *[]error) time.Durati
 		return porDefecto
 	}
 	return d
+}
+
+func decimalOpcional(clave string, errs *[]error) *float64 {
+	v := strings.TrimSpace(os.Getenv(clave))
+	if v == "" {
+		return nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s debe ser un número decimal: %w", clave, err))
+		return nil
+	}
+	return &f
 }
