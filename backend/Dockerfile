@@ -1,6 +1,7 @@
-# Imagen multietapa sobre Debian: compila en una imagen con Go y copia solo el
-# binario a una imagen liviana. En el paso 55 se agrega el destino del worker.
-#   docker build --target api -t seguimiento-api .
+# Imagen multietapa sobre Debian: compila una sola vez y produce dos imágenes
+# livianas, una para la API y otra para el worker.
+#   docker build --target api    -t seguimiento-api .
+#   docker build --target worker -t seguimiento-worker .
 
 # --- Compilación -------------------------------------------------------------
 FROM golang:1.26-bookworm AS compilacion
@@ -11,7 +12,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /salida/api ./cmd/api
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /salida/api ./cmd/api \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /salida/worker ./cmd/worker
 
 # --- Base de ejecución: Debian 12 (bookworm) ---------------------------------
 FROM debian:bookworm-slim AS base
@@ -32,3 +34,8 @@ EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=5 \
   CMD wget -qO- http://127.0.0.1:8080/salud >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/api"]
+
+# --- Worker ------------------------------------------------------------------
+FROM base AS worker
+COPY --from=compilacion /salida/worker /usr/local/bin/worker
+ENTRYPOINT ["/usr/local/bin/worker"]

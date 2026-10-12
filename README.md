@@ -1,217 +1,214 @@
-# Paso 54 · Generación asíncrona de reportes
+# Paso 55 · Worker
 
-> Rama `paso-a-paso` · paso 54 de 65 · anterior: **Paso 53 · Proveedor Anthropic** · siguiente: **Paso 55 · Worker**
+> Rama `paso-a-paso` · paso 55 de 65 · anterior: **Paso 54 · Generación asíncrona** · siguiente: **Paso 56 · Panel de la cola (Asynqmon)**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se escribió la lógica que el worker ejecutará para cada trabajo de la cola: **repartir un lote** en un trabajo por persona y **generar el reporte** de cada una (IA → PDF → almacenamiento → base de datos).
+Se creó el **segundo programa** del sistema: el **worker**, que consume la cola de Redis y genera los reportes. Con él, el flujo de reportes funciona **de punta a punta**.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/servicio/generacion_reportes.go` | **Nuevo.** `GeneradorReportes` con `ProcesarLote`, `GenerarReporte`, `RegistrarFalloReporte` y `RegistrarFalloLote` (cumple `cola.Procesador`, paso 47), más `EsErrorPermanente`, `RutaPDFReporte`, `MensajeFallo` y la interfaz `GeneradorPDF`. |
-| `backend/internal/servicio/reportes_test.go` | **Modificado.** Dobles de la IA (`resumidorFalso`) y del PDF (`pdfFalso`) y ocho pruebas del generador. |
+| `backend/cmd/worker/main.go` | **Nuevo.** Programa del worker: conecta todo y arranca el servidor de Asynq. |
+| `backend/Dockerfile` | **Modificado.** Compila los dos programas y agrega la etapa `worker`. |
+| `docker-compose.yml` | **Modificado.** Servicio `worker`, que comparte el volumen de archivos con la API. |
+| `Makefile` | **Modificado.** `make logs` muestra la API y el worker. |
 
-Con este paso, **todo el código de `backend/internal`** queda igual a la versión final, salvo las pruebas de integración (paso 58).
+```
+Profesor ── POST /reportes/lotes ──► API ── encola ──► Redis ──► Worker
+                                                                  │ IA (simulado / OpenAI / Claude)
+                                                                  │ PDF
+                                                                  ▼
+Profesor ◄── GET /reportes/{id}/pdf ── API ◄── volumen "archivos" ◄┘
+```
 
 ---
 
 ## 2. Por qué
 
-- **RF-14.2:** un reporte **por persona**. Un lote se reparte en trabajos independientes: si el reporte de una persona falla, los demás siguen; y varios reportes pueden generarse en paralelo.
-- **RF-14.4 y RF-14.5:** cada reporte termina como un **PDF guardado**.
-- **Robustez:** los trabajos pueden reintentarse o entregarse dos veces (paso 47); cada paso debe ser **idempotente**.
+- **Separar procesos:** la API atiende peticiones HTTP rápidas; el worker hace el trabajo lento (IA y PDF). Si la IA tarda, la API no se entera. Si llegan muchos lotes, se agregan workers sin tocar la API.
+- **Arquitectura §6 (flujo asíncrono)** del documento de arquitectura, y el stack Asynq + Redis del curso.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Dependencias
+### 3.1 `cmd/worker/main.go`
 
 ```go
-type GeneradorPDF interface {
-	Generar(c pdf.Contenido) ([]byte, error)
-}
-
-type GeneradorReportes struct {
-	repo           RepositorioReportes
-	encolador      Encolador
-	almacenamiento Almacenamiento
-	resumidor      ia.Resumidor
-	pdf            GeneradorPDF
-	reloj          Reloj
-	log            *slog.Logger
+func main() {
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("servicio", "worker")
+	if err := ejecutar(log); err != nil { ... os.Exit(1) }
 }
 ```
-- Todo llega como **interfaz**: el repositorio (paso 46), el encolador (paso 47), el almacenamiento (paso 38), la IA (pasos 51 a 53) y el PDF (paso 50). Las pruebas los reemplazan por dobles; nada toca la red ni el disco.
-
-### 3.2 `ProcesarLote`: repartir
+- El mismo patrón `main → ejecutar` de la API (paso 0), con `servicio=worker` en todos sus logs.
 
 ```go
-func (g *GeneradorReportes) ProcesarLote(ctx context.Context, loteID string) error {
-	lote, err := g.repo.ObtenerLote(ctx, loteID)
+	db, err := basedatos.Conectar(ctx, cfg.BaseDatos, log)
 	...
-	if !lote.Estado.EstaActivo() {
-		g.log.Info("lote ya procesado, se omite", "lote_id", loteID, "estado", lote.Estado)
-		return nil
+	almacen, err := almacenamiento.Nuevo(cfg.Almacenamiento)
+	...
+	resumidor, err := ia.Nuevo(cfg.LLM)
+	if err != nil {
+		return err
 	}
-	personas, err := g.repo.ListarPersonasParaReporte(ctx, lote.ProfesorID, lote.SemanaInicio, dominio.FinSemana(lote.SemanaInicio))
+	log.Info("proveedor de IA configurado", "proveedor", resumidor.Proveedor(), "modelo", resumidor.Modelo())
+```
+- La **misma configuración** que la API (`config.Cargar`). El worker no aplica migraciones (las aplica la API) y no crea el administrador.
+- Crea el almacenamiento con la misma función `almacenamiento.Nuevo` que la API (paso 38): ambos usan siempre el mismo tipo de almacenamiento, y cuando se agregue Cloud Storage el worker no cambiará.
+- **Si el proveedor de IA está mal configurado, el worker no arranca** y el log dice por qué (por ejemplo, "LLM_MODELO es obligatorio con el proveedor openai"). Es mejor fallar al inicio que en cada reporte.
+- El log `proveedor de IA configurado` confirma qué modelo quedó activo.
+
+```go
+	redis := asynq.RedisClientOpt{Addr: cfg.Redis.Direccion, Password: cfg.Redis.Password, DB: cfg.Redis.DB}
+	clienteCola := cola.NuevoCliente(redis, cola.Opciones{...})
 	...
-	reportes, err := g.repo.CrearReportesPendientes(ctx, lote.ID, lote.ProfesorID, lote.SemanaInicio, personas)
-	...
-	if err := g.repo.IniciarLote(ctx, lote.ID, len(reportes)); err != nil { ... }
-	for _, reporteID := range reportes {
-		if err := g.encolador.EncolarReporte(ctx, reporteID); err != nil {
-			g.log.Error("no fue posible encolar el reporte", "reporte_id", reporteID, "error", err)
-			if errFallo := g.repo.FallarReporte(ctx, reporteID, "no fue posible encolar el reporte: "+err.Error()); errFallo != nil {
-				return errFallo
-			}
-		}
+	generador := servicio.NuevoGeneradorReportes(
+		repositorio.NuevoReportes(db),
+		clienteCola,
+		almacen,
+		resumidor,
+		pdf.NuevoGenerador(cfg.ZonaHoraria),
+		servicio.NuevoReloj(cfg.ZonaHoraria),
+		log,
+	)
+```
+- El worker **también encola**: al procesar un lote, encola un trabajo por persona (paso 54).
+- Aquí se conectan las implementaciones concretas con las interfaces del generador (como la API en el paso 15).
+
+```go
+	servidor := asynq.NewServer(redis, asynq.Config{
+		Concurrency: cfg.Worker.Concurrencia,
+		Queues:      map[string]int{cola.ColaReportes: 1},
+		Logger:      nuevoLoggerAsynq(log),
+	})
+	if err := servidor.Start(cola.NuevoMux(generador, servicio.EsErrorPermanente, log)); err != nil {
+		return err
 	}
+	log.Info("worker iniciado", "concurrencia", cfg.Worker.Concurrencia, "max_reintentos", cfg.Worker.MaxReintentos)
+
+	<-ctx.Done()
+	log.Info("deteniendo el worker")
+	servidor.Shutdown()
 	return nil
-}
 ```
-1. Un lote ya terminado **se omite** (si la cola lo entrega dos veces).
-2. Busca a las personas vinculadas al profesor esa semana (RF-14.2).
-3. Crea un reporte **pendiente** por persona (idempotente, paso 46).
-4. Fija el total y pasa el lote a **en proceso** (o completado, si no hay nadie).
-5. Encola un trabajo `generar_reporte` por persona (con `TaskID`, sin duplicados, paso 47). Si uno no se puede encolar, ese reporte se marca **fallido** para que el lote pueda terminar.
-
-### 3.3 `GenerarReporte`: el reporte de una persona
+- `asynq.NewServer` crea el consumidor: `Concurrency` = cuántos trabajos a la vez (`WORKER_CONCURRENCIA`, 2 por defecto); `Queues` = qué colas atiende.
+- `Start` arranca el procesamiento en segundo plano con el **mux** del paso 47, al que se le entrega el generador y la función que distingue errores permanentes (paso 54).
+- `<-ctx.Done()` **espera** a Ctrl+C o `docker stop`. Entonces `Shutdown` deja de tomar trabajos nuevos y espera a que terminen los que están en curso. Un trabajo cortado a la mitad vuelve a la cola y se reintenta (por eso todo es idempotente).
 
 ```go
-const ResumenSinTareas = "No se registraron tareas durante esta semana, por lo que no hay actividades para resumir."
+// loggerAsynq adapta slog a la interfaz de logs de Asynq.
+type loggerAsynq struct{ log *slog.Logger }
 
-func (g *GeneradorReportes) GenerarReporte(ctx context.Context, reporteID string) error {
-	rep, err := g.repo.ObtenerReporte(ctx, reporteID)
-	...
-	if rep.Estado.EsFinal() {
-		g.log.Info("reporte ya finalizado, se omite", ...)
-		return nil
-	}
-	if err := g.repo.MarcarReporteEnProceso(ctx, reporteID); err != nil { ... }
-
-	datos, err := g.repo.ObtenerDatosSemana(ctx, rep.ProfesorID, rep.UsuarioID, rep.SemanaInicio)
-	...
-	resumen := ResumenSinTareas
-	proveedor, modelo := "", ""
-	if datos.TotalTareas() > 0 {
-		inicio := g.reloj.Ahora()
-		resumen, err = g.resumidor.Resumir(ctx, datos)
-		if err != nil {
-			return fmt.Errorf("generando resumen con IA: %w", err)
-		}
-		proveedor, modelo = g.resumidor.Proveedor(), g.resumidor.Modelo()
-		g.log.Info("resumen generado", ..., "duracion_ms", g.reloj.Ahora().Sub(inicio).Milliseconds())
-	}
-
-	contenido, err := g.pdf.Generar(pdf.Contenido{Datos: datos, Resumen: resumen, GeneradoEn: g.reloj.Ahora(), ProveedorIA: proveedor, ModeloIA: modelo})
-	...
-	ruta := RutaPDFReporte(rep)
-	tamano, err := g.almacenamiento.Guardar(ctx, ruta, bytes.NewReader(contenido))
-	...
-	if err := g.repo.CompletarReporte(ctx, reporteID, dominio.ResultadoReporte{...}); err != nil { ... }
-	...
+func (l loggerAsynq) Debug(args ...any) { l.log.Debug(fmt.Sprint(args...)) }
+...
+func (l loggerAsynq) Fatal(args ...any) {
+	l.log.Error(fmt.Sprint(args...))
+	os.Exit(1)
 }
 ```
-1. **Idempotente:** si el reporte ya terminó, no hace nada.
-2. Lo marca **en proceso** (suma un intento, paso 46).
-3. Lee los datos de la semana (solo los insumos permitidos, RF-14.3).
-4. **Sin tareas, no se llama a la IA:** se usa un texto fijo. Así el modelo no puede "inventar" actividades para una semana vacía (RN-46) y no se gasta dinero en una llamada inútil.
-5. Con tareas, pide el resumen y registra cuánto tardó (útil para elegir modelo y para el análisis de capacidad).
-6. Genera el PDF, lo guarda en `reportes/<semana>/<id>.pdf` y registra el resultado; `CompletarReporte` también actualiza el lote (paso 46).
-7. Cualquier error se **devuelve**: la cola decide si reintenta (3.4).
+- **Patrón adaptador:** Asynq tiene su propia interfaz de logs (`Debug`, `Info`, `Warn`, `Error`, `Fatal`). Este tipo la implementa reenviando todo a `slog`, para que los mensajes internos de Asynq salgan en el mismo formato JSON, con `componente=asynq`.
 
-```go
-func RutaPDFReporte(rep dominio.ReporteSemanal) string {
-	return fmt.Sprintf("reportes/%s/%s.pdf", rep.SemanaInicio.Format(dominio.FormatoFecha), rep.ID)
-}
+### 3.2 `Dockerfile`
+
+```dockerfile
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /salida/api ./cmd/api \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /salida/worker ./cmd/worker
+...
+# --- Worker ------------------------------------------------------------------
+FROM base AS worker
+COPY --from=compilacion /salida/worker /usr/local/bin/worker
+ENTRYPOINT ["/usr/local/bin/worker"]
 ```
-- Los PDF quedan organizados por semana. Si el trabajo se reintenta, se sobrescribe el mismo archivo (la escritura es atómica, paso 38).
+- Se compilan **los dos programas en la misma etapa**: comparten la descarga de dependencias y la caché de compilación.
+- La etapa `worker` reutiliza `base` (Debian 12 mínima, usuario `app`, `/data`). Es la razón por la que en el paso 5 se separó `base`.
+- El worker **no expone puertos** ni tiene `HEALTHCHECK` HTTP: no atiende peticiones.
 
-### 3.4 ¿Reintentar o no?
+### 3.3 `docker-compose.yml`
 
-```go
-func EsErrorPermanente(err error) bool {
-	switch apperr.TipoDe(err) {
-	case apperr.TipoNoEncontrado, apperr.TipoValidacion, apperr.TipoProhibido:
-		return true
-	}
-	return ia.EsErrorDeIA(err) && !ia.EsReintentable(err)
-}
+```yaml
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    image: seguimiento-worker:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_DIRECCION: redis:6379
+      ALMACENAMIENTO_RUTA: /data
+    # Comparte el volumen con la API: el worker escribe los PDF y la API los sirve.
+    volumes:
+      - archivos:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # La API aplica las migraciones al arrancar.
+      api:
+        condition: service_healthy
 ```
-- Es la función `esPermanente` que se le entrega a la cola (paso 47). **Permanentes:** datos que no existen o son inválidos, y errores de la IA no transitorios (clave inválida, modelo inexistente, rechazo). **Transitorios:** todo lo demás (red, tiempo agotado, límite de uso, base de datos momentáneamente caída).
-- `fmt.Errorf("...: %w", err)` en `GenerarReporte` **envuelve** el error de la IA; `errors.As` (dentro de `ia.EsErrorDeIA`) lo encuentra igual.
-
-```go
-func (g *GeneradorReportes) RegistrarFalloReporte(ctx context.Context, reporteID string, causa error) error {
-	return g.repo.FallarReporte(ctx, reporteID, MensajeFallo(causa))
-}
-```
-- La cola llama a estos métodos cuando el fallo es definitivo; el reporte queda `fallido` **con el motivo**, visible para el profesor en el detalle del lote.
+- **El mismo volumen `archivos`** que la API: el worker escribe `reportes/<semana>/<id>.pdf` y la API lo lee al descargar.
+- Espera a que la **API esté sana**, porque es la API quien crea las tablas.
+- También se quitó el comentario que tenía `redis` desde el paso 47 (ya no hace falta: ahora la API y el worker lo usan).
 
 ---
 
-## 4. Las pruebas
-
-| Prueba | Qué verifica |
-|---|---|
-| `TestProcesarLoteCreaYEncolaUnReportePorPersona` | 3 personas → lote en proceso con total 3 y 3 trabajos encolados. |
-| `TestProcesarLoteOmiteLotesTerminados` | Un lote completado no se reprocesa. |
-| `TestProcesarLoteMarcaFallidoElReporteQueNoSePudoEncolar` | Con Redis caído, el reporte queda fallido. |
-| `TestGenerarReporteCompleto` | Llama una vez a la IA, el PDF usa ese resumen, se guarda en `reportes/2026-10-05/r1.pdf` y el resultado registra ruta, tamaño, proveedor y modelo; antes se marcó en proceso. |
-| `TestGenerarReporteSinTareasNoConsultaLaIA` | Sin tareas: cero llamadas a la IA, resumen fijo y sin proveedor. |
-| `TestGenerarReporteOmiteReportesFinalizados` | Un reporte completado no se regenera. |
-| `TestGenerarReportePropagaElErrorDeIA` | Un 401 de la IA es **permanente**; el reporte no se completa; al registrar el fallo, el motivo incluye "clave inválida". |
-| `TestEsErrorPermanente` | No encontrado y validación → permanentes; IA 400 → permanente; IA 429 y 503 (incluso envuelto) → transitorios; un error de red → transitorio. |
-
----
-
-## 5. Conceptos de este paso
+## 4. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Fan-out | Un trabajo (el lote) genera muchos trabajos pequeños (uno por persona). |
-| Idempotencia | Cada trabajo comprueba el estado antes de actuar. |
-| Errores permanentes y transitorios | Solo se reintenta lo que puede funcionar después. |
-| `bytes.NewReader` | Convierte un `[]byte` en un `io.Reader` para guardarlo. |
+| Proceso consumidor | Programa que toma trabajos de una cola y los ejecuta. |
+| Concurrencia del worker | Cuántos trabajos procesa a la vez. |
+| `<-ctx.Done()` | Bloquear hasta que llegue la señal de apagado. |
+| Patrón adaptador | Un tipo que traduce una interfaz a otra (logs de Asynq → slog). |
+| Volumen compartido | Dos contenedores leen y escriben los mismos archivos. |
 
 ---
 
-## 6. Cómo comprobarlo
+## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/servicio/ -v -run 'ProcesarLote|GenerarReporte|EsErrorPermanente'
+docker compose up --build -d --wait
+docker compose ps                    # api, nginx, postgres, redis y worker
+docker compose logs worker           # "proveedor de IA configurado" ... "worker iniciado"
 ```
 
-Por HTTP de punta a punta, en el paso 55 (con el worker en marcha).
+De punta a punta (profesora, Laura vinculada y al menos una tarea en la semana, pasos 33 y 37):
+1. `POST /api/v1/reportes/lotes` con `{"semana":"<fecha de esta semana>"}` → 202.
+2. `GET /api/v1/reportes/lotes/<id>` → en uno o dos segundos, `"estado":"completado"`, con el reporte de Laura, su `resumen` y su `url_descarga`.
+3. `GET <url_descarga>` → se descarga `reporte-laura-martinez-<semana>.pdf`.
+4. `docker compose logs worker` → `lote iniciado`, `resumen generado`, `reporte generado`.
+
+Para probar un fallo: ponga `LLM_PROVEEDOR=openai` **sin** `LLM_MODELO` y ejecute `docker compose up -d worker`. El worker no arranca y `docker compose logs worker` explica el motivo.
 
 ---
 
-## 7. Pasos para lograr esta versión desde el paso 53
+## 6. Pasos para lograr esta versión desde el paso 54
 
-1. Crear `backend/internal/servicio/generacion_reportes.go` con `GeneradorPDF`, `ResumenSinTareas`, `GeneradorReportes`, `NuevoGeneradorReportes`, los cuatro métodos, `RutaPDFReporte`, `EsErrorPermanente` y `MensajeFallo`.
-2. En `reportes_test.go`: `resumidorFalso`, `pdfFalso`, `nuevoGenerador`, `semanaPrueba`, `datosConTareas` y las ocho pruebas.
-3. `make pruebas lint`
-4. Commit: `git add . && git commit -m "Paso 54: generación asíncrona de reportes"`
-
----
-
-## 8. Preparación para las próximas entregas
-
-- **El generador no sabe que existe Asynq:** recibe un ID y devuelve un error. En la Entrega 4 se podría invocar desde una función serverless disparada por Pub/Sub sin cambiarlo.
-- **El tiempo de cada llamada a la IA queda en los logs** (`duracion_ms`): servirá para dimensionar workers y comparar proveedores.
+1. Crear `backend/cmd/worker/main.go` (sección 3.1).
+2. En `backend/Dockerfile`: compilar también `./cmd/worker` y agregar la etapa `worker`; actualizar el comentario inicial.
+3. En `docker-compose.yml`: el servicio `worker` (sección 3.3), quitar el comentario del servicio `redis` y actualizar el comentario inicial.
+4. En el `Makefile`: `logs` muestra `api worker`.
+5. `docker compose up --build -d --wait` y probar el flujo completo (sección 5).
+6. Commit: `git add . && git commit -m "Paso 55: worker"`
 
 ---
 
-## 9. Requisitos que atiende
+## 7. Preparación para las próximas entregas
+
+- **Escalado independiente (Entrega 3):** la API y el worker se escalan por separado. Más profesores consultando → más instancias de la API; más reportes → más workers o más concurrencia.
+- **Volumen compartido → Cloud Storage:** con API y workers en máquinas distintas, el volumen local ya no sirve; se reemplaza el almacenamiento por Cloud Storage (paso 38, deuda técnica DT-02) sin tocar el generador.
+
+---
+
+## 8. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-14.2 Un reporte por persona | `ProcesarLote` crea y encola uno por persona. |
-| RF-14.3 Insumos permitidos | `ObtenerDatosSemana` + prompt del paso 51. |
-| RF-14.4 / RF-14.5 PDF almacenado | `GenerarReporte` genera y guarda el PDF. |
-| RN-46 No inventar ni evaluar | Sin tareas no se consulta a la IA. |
-| RNF-01 Backend sólido | Idempotencia, reintentos solo ante errores transitorios y registro del motivo de fallo. |
+| RF-14.1 a RF-14.7 | El flujo de reportes funciona completo: lote, uno por persona, IA, PDF, almacenamiento y descarga. |
+| Stack: Asynq + Redis, Docker Compose | Worker como servicio de Compose que consume la cola. |
+| Arquitectura §6 Flujo asíncrono | API y worker desacoplados por la cola. |

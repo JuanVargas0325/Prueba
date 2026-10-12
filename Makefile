@@ -16,8 +16,8 @@ arriba: ## Construye y levanta todo el sistema (requiere .env)
 abajo: ## Detiene el sistema (conserva los datos)
 	docker compose down
 
-logs: ## Muestra los logs de la API
-	docker compose logs -f api
+logs: ## Muestra los logs de la API y del worker
+	docker compose logs -f api worker
 
 pruebas: ## Pruebas unitarias con detector de condiciones de carrera
 	$(DOCKER_GO) $(GO_IMG) go test -race ./...

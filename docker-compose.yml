@@ -1,4 +1,4 @@
-# Despliegue local.
+# Despliegue local completo de la Entrega 1.
 #   1. cp .env.example .env   (y ajustar los valores)
 #   2. docker compose up --build -d
 #   3. La API queda disponible en http://localhost:8080 a través de Nginx.
@@ -24,8 +24,6 @@ services:
     # ports:
     #   - "5433:5432"
 
-  # Broker de la cola de tareas asíncronas (Asynq): la API encola y el worker
-  # (paso 55) procesa.
   redis:
     image: redis:7-bookworm
     restart: unless-stopped
@@ -58,6 +56,29 @@ services:
         condition: service_healthy
     expose:
       - "8080"
+
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    image: seguimiento-worker:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_DIRECCION: redis:6379
+      ALMACENAMIENTO_RUTA: /data
+    # Comparte el volumen con la API: el worker escribe los PDF y la API los sirve.
+    volumes:
+      - archivos:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # La API aplica las migraciones al arrancar.
+      api:
+        condition: service_healthy
 
   nginx:
     image: nginx:1.27-bookworm
