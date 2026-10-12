@@ -1,246 +1,180 @@
-# Paso 4 · Migraciones y esquema de la base de datos
+# Paso 5 · Dockerfile de la API
 
-> Rama `paso-a-paso` · paso 4 de 65 · anterior: **Paso 3 · Conexión a PostgreSQL** · siguiente: **Paso 5 · Dockerfile de la API**
+> Rama `paso-a-paso` · paso 5 de 65 · anterior: **Paso 4 · Migraciones y esquema** · siguiente: **Paso 6 · Docker Compose con PostgreSQL y la API**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Al arrancar, la API crea automáticamente **todas las tablas** del sistema aplicando *migraciones*.
+La API se puede empaquetar como **imagen de Docker** basada en **Linux Debian 12 (bookworm)**.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/basedatos/migraciones/0001_esquema_inicial.sql` | **Nuevo.** El esquema completo: 10 tablas con sus restricciones e índices. |
-| `backend/internal/basedatos/basedatos.go` | **Modificado.** Funciones `Migrar` y `aplicarMigracion`; los archivos `.sql` quedan **dentro del ejecutable** con `go:embed`. |
-| `backend/cmd/api/main.go` | **Modificado.** Llama a `basedatos.Migrar` después de conectarse. |
+| `backend/Dockerfile` | **Nuevo.** Construcción en varias etapas: compila con Go y copia solo el binario a una imagen Debian mínima. |
+| `backend/.dockerignore` | **Nuevo.** Archivos que no se envían a Docker al construir. |
 
-Al arrancar con una base de datos vacía se ve en el log:
-
-```json
-{"level":"INFO","msg":"migración aplicada","servicio":"api","version":"0001_esquema_inicial"}
+```bash
+cd backend
+docker build --target api -t seguimiento-api .
 ```
 
-y la base de datos queda con 11 tablas: las 10 del sistema más `migraciones_aplicadas`. En los arranques siguientes no se vuelve a aplicar nada.
+La imagen resultante pesa unos 150 MB, frente a unos 900 MB de la imagen con el compilador de Go. Ejecuta la API como un usuario sin privilegios y Docker sabe si está sana gracias a un *healthcheck* sobre `/salud`.
 
 ---
 
 ## 2. Por qué
 
-### ¿Qué es una migración?
-
-Un archivo con los cambios que hay que aplicar a la **estructura** de la base de datos (crear tablas, columnas, índices) para pasar de una versión del esquema a la siguiente. Es un "control de versiones" para la base de datos: Git guarda la evolución del código y las migraciones la del esquema.
-
-El código y la base de datos deben estar sincronizados: si el código lee una columna, esa columna tiene que existir en **todas** las bases de datos (la de cada integrante, la de GitHub Actions, la de la nube). Hacer ese cambio a mano en cada una es lento y propenso a olvidos. Con migraciones, el cambio queda escrito y se aplica igual en todas partes.
-
-### ¿Por qué todo el esquema en este paso?
-
-Las funcionalidades llegan una por una en los pasos siguientes, pero el **modelo de datos se diseña completo al inicio** porque:
-- las tablas dependen unas de otras (una tarea pertenece a una vinculación, que pertenece a un espacio, que pertenece a un período);
-- si cada integrante del equipo creara "su" tabla por separado, se producirían conflictos entre migraciones;
-- muchas reglas de negocio se garantizan con restricciones en la base de datos (`CHECK`, `UNIQUE`), y es más fácil razonarlas viendo todo el modelo.
-
-### ¿Por qué aplicarlas al arrancar?
-
-Así una base de datos vacía (la de un integrante nuevo, la de CI o la de la nube) queda lista solo con levantar la API, sin comandos manuales.
+- **Entregable de la Entrega 1:** el enunciado exige "archivos `Dockerfile`" para ejecutar el sistema de forma reproducible.
+- **Stack del curso:** Linux **Debian** o Ubuntu. Todas las imágenes del proyecto usan Debian 12 (`bookworm`).
+- **Reproducibilidad:** la imagen contiene el programa y todo lo que necesita. Funciona igual en su equipo, en el de sus compañeros, en GitHub Actions y en la nube.
+- **Imagen multietapa:** para compilar se necesita Go (cientos de MB); para ejecutar, solo el binario. Separar las etapas produce una imagen final pequeña, que se descarga y arranca más rápido y tiene menos programas que puedan tener vulnerabilidades.
 
 ---
 
-## 3. Explicación detallada
+## 3. Explicación detallada del `Dockerfile`
 
-### 3.1 Cómo funciona `Migrar` (`basedatos.go`)
+Un `Dockerfile` es una receta: cada instrucción crea una **capa** de la imagen. Docker guarda las capas en caché y solo reconstruye desde la primera que cambió.
 
-```go
-//go:embed migraciones/*.sql
-var archivosMigracion embed.FS
+### Etapa 1 · Compilación
+
+```dockerfile
+FROM golang:1.26-bookworm AS compilacion
+WORKDIR /src
 ```
+- `FROM` parte de una imagen existente: la oficial de Go 1.26 sobre Debian 12. `AS compilacion` le da nombre a la etapa para referirse a ella después.
+- `WORKDIR /src` crea la carpeta `/src` y se ubica en ella.
 
-- `//go:embed` es una **directiva del compilador**: copia los archivos indicados **dentro del ejecutable**. La variable `archivosMigracion` se comporta como un sistema de archivos de solo lectura.
-- Ventaja: el binario es autosuficiente. La imagen de Docker (paso 5) no necesita copiar la carpeta `migraciones/`, y es imposible que el binario y sus migraciones no coincidan.
-- El comentario debe ir pegado a la variable y sin espacio entre `//` y `go:embed`.
-
-```go
-const claveBloqueoMigraciones = 4204_2026
-
-func Migrar(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) error {
-	conn, err := pool.Acquire(ctx)
-	...
-	defer conn.Release()
-
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", claveBloqueoMigraciones); err != nil {
-		return fmt.Errorf("bloqueando migraciones: %w", err)
-	}
-	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", claveBloqueoMigraciones) //nolint:errcheck
+```dockerfile
+COPY go.mod go.sum ./
+RUN go mod download
 ```
+- Primero se copian **solo** `go.mod` y `go.sum` y se descargan las dependencias.
+- **Truco de caché:** las dependencias cambian poco y el código cambia mucho. Al copiarlas por separado, si solo cambió el código Docker reutiliza la capa de dependencias ya descargadas y la construcción tarda segundos en lugar de minutos.
 
-- `pool.Acquire` toma **una** conexión del pool y la reserva. Es necesario porque el bloqueo de PostgreSQL pertenece a una conexión concreta.
-- `pg_advisory_lock(42042026)` es un **bloqueo consultivo**: un candado con un número arbitrario que solo una conexión puede tener a la vez. Si dos instancias de la API arrancan al mismo tiempo (Entrega 3, varias instancias), la segunda espera a que la primera termine de migrar. Sin el candado, ambas intentarían crear las mismas tablas y una fallaría.
-- `4204_2026`: los `_` en un número solo sirven para leerlo mejor (el curso es MISW4204). Vale `42042026`.
-- El `defer` libera el candado al terminar. `context.WithoutCancel(ctx)` asegura que la liberación se ejecute aunque el contexto original se haya cancelado. El comentario `//nolint:errcheck` le indica al linter (paso 8) que ignorar ese error es intencional: si falla, la conexión se cierra igual y PostgreSQL libera el candado.
-
-```go
-	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS migraciones_aplicadas (
-		version     TEXT PRIMARY KEY,
-		aplicada_en TIMESTAMPTZ NOT NULL DEFAULT now()
-	)`); err != nil { ... }
+```dockerfile
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /salida/api ./cmd/api
 ```
+- Copia el resto del código (menos lo excluido en `.dockerignore`) y compila.
+- `CGO_ENABLED=0`: compila sin depender de librerías de C del sistema. El binario es **estático** y funciona en cualquier Linux.
+- `GOOS=linux`: el sistema operativo destino.
+- `-trimpath`: quita del binario las rutas del equipo donde se compiló (reproducibilidad y privacidad).
+- `-ldflags="-s -w"`: quita la información de depuración; el binario queda más pequeño (unos 18 MB).
+- `-o /salida/api`: dónde dejar el ejecutable. `./cmd/api` es el programa a compilar.
 
-- Una tabla de control con las versiones ya aplicadas. `IF NOT EXISTS` la crea solo la primera vez.
-- El texto entre comillas invertidas (`` ` ``) es un **string literal crudo**: puede tener varias líneas y no interpreta `\`.
+### Etapa 2 · Base de ejecución
 
-```go
-	nombres, err := fs.Glob(archivosMigracion, "migraciones/*.sql")
-	...
-	sort.Strings(nombres)
-	for _, nombre := range nombres {
-		if err := aplicarMigracion(ctx, conn.Conn(), nombre, log); err != nil {
-			return err
-		}
-	}
+```dockerfile
+FROM debian:bookworm-slim AS base
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates tzdata wget \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+USER app
 ```
+- `debian:bookworm-slim`: Debian 12 en su versión reducida (sin documentación ni herramientas extra).
+- Se instalan solo tres paquetes:
+  - `ca-certificates`: certificados de las autoridades de confianza, necesarios para llamadas **HTTPS** salientes (en el paso 52 la API de IA);
+  - `tzdata`: zonas horarias del sistema (el binario ya trae las suyas desde el paso 1, pero así también las tienen otras herramientas);
+  - `wget`: lo usa el *healthcheck* para consultar `/salud`.
+- `--no-install-recommends` evita instalar paquetes "sugeridos" que no se necesitan.
+- `rm -rf /var/lib/apt/lists/*` borra los índices de paquetes descargados (unos 20 MB que ya no sirven).
+- Todo va en **un solo `RUN`** unido con `&&`. Si se hiciera en varios, los archivos borrados seguirían ocupando espacio en la capa anterior.
+- `useradd ... app` crea un usuario sin contraseña, sin carpeta personal y sin shell. `USER app` hace que todo lo siguiente corra con ese usuario. **Por seguridad:** si alguien encontrara una falla en la API, no tendría permisos de administrador (`root`) dentro del contenedor.
+- La etapa se llama `base` porque en el paso 55 la reutilizará también el worker.
 
-- Lista los archivos y los **ordena por nombre**. Por eso los nombres empiezan con un número de 4 dígitos (`0001_`, `0002_`...): el orden alfabético coincide con el orden de aplicación.
-- `for _, nombre := range nombres`: el `_` descarta el índice, que no se necesita.
+### Etapa 3 · API
 
-```go
-func aplicarMigracion(ctx context.Context, conn *pgx.Conn, nombre string, log *slog.Logger) error {
-	version := strings.TrimSuffix(strings.TrimPrefix(nombre, "migraciones/"), ".sql")
-	var aplicada bool
-	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM migraciones_aplicadas WHERE version = $1)", version).Scan(&aplicada); err != nil { ... }
-	if aplicada {
-		return nil
-	}
-	sql, err := archivosMigracion.ReadFile(nombre)
-	...
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, string(sql)); err != nil {
-			return fmt.Errorf("aplicando migración %s: %w", version, err)
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO migraciones_aplicadas (version) VALUES ($1)", version); err != nil {
-			return fmt.Errorf("registrando migración %s: %w", version, err)
-		}
-		return nil
-	})
-	...
-	log.Info("migración aplicada", "version", version)
-	return nil
-}
+```dockerfile
+FROM base AS api
+COPY --from=compilacion /salida/api /usr/local/bin/api
+EXPOSE 8080
 ```
+- Parte de `base` y copia **únicamente el binario** desde la etapa de compilación. El compilador, el código fuente y las dependencias no llegan a la imagen final.
+- `EXPOSE 8080` documenta en qué puerto escucha. No publica el puerto por sí solo; eso lo hace `docker run -p` o Docker Compose.
 
-- La versión es el nombre del archivo sin carpeta ni extensión: `0001_esquema_inicial`.
-- `$1` es un **parámetro**: el valor viaja aparte del SQL. Nunca se concatena texto en una consulta (eso permitiría inyección SQL).
-- `.Scan(&aplicada)` copia el resultado de la consulta en la variable; `&` pasa su dirección para que `Scan` pueda escribir en ella.
-- `pgx.BeginFunc` abre una **transacción**, ejecuta la función y:
-  - si la función devuelve `nil`, confirma (`COMMIT`);
-  - si devuelve un error, revierte (`ROLLBACK`).
-  
-  Por eso una migración con un error a la mitad **no deja la base de datos a medias**: o se aplica completa y queda registrada, o no se aplica nada. PostgreSQL permite crear tablas dentro de transacciones, lo que no todas las bases de datos admiten.
-- Se separó en dos funciones (`Migrar` y `aplicarMigracion`) para que cada una sea corta y fácil de leer.
-
-**Regla de oro:** **nunca se edita una migración que ya se aplicó.** Si `0001` ya corrió en una base de datos, editarla no cambia nada allí (la versión ya está registrada y se salta). Los cambios futuros van en un archivo nuevo, por ejemplo `0002_fecha_limite_creacion.sql`.
-
-### 3.2 El esquema (`0001_esquema_inicial.sql`)
-
-```mermaid
-erDiagram
-    usuarios ||--o{ usuario_roles : tiene
-    periodos_academicos ||--o{ espacios : agrupa
-    usuarios ||--o{ espacios : "dirige (profesor)"
-    usuarios ||--o{ vinculaciones : "se vincula"
-    espacios ||--o{ vinculaciones : tiene
-    vinculaciones ||--o{ vinculacion_rectificaciones : "se corrige"
-    vinculaciones ||--o{ tareas : registra
-    tareas ||--o{ tarea_adjuntos : adjunta
-    usuarios ||--o{ lotes_reportes : solicita
-    lotes_reportes ||--o{ reportes_semanales : contiene
-    usuarios ||--o{ reportes_semanales : "es reportado"
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=5 \
+  CMD wget -qO- http://127.0.0.1:8080/salud >/dev/null || exit 1
 ```
+- Docker ejecuta este comando **dentro del contenedor** cada 10 segundos. Si `/salud` no responde 200 en 3 segundos, cuenta un fallo; con 5 fallos seguidos marca el contenedor como `unhealthy`.
+- `--start-period=20s`: margen inicial (por ejemplo, mientras espera a PostgreSQL) en el que los fallos no cuentan.
+- `wget -qO-` descarga la URL en silencio. Si la respuesta no es exitosa (por ejemplo, 503), `wget` termina con error y `|| exit 1` lo reporta.
+- Se usa `127.0.0.1` porque se consulta a sí mismo.
+- En el paso 6, Docker Compose esperará a que este estado sea `healthy` antes de dar por arrancado el sistema.
 
-**Decisiones comunes a todas las tablas:**
-- **Identificadores UUID** (`UUID PRIMARY KEY DEFAULT gen_random_uuid()`): códigos aleatorios como `6f1c2a8e-1a7d-...` en lugar de números consecutivos. Las URLs de la API (`/tareas/{id}`) no permiten adivinar otros registros probando 1, 2, 3...; además pueden generarse en la aplicación antes de insertar (se aprovecha en el paso 36 con las tareas).
-- **`TIMESTAMPTZ`** (fecha y hora con zona horaria) para los momentos (`creado_en`), y **`DATE`** (solo fecha) para los días de calendario (`fecha_inicio`, `semana_inicio`).
-- **`TEXT` con `CHECK (x IN (...))`** para los catálogos cerrados (roles, estados): la base de datos rechaza cualquier valor fuera de la lista aunque el código tuviera un error.
-- **`REFERENCES`** (llaves foráneas): no se puede crear, por ejemplo, una tarea para una vinculación que no existe.
-- **Índices** en las columnas por las que se busca a menudo, para que las consultas no recorran toda la tabla.
+```dockerfile
+ENTRYPOINT ["/usr/local/bin/api"]
+```
+- El programa que se ejecuta al iniciar el contenedor. La forma con corchetes (*exec form*) ejecuta el binario directamente, sin pasar por un shell; así recibe las señales de `docker stop` y puede hacer el apagado ordenado del paso 2.
 
-**Tabla por tabla:**
+### `.dockerignore`
 
-| Tabla | Qué guarda | Detalles importantes |
-|---|---|---|
-| `usuarios` | Personas registradas (RF-02). | Índice **único** sobre `lower(correo)`: `Ana@x.co` y `ana@x.co` son el mismo usuario. Se guarda `password_hash`, nunca la contraseña (paso 12). `activo` para una futura desactivación. |
-| `usuario_roles` | Roles de cada usuario (RF-01.3, RN-01: una persona puede tener varios). | Llave primaria `(usuario_id, rol)`: no se repite un rol. `ON DELETE CASCADE`: si se borra el usuario, se borran sus roles. `CHECK` con los 4 roles: administrador, profesor, monitor y asistente_graduado. |
-| `periodos_academicos` | Semestres, por ejemplo `2026-20` (RF-03.2). | `codigo` único. `creacion_habilitada` abre o cierra la ventana para crear cursos y proyectos (RN-07). `CHECK (fecha_cierre > fecha_inicio)`. |
-| `espacios` | Cursos y proyectos (RF-03). | `tipo` curso o proyecto; `estado` activo o cerrado (RF-03.5); `profesor_id` es el profesor responsable. Índice por profesor porque casi todas las consultas filtran por él. |
-| `vinculaciones` | Persona + espacio + rol + horas semanales (RF-04). | `UNIQUE (usuario_id, espacio_id, rol)`: una persona puede estar en el mismo espacio con **roles distintos**, pero no dos veces con el mismo (RF-04.6). `CHECK (horas_semanales > 0)`. Las reglas de 22 h, 12 h, 3 monitorías y 40 % **no** se pueden expresar con `CHECK` porque involucran varias filas; se validan en la aplicación dentro de una transacción con bloqueo (paso 31). |
-| `vinculacion_rectificaciones` | Historial de correcciones que hace el administrador (RF-04.5). | Guarda rol y horas anteriores y nuevos, quién corrigió y el motivo. Nada se pierde. |
-| `tareas` | Registro semanal de actividades (RF-06). | `CHECK (EXTRACT(ISODOW FROM semana_inicio) = 1)`: la semana se guarda siempre como **su lunes** (RF-08.1). `horas_invertidas INTEGER` (horas enteras, RN-24). `tardia` marca el reporte tardío (RN-32). Índices por vinculación y semana. |
-| `tarea_adjuntos` | Metadatos de archivos de evidencia (RF-06.4). | El archivo en sí se guarda fuera de la base de datos (paso 38); aquí solo nombre, ruta, tipo y tamaño. `ON DELETE CASCADE` con la tarea. |
-| `lotes_reportes` | Cada ejecución de "generar reportes de la semana" (RF-14.1). | Estado del lote y contadores (total, completados, fallidos) para seguir su avance. |
-| `reportes_semanales` | Un reporte PDF por persona y semana (RF-14.2). | Resumen de IA, ruta del PDF, intentos, error, proveedor y modelo de IA usados. `UNIQUE (lote_id, usuario_id)`: un reporte por persona en cada lote. |
+```
+*_test.go
+coverage.out
+*.pdf
+.env
+```
+- Lo que **no** se envía a Docker al construir: las pruebas (no se necesitan para compilar el programa), los reportes de cobertura, los PDF y, sobre todo, cualquier `.env` con secretos, para que nunca termine dentro de una imagen.
 
 ---
 
-## 4. Conceptos de Go (y SQL) de este paso
+## 4. Conceptos de Docker de este paso
 
 | Concepto | Explicación |
 |---|---|
-| `//go:embed` | Incluye archivos dentro del ejecutable (`embed.FS`). |
-| String crudo | `` `texto` ``: varias líneas, sin secuencias de escape. |
-| `_` en números | Separador visual: `4204_2026` es `42042026`. |
-| `&variable` | Dirección de la variable, para que otra función escriba en ella (`Scan(&aplicada)`). |
-| Transacción | Conjunto de operaciones que se confirman todas o ninguna (`BEGIN`/`COMMIT`/`ROLLBACK`). |
-| Parámetros `$1` | Valores separados del SQL; previenen la inyección SQL. |
-| Bloqueo consultivo | Candado de PostgreSQL identificado por un número (`pg_advisory_lock`). |
-| `//nolint:regla` | Desactiva una advertencia del linter en esa línea, dejando claro que es intencional. |
+| Imagen | Plantilla inmutable con el sistema de archivos y el programa. |
+| Contenedor | Una ejecución de una imagen. |
+| Capa | Resultado de cada instrucción; Docker las cachea. |
+| Multietapa | Varias `FROM` en un archivo; la imagen final copia solo lo necesario (`COPY --from`). |
+| `--target` | Construye hasta la etapa indicada (`api`; en el paso 55 también `worker`). |
+| `HEALTHCHECK` | Comando que Docker ejecuta para saber si el contenedor está sano. |
+| `USER` | Usuario con el que corre el proceso. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
-Con un PostgreSQL vacío (como en el paso 3):
-
 ```bash
 cd backend
-POSTGRES_USER=seguimiento POSTGRES_PASSWORD=clave POSTGRES_DB=seguimiento go run ./cmd/api
-# log: "migración aplicada" ... "version":"0001_esquema_inicial"
+docker build --target api -t seguimiento-api .
+docker images seguimiento-api               # ~150 MB
+
+# Red y base de datos de prueba
+docker network create red-prueba
+docker run -d --name pg --network red-prueba -e POSTGRES_USER=s -e POSTGRES_PASSWORD=s -e POSTGRES_DB=s postgres:16-bookworm
+
+# La API en contenedor, apuntando al contenedor "pg"
+docker run -d --name api --network red-prueba -p 8080:8080 \
+  -e POSTGRES_USER=s -e POSTGRES_PASSWORD=s -e POSTGRES_DB=s -e POSTGRES_HOST=pg seguimiento-api
+
+docker ps                       # después de unos segundos, la columna STATUS dice "(healthy)"
+curl http://localhost:8080/salud
+docker exec api id              # uid=10001(app): no corre como root
+
+# Limpieza
+docker rm -f api pg && docker network rm red-prueba
 ```
 
-Ver las tablas creadas:
-
-```bash
-docker exec -it pg psql -U seguimiento -d seguimiento -c '\dt'
-docker exec -it pg psql -U seguimiento -d seguimiento -c 'SELECT * FROM migraciones_aplicadas'
-```
-
-Detenga y vuelva a arrancar la API: ya no aparece "migración aplicada" porque la versión está registrada.
+Dentro de una red de Docker, los contenedores se encuentran por su **nombre** (`POSTGRES_HOST=pg`). En el paso 6 Docker Compose crea esa red automáticamente.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 3
+## 6. Pasos para lograr esta versión desde el paso 4
 
-1. Crear la carpeta `backend/internal/basedatos/migraciones/`.
-2. Crear `0001_esquema_inicial.sql` con las 10 tablas (ver el archivo en este commit; cada bloque está comentado con los requisitos que atiende).
-3. En `backend/internal/basedatos/basedatos.go`:
-   - actualizar el comentario del paquete ("...y las migraciones del esquema");
-   - agregar los imports `embed`, `io/fs`, `sort`, `strings` y `github.com/jackc/pgx/v5`;
-   - declarar `//go:embed migraciones/*.sql` y `var archivosMigracion embed.FS`;
-   - agregar la constante `claveBloqueoMigraciones`, `Migrar` y `aplicarMigracion` (sección 3.1).
-4. En `backend/cmd/api/main.go`, justo después de `defer db.Close()`:
-   ```go
-   if err := basedatos.Migrar(ctx, db, log); err != nil {
-       return err
-   }
-   ```
-5. Probar contra una base de datos vacía (sección 5) y hacer commit: `git add . && git commit -m "Paso 4: migraciones y esquema de la base de datos"`
-
-Para cambiar el esquema en el futuro: crear `0002_descripcion.sql`; **no editar** `0001`.
+1. Crear `backend/Dockerfile` con las tres etapas (`compilacion`, `base`, `api`) de la sección 3.
+2. Crear `backend/.dockerignore` con las cuatro líneas de la sección 3.
+3. Construir y probar como en la sección 5.
+4. Commit: `git add . && git commit -m "Paso 5: Dockerfile de la API"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- **El bloqueo consultivo** permite que, en la Entrega 3, varias instancias de la API arranquen a la vez contra la misma base de datos sin pelearse por las migraciones.
-- **Las migraciones dentro del binario** hacen que desplegar en una VM o en Cloud Run sea solo "ejecutar la imagen nueva": el esquema se actualiza solo.
-- **UUID como identificadores** facilitará escalar horizontalmente: varias instancias pueden generar identificadores sin coordinarse.
+- **La misma imagen sirve para la nube.** En la Entrega 2 se puede construir y ejecutar en una VM; en la Entrega 4, publicar en Artifact Registry y desplegar en Cloud Run.
+- **La etapa `base` compartida** permite agregar el worker (paso 55) u otros procesos sin duplicar la configuración del sistema operativo.
+- **El `HEALTHCHECK`** documenta cómo saber si la instancia está sana. Los grupos de instancias de la Entrega 3 usarán la misma ruta `/salud`.
 
 ---
 
@@ -248,9 +182,6 @@ Para cambiar el esquema en el futuro: crear `0002_descripcion.sql`; **no editar*
 
 | Requisito | Cómo |
 |---|---|
-| RNF-04 Persistencia | Tablas para todos los datos del sistema. |
-| RNF-06 Consistencia | Restricciones `CHECK`, `UNIQUE` y llaves foráneas. |
-| RF-04.6 Vinculaciones independientes | `UNIQUE (usuario_id, espacio_id, rol)`. |
-| RF-07.2 Estados de tarea | `CHECK` con abierto, en_desarrollo y finalizado. |
-| RF-08.1 Semana de lunes a domingo | `CHECK` de que `semana_inicio` es lunes. |
-| Arquitectura §5 Modelo de datos | El esquema completo queda definido. |
+| Entregable: `Dockerfile` | Imagen multietapa de la API. |
+| Stack: Linux Debian | `golang:1.26-bookworm` y `debian:bookworm-slim`. |
+| RNF-01 / seguridad básica | Usuario sin privilegios, imagen mínima, sin secretos dentro de la imagen. |
