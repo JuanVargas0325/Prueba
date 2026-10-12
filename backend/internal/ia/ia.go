@@ -7,18 +7,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	"seguimiento/internal/dominio"
 )
 
-// Proveedores admitidos en LLM_PROVEEDOR. Los proveedores reales se agregan
-// en los pasos 52 (compatible con OpenAI) y 53 (Anthropic).
+// Proveedores admitidos en LLM_PROVEEDOR. Anthropic se agrega en el paso 53.
 const (
 	// ProveedorSimulado no llama a ningún modelo: genera un resumen
 	// determinístico. Sirve para desarrollar y probar sin credenciales.
 	ProveedorSimulado = "simulado"
+	// ProveedorOpenAI usa la API de Chat Completions de OpenAI o de cualquier
+	// servicio compatible (Gemini, Groq, OpenRouter, Ollama, LM Studio...).
+	ProveedorOpenAI = "openai"
 )
 
 // Resumidor redacta el resumen del trabajo semanal de una persona.
@@ -47,8 +50,11 @@ func Nuevo(cfg Config) (Resumidor, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Proveedor)) {
 	case "", ProveedorSimulado:
 		return NuevoSimulado(), nil
+	case ProveedorOpenAI:
+		return NuevoOpenAI(cfg, &http.Client{Timeout: cfg.Timeout})
 	default:
-		return nil, fmt.Errorf("LLM_PROVEEDOR %q no soportado (use %s)", cfg.Proveedor, ProveedorSimulado)
+		return nil, fmt.Errorf("LLM_PROVEEDOR %q no soportado (use %s o %s)",
+			cfg.Proveedor, ProveedorSimulado, ProveedorOpenAI)
 	}
 }
 
@@ -82,4 +88,22 @@ func EsReintentable(err error) bool {
 func EsErrorDeIA(err error) bool {
 	var ep *ErrorProveedor
 	return errors.As(err, &ep)
+}
+
+// estadoReintentable clasifica un código HTTP: límite de uso, tiempo agotado
+// y fallas del servidor son transitorios; credenciales o peticiones inválidas no.
+func estadoReintentable(estado int) bool {
+	return estado == http.StatusRequestTimeout ||
+		estado == http.StatusConflict ||
+		estado == http.StatusTooManyRequests ||
+		estado >= http.StatusInternalServerError
+}
+
+// limpiarResumen normaliza el texto devuelto por el modelo.
+func limpiarResumen(proveedor, texto string) (string, error) {
+	texto = strings.TrimSpace(texto)
+	if texto == "" {
+		return "", &ErrorProveedor{Proveedor: proveedor, Mensaje: "el modelo devolvió un resumen vacío", Reintentable: true}
+	}
+	return texto, nil
 }
