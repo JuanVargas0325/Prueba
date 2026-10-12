@@ -1,172 +1,226 @@
-# Paso 29 · Endpoints de espacios
+# Paso 30 · Dominio: vinculaciones y reglas de horas
 
-> Rama `paso-a-paso` · paso 29 de 65 · anterior: **Paso 28 · Servicio de espacios** · siguiente: **Paso 30 · Dominio: vinculaciones y reglas de horas**
+> Rama `paso-a-paso` · paso 30 de 65 · anterior: **Paso 29 · Endpoints de espacios** · siguiente: **Paso 31 · Repositorio de vinculaciones**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Cursos y proyectos se gestionan por HTTP:
-
-| Método | Ruta | Rol | Descripción |
-|---|---|---|---|
-| POST | `/api/v1/espacios` | profesor | Crea un curso o proyecto en un período habilitado. |
-| GET | `/api/v1/espacios` | todos | Lista los espacios visibles. Filtros: `?periodo_id=`, `?estado=`, `?tipo=`. |
-| GET | `/api/v1/espacios/{id}` | todos (si lo puede ver) | Detalle; los cerrados traen `"solo_lectura": true`. |
-| POST | `/api/v1/espacios/{id}/cerrar` | profesor responsable o administrador | Cierra el espacio. |
+Se modelaron las **vinculaciones** (una persona asignada a un curso o proyecto, con un rol y unas horas semanales) y las **reglas de dedicación horaria**, el núcleo de negocio del proyecto.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/handler/espacios.go` | **Nuevo.** Módulo de espacios. |
-| `backend/internal/handler/formatos.go` | **Modificado.** `personaRef`: referencia corta a una persona (id, nombre y correo opcional). |
-| `backend/internal/handler/respuestas.go` | **Modificado.** `consultaUUID` y `validarUUIDOpcional`. |
-| `backend/internal/handler/router.go` | **Modificado.** Servicio `Espacios` y su módulo. |
-| `backend/internal/handler/router_test.go` | **Modificado.** Constante `uuidB` y caso "un monitor no crea espacios". |
-| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso de espacios y `TestEspacios`. |
-| `backend/cmd/api/main.go` | **Modificado.** Repositorio de espacios, el **reloj** de la aplicación y el servicio de espacios. |
-
-```bash
-curl -s -X POST localhost:8080/api/v1/espacios -H "Authorization: Bearer $TOKEN_PROFESOR" -H 'Content-Type: application/json' \
-  -d '{"tipo":"curso","nombre":"Desarrollo en la nube","periodo_id":"<id del período>","fecha_inicio":"2026-08-03","fecha_cierre":"2026-12-04"}'
-# {"id":"372c...","tipo":"curso","nombre":"Desarrollo en la nube",
-#  "periodo":{"id":"8e99...","codigo":"2026-20"},"profesor":{"id":"4ed2...","nombre":"Carolina Rojas"},
-#  "fecha_inicio":"2026-08-03","fecha_cierre":"2026-12-04","observaciones":"","estado":"activo","solo_lectura":false,...}
-```
+| `backend/internal/dominio/vinculacion.go` | **Nuevo.** Constantes de los límites, entidad `Vinculacion` con su vigencia, `ValidarHoras`, `LimiteMonitoriaMixta`, `ValidarCargaHoraria`, el tipo `ValidadorCarga`, `Rectificacion` y `FiltroVinculaciones`. |
+| `backend/internal/dominio/reglas_test.go` | **Modificado.** Pruebas de todas las reglas de horas, incluido el ejemplo del enunciado. |
 
 ---
 
 ## 2. Por qué
 
-- **RF-03.1 a RF-03.7** quedan disponibles por la API.
-- **`POST /espacios/{id}/cerrar` en lugar de `PATCH` con `estado`:** cerrar es una **acción** con reglas propias (solo el responsable, no se puede reabrir), no la edición de un campo cualquiera. Un endpoint de acción lo deja explícito.
-- **`solo_lectura`:** RF-03.6 pide que los espacios cerrados se puedan consultar "en modo de solo lectura". El campo le dice al cliente (el frontend de la Entrega 2) que no debe ofrecer acciones de edición.
+El enunciado define reglas **bloqueantes** (RN-19): si se violan, la vinculación no se crea.
+
+| Regla | Texto del enunciado |
+|---|---|
+| RN-14 / RF-05.1 | Máximo **22 horas** semanales como asistente graduado. |
+| RN-15 / RF-05.2 | Máximo **3 monitorías** simultáneas. |
+| RN-16 / RF-05.3 | Máximo **12 horas** semanales de monitoría. |
+| RN-17 / RF-05.4 | Con monitoría **y** asistencia a la vez, las horas de monitoría no pueden superar el **40 %** de las horas de asistencia. |
+| RN-18 / RF-05.5 | Ese 40 % se **redondea hacia arriba**: 22 h → 8,8 → **9 h**; 12 h → 4,8 → **5 h**. |
+
+Son reglas puras (dado un conjunto de vinculaciones, ¿es válido?), así que van en el dominio y se prueban exhaustivamente sin base de datos.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Registro de rutas
+### 3.1 Constantes
 
 ```go
-func (h *HandlerEspacios) Registrar(g *gin.RouterGroup) {
-	r := g.Group("/espacios")
-	r.GET("", h.Listar)
-	r.GET("/:id", h.Obtener)
-	r.POST("", RequiereRol(dominio.RolProfesor), h.Crear)
-	r.POST("/:id/cerrar", RequiereRol(dominio.RolProfesor, dominio.RolAdministrador), h.Cerrar)
+const (
+	MaxHorasAsistenteGraduado   = 22 // RN-14
+	MaxMonitoriasSimultaneas    = 3  // RN-15
+	MaxHorasMonitoria           = 12 // RN-16
+	PorcentajeMaxMonitoriaMixta = 40 // RN-17: % de las horas de asistencia graduada
+)
+```
+- Cada número del enunciado tiene un nombre y una referencia a su regla. Si la universidad cambiara un límite, se cambia en un solo lugar.
+
+### 3.2 La entidad
+
+```go
+type Vinculacion struct {
+	ID                 string
+	UsuarioID          string
+	UsuarioNombre      string
+	UsuarioCorreo      string
+	EspacioID          string
+	EspacioNombre      string
+	EspacioTipo        TipoEspacio
+	EspacioEstado      EstadoEspacio
+	EspacioFechaInicio time.Time
+	EspacioFechaCierre time.Time
+	ProfesorID         string
+	ProfesorNombre     string
+	Rol                Rol
+	HorasSemanales     int
+	CreadoEn           time.Time
+	ActualizadoEn      time.Time
 }
 ```
-- La lectura no exige rol en el router: la visibilidad la decide el servicio (paso 28).
+- Además de lo propio (rol y horas), trae datos de la persona, del espacio y del profesor, que el repositorio obtendrá con `JOIN` (paso 31). El **profesor responsable** de una vinculación es el del espacio (RN-11).
 
-### 3.2 Formato de salida
-
-```go
-type espacioJSON struct {
-	ID            string                `json:"id"`
-	Tipo          dominio.TipoEspacio   `json:"tipo"`
-	Nombre        string                `json:"nombre"`
-	Periodo       periodoRef            `json:"periodo"`
-	Profesor      personaRef            `json:"profesor"`
-	FechaInicio   string                `json:"fecha_inicio"`
-	FechaCierre   string                `json:"fecha_cierre"`
-	Observaciones string                `json:"observaciones"`
-	Estado        dominio.EstadoEspacio `json:"estado"`
-	SoloLectura   bool                  `json:"solo_lectura"`
-	CreadoEn      time.Time             `json:"creado_en"`
-}
-
-type periodoRef struct {
-	ID     string `json:"id"`
-	Codigo string `json:"codigo"`
-}
-```
-- **Objetos anidados** para las referencias: `"periodo": {"id", "codigo"}` y `"profesor": {"id", "nombre"}`. El cliente obtiene lo que necesita para mostrar ("2026-20", "Carolina Rojas") y el ID por si quiere más detalle.
-- `personaRef` va en `formatos.go` porque la reutilizarán vinculaciones, tareas y seguimiento:
-  ```go
-  type personaRef struct {
-  	ID     string `json:"id"`
-  	Nombre string `json:"nombre"`
-  	Correo string `json:"correo,omitempty"`
-  }
-  ```
-  `omitempty`: si el correo está vacío, el campo **no aparece** en el JSON.
-- `SoloLectura: e.Estado == dominio.EspacioCerrado` se calcula al convertir.
-
-### 3.3 Validar identificadores que llegan en el cuerpo o la consulta
+### 3.3 Vigencia
 
 ```go
-func consultaUUID(c *gin.Context, nombre string) (string, error) {
-	return validarUUIDOpcional(nombre, c.Query(nombre))
-}
-
-func validarUUIDOpcional(nombre, valor string) (string, error) {
-	if valor == "" {
-		return "", nil
+func (v Vinculacion) InicioVigencia(zona *time.Location) time.Time {
+	creada := Fecha(v.CreadoEn, zona)
+	if creada.After(v.EspacioFechaInicio) {
+		return creada
 	}
-	if _, err := uuid.Parse(valor); err != nil {
-		return "", apperr.Validacion("%s debe ser un identificador válido", nombre)
-	}
-	return valor, nil
+	return v.EspacioFechaInicio
+}
+
+func (v Vinculacion) VigenteEnSemana(semanaInicio time.Time, zona *time.Location) bool {
+	return seCruzan(v.InicioVigencia(zona), v.EspacioFechaCierre, InicioSemana(semanaInicio), FinSemana(semanaInicio))
 }
 ```
-- `parametroUUID` (paso 19) valida parámetros de **ruta**, que son obligatorios. Estos validan IDs **opcionales**: en la consulta (`?periodo_id=`) o dentro del JSON (`"periodo_id"` en `Crear`). Vacío está bien; un texto que no es UUID → 400.
+- ¿Desde cuándo debe reportar una persona? Desde la fecha **más tardía** entre el inicio del espacio y el día en que se la vinculó. Si a Laura la vinculan el 16 de septiembre a un curso que empezó en agosto, no tiene sentido marcarle "sin reporte" las semanas de agosto.
+- `VigenteEnSemana` reutiliza `seCruzan` (paso 25). Se usará en el seguimiento semanal (paso 41).
 
-### 3.4 `main.go`
+### 3.4 Reglas de horas
 
 ```go
-	reloj := servicio.NuevoReloj(cfg.ZonaHoraria)
-	...
-		Espacios: servicio.NuevoEspacios(espacios, periodos, reloj, log),
+func ValidarHoras(horas int) error {
+	if horas <= 0 {
+		return apperr.Validacion("las horas semanales contratadas deben ser mayores que cero")
+	}
+	return nil
+}
 ```
-- Se crea **el** reloj de la aplicación con `APP_ZONA_HORARIA` (paso 1). Todos los servicios que dependen de la fecha lo compartirán.
-- El servicio de espacios recibe el repositorio de períodos como su `LectorPeriodos`.
 
-### 3.5 Pruebas
+```go
+func LimiteMonitoriaMixta(horasAsistencia int) int {
+	return (horasAsistencia*PorcentajeMaxMonitoriaMixta + 99) / 100
+}
+```
+- **Redondeo hacia arriba solo con enteros:** en Go, la división entera **trunca** (`88 / 100 = 0`). Sumar `99` antes de dividir convierte el truncamiento en redondeo hacia arriba:
+  - 22 h: `(22·40 + 99) / 100 = (880 + 99) / 100 = 979 / 100 = 9` ✔ (8,8 → 9);
+  - 12 h: `(480 + 99) / 100 = 5` ✔ (4,8 → 5);
+  - 10 h: `(400 + 99) / 100 = 4` ✔ (exacto, no sube).
+- Se evitan los números decimales (`float64`), que pueden dar sorpresas como `0.1 + 0.2 = 0.30000000000000004`.
 
-- `TestControlDeAccesoPorRol`: un monitor no puede crear espacios (403).
-- `TestEspacios` (handler):
-  - crear un curso pasa al servicio el `periodo_id` y el tipo;
-  - cerrar devuelve `"solo_lectura":true`;
-  - un `apperr.NoEncontrado` del servicio se traduce en **404**.
-- `uuidB` es un segundo UUID fijo para las pruebas.
+```go
+func ValidarCargaHoraria(vinculaciones []Vinculacion) error {
+	horasAsistencia, horasMonitoria, monitorias := 0, 0, 0
+	for _, v := range vinculaciones {
+		switch v.Rol {
+		case RolAsistenteGraduado:
+			horasAsistencia += v.HorasSemanales
+		case RolMonitor:
+			horasMonitoria += v.HorasSemanales
+			monitorias++
+		}
+	}
+
+	if horasAsistencia > MaxHorasAsistenteGraduado {
+		return apperr.ReglaNegocio("la persona superaría el máximo de %d horas semanales como asistente graduado (quedaría con %d)", ...)
+	}
+	if monitorias > MaxMonitoriasSimultaneas { ... }
+	if horasMonitoria > MaxHorasMonitoria { ... }
+	if horasAsistencia > 0 && monitorias > 0 {
+		if limite := LimiteMonitoriaMixta(horasAsistencia); horasMonitoria > limite {
+			return apperr.ReglaNegocio("con %d horas como asistente graduado, las horas de monitoría no pueden superar %d (40 %% redondeado hacia arriba); quedaría con %d", ...)
+		}
+	}
+	return nil
+}
+```
+- Recibe **todas** las vinculaciones simultáneas de una persona **incluida la que se quiere crear**, suma por rol y verifica las cuatro reglas en orden.
+- Los mensajes dicen **cuánto quedaría**, para que el profesor entienda por qué se rechazó.
+- `%%` en un formato produce un `%` literal.
+- `if limite := ...; cond`: el `if` con inicialización (paso 0) mantiene `limite` dentro del bloque.
+- Todas son **422** (regla de negocio), no errores de validación.
+
+### 3.5 `ValidadorCarga`: la regla viaja hasta la transacción
+
+```go
+type ValidadorCarga func(simultaneas []Vinculacion, objetivo Vinculacion) error
+```
+- Un **tipo función**. Hay un problema de concurrencia: si dos profesores vinculan a la misma persona **al mismo tiempo**, cada uno podría ver "tiene 12 h, agregar 10 h está bien" y entre los dos dejarla con 32 h.
+- La solución (paso 31) es validar **dentro de una transacción que bloquea a la persona**. Pero la regla es del dominio, no de la base de datos. Con este tipo, el servicio le **pasa la regla como función** al repositorio, que la ejecuta en el momento exacto, con el usuario bloqueado.
+
+### 3.6 Rectificaciones y filtro
+
+```go
+type Rectificacion struct {
+	ID              string
+	VinculacionID   string
+	AdministradorID string
+	RolAnterior     Rol
+	RolNuevo        Rol
+	HorasAnteriores int
+	HorasNuevas     int
+	Motivo          string
+	CreadoEn        time.Time
+}
+```
+- **RF-04.4 / RN-12:** las horas no se modifican; **RF-04.5:** el administrador puede **rectificar** un error, con motivo y dejando registro (tabla `vinculacion_rectificaciones`, paso 4).
+
+```go
+type FiltroVinculaciones struct {
+	VisiblePara string
+	ProfesorID string
+	UsuarioID  string
+	EspacioID  string
+	SoloEspaciosActivos bool
+	Paginacion
+}
+```
+- `VisiblePara`: mismo mecanismo de visibilidad de los espacios. `ProfesorID`: limitar a los espacios de un profesor (lo usará el seguimiento, paso 43).
+
+### 3.7 Pruebas
+
+```go
+func vinc(rol Rol, horas int) Vinculacion { return Vinculacion{Rol: rol, HorasSemanales: horas} }
+```
+
+| Prueba | Casos |
+|---|---|
+| `TestLimiteMonitoriaMixtaRedondeaHaciaArriba` | 22→9, 12→5, 10→4, 5→2, 1→1, 20→8. |
+| `TestValidarCargaHoraria` (10 subpruebas con `t.Run`) | 22 h de asistencia ✔; 23 h ✘ (RN-14); 3 monitorías ✔; 4 ✘ (RN-15); 13 h de monitoría ✘ (RN-16); **ejemplo del enunciado: 12 h de asistencia + 3 h + 3 h de monitoría ✘** (6 > 5, RN-17); 12 + 5 ✔ (redondeo RN-18); 22 + 9 ✔; 22 + 10 ✘; sin vinculaciones ✔. |
+| `TestValidarHoras` | 0 y −3 inválidos; 4 válido. |
+| `TestVigenciaDeLaVinculacion` | Creada el 16/09 en un curso de agosto: empieza el 16/09; no vigente la semana del 07/09; vigente la del 14/09 y la del cierre; no vigente después del cierre. |
+
+`t.Run(nombre, func...)` crea **subpruebas** con nombre; en la salida se ve cuál de los 10 casos falló.
 
 ---
 
-## 4. Conceptos de este paso
+## 4. Conceptos de Go de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Endpoint de acción | `POST /recurso/{id}/accion` para operaciones con reglas propias. |
-| Objetos anidados en JSON | Structs dentro de structs (`periodoRef`, `personaRef`). |
-| `omitempty` | El campo se omite del JSON si tiene su valor cero. |
-| Campos calculados | `solo_lectura` se deriva del estado al responder. |
+| División entera | `/` entre enteros trunca; `(a + b - 1) / b` redondea hacia arriba. |
+| `%%` | `%` literal en un formato. |
+| Tipo función como estrategia | `ValidadorCarga`: una regla que se entrega a otra capa para ejecutarla en el momento justo. |
+| Subpruebas | `t.Run(nombre, f)`. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-make pruebas
-docker compose up --build -d --wait
+cd backend
+go test ./internal/dominio/ -v -run 'Carga|Monitoria|Horas|Vigencia'
 ```
-
-1. Con el token del administrador: crear un usuario con rol `profesor` (paso 19) y un período (paso 24).
-2. Iniciar sesión como el profesor y crear un curso (ejemplo de la sección 1).
-3. `POST /api/v1/espacios/<id>/cerrar` → `"estado":"cerrado","solo_lectura":true`; repetir → **409**.
-4. Con el administrador, `PATCH /api/v1/periodos/<id>` con `{"creacion_habilitada":false}`; crear otro curso → **422** "el período 2026-20 no está habilitado para crear cursos o proyectos".
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 28
+## 6. Pasos para lograr esta versión desde el paso 29
 
-1. En `formatos.go`: `personaRef`.
-2. En `respuestas.go`: `consultaUUID` y `validarUUIDOpcional`.
-3. Crear `backend/internal/handler/espacios.go` (interfaz, handler, `Registrar`, `espacioJSON`, `periodoRef`, `aEspacioJSON`, `peticionEspacio` y los cuatro endpoints).
-4. En `router.go`: campo `Espacios` y `&HandlerEspacios{...}`.
-5. En `router_test.go`: `uuidB` y el caso `POST /api/v1/espacios` con token de monitor.
-6. En `handler/modulos_test.go`: `servicioEspaciosFalso` y `TestEspacios`.
-7. En `main.go`: `espacios = repositorio.NuevoEspacios(db)`, `reloj := servicio.NuevoReloj(cfg.ZonaHoraria)` y `Espacios: servicio.NuevoEspacios(espacios, periodos, reloj, log)`.
-8. `make pruebas lint` y commit: `git add . && git commit -m "Paso 29: endpoints de espacios"`
+1. Crear `backend/internal/dominio/vinculacion.go` con las constantes, `Vinculacion`, `InicioVigencia`, `VigenteEnSemana`, `ValidarHoras`, `LimiteMonitoriaMixta`, `ValidarCargaHoraria`, `ValidadorCarga`, `Rectificacion` y `FiltroVinculaciones`.
+2. En `reglas_test.go`, al inicio: `vinc`, `TestLimiteMonitoriaMixtaRedondeaHaciaArriba`, `TestValidarCargaHoraria`, `TestValidarHoras` y `TestVigenciaDeLaVinculacion` (agregar el import `time`).
+3. `make pruebas lint`
+4. Commit: `git add . && git commit -m "Paso 30: dominio de vinculaciones y reglas de horas"`
 
 ---
 
@@ -174,7 +228,7 @@ docker compose up --build -d --wait
 
 | Requisito | Cómo |
 |---|---|
-| RF-03.1 a RF-03.3 Crear con información mínima | `POST /api/v1/espacios`. |
-| RF-03.4 / RF-11.1 Consultar sus espacios | `GET /api/v1/espacios` con visibilidad. |
-| RF-03.5 Cerrar | `POST /api/v1/espacios/{id}/cerrar`. |
-| RF-03.6 Consultar cerrados en solo lectura | Campo `solo_lectura`. |
+| RF-04.1 a RF-04.3 Vinculación con rol y horas | Entidad `Vinculacion`. |
+| RF-04.5 Rectificación | Entidad `Rectificacion`. |
+| RF-05.1 a RF-05.5 / RN-14 a RN-18 | `ValidarCargaHoraria` y `LimiteMonitoriaMixta`, con el ejemplo del enunciado probado. |
+| RF-05.6 / RN-19 Reglas bloqueantes | Errores 422 y `ValidadorCarga` para aplicarlas de forma atómica (paso 31). |

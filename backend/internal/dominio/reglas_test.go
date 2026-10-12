@@ -3,9 +3,77 @@ package dominio
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"seguimiento/internal/apperr"
 )
+
+func vinc(rol Rol, horas int) Vinculacion { return Vinculacion{Rol: rol, HorasSemanales: horas} }
+
+func TestLimiteMonitoriaMixtaRedondeaHaciaArriba(t *testing.T) {
+	casos := map[int]int{22: 9, 12: 5, 10: 4, 5: 2, 1: 1, 20: 8}
+	for asistencia, esperado := range casos {
+		if got := LimiteMonitoriaMixta(asistencia); got != esperado {
+			t.Errorf("LimiteMonitoriaMixta(%d) = %d, se esperaba %d", asistencia, got, esperado)
+		}
+	}
+}
+
+func TestValidarCargaHoraria(t *testing.T) {
+	casos := []struct {
+		nombre string
+		vs     []Vinculacion
+		valido bool
+	}{
+		{"asistente con 22 h", []Vinculacion{vinc(RolAsistenteGraduado, 12), vinc(RolAsistenteGraduado, 10)}, true},
+		{"asistente con 23 h (RN-14)", []Vinculacion{vinc(RolAsistenteGraduado, 12), vinc(RolAsistenteGraduado, 11)}, false},
+		{"tres monitorías", []Vinculacion{vinc(RolMonitor, 4), vinc(RolMonitor, 4), vinc(RolMonitor, 4)}, true},
+		{"cuatro monitorías (RN-15)", []Vinculacion{vinc(RolMonitor, 2), vinc(RolMonitor, 2), vinc(RolMonitor, 2), vinc(RolMonitor, 2)}, false},
+		{"monitorías con 13 h (RN-16)", []Vinculacion{vinc(RolMonitor, 7), vinc(RolMonitor, 6)}, false},
+		{"ejemplo del enunciado: 12 h asistencia + 6 h monitoría (RN-17)", []Vinculacion{vinc(RolAsistenteGraduado, 12), vinc(RolMonitor, 3), vinc(RolMonitor, 3)}, false},
+		{"12 h asistencia + 5 h monitoría (redondeo RN-18)", []Vinculacion{vinc(RolAsistenteGraduado, 12), vinc(RolMonitor, 5)}, true},
+		{"22 h asistencia + 9 h monitoría", []Vinculacion{vinc(RolAsistenteGraduado, 22), vinc(RolMonitor, 9)}, true},
+		{"22 h asistencia + 10 h monitoría", []Vinculacion{vinc(RolAsistenteGraduado, 22), vinc(RolMonitor, 10)}, false},
+		{"sin vinculaciones", nil, true},
+	}
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			err := ValidarCargaHoraria(c.vs)
+			if c.valido && err != nil {
+				t.Fatalf("debería ser válido: %v", err)
+			}
+			if !c.valido && !apperr.Es(err, apperr.TipoReglaNegocio) {
+				t.Fatalf("debería violar una regla de negocio, se obtuvo %v", err)
+			}
+		})
+	}
+}
+
+func TestValidarHoras(t *testing.T) {
+	if ValidarHoras(0) == nil || ValidarHoras(-3) == nil || ValidarHoras(4) != nil {
+		t.Error("solo se admiten horas positivas")
+	}
+}
+
+func TestVigenciaDeLaVinculacion(t *testing.T) {
+	v := Vinculacion{
+		EspacioFechaInicio: fecha(t, "2026-08-03"),
+		EspacioFechaCierre: fecha(t, "2026-12-04"),
+		CreadoEn:           time.Date(2026, 9, 16, 15, 0, 0, 0, time.UTC),
+	}
+	if got := v.InicioVigencia(time.UTC).Format(FormatoFecha); got != "2026-09-16" {
+		t.Errorf("la vigencia empieza al crear la vinculación, se obtuvo %s", got)
+	}
+	if v.VigenteEnSemana(fecha(t, "2026-09-07"), time.UTC) {
+		t.Error("no debería estar vigente antes de crearse")
+	}
+	if !v.VigenteEnSemana(fecha(t, "2026-09-14"), time.UTC) || !v.VigenteEnSemana(fecha(t, "2026-11-30"), time.UTC) {
+		t.Error("debería estar vigente en la semana de creación y en la del cierre")
+	}
+	if v.VigenteEnSemana(fecha(t, "2026-12-07"), time.UTC) {
+		t.Error("no debería estar vigente después del cierre del espacio")
+	}
+}
 
 func TestPeriodoPermiteCrearEspacios(t *testing.T) {
 	p := PeriodoAcademico{Codigo: "2026-20", Estado: PeriodoActivo, CreacionHabilitada: true,
