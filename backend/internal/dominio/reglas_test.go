@@ -130,6 +130,54 @@ func TestEspacioFechasYEstado(t *testing.T) {
 	}
 }
 
+func TestDatosTareaNormalizar(t *testing.T) {
+	d, err := DatosTarea{Titulo: "  Calificar  ", HorasInvertidas: 3}.Normalizar()
+	if err != nil || d.Titulo != "Calificar" || d.Estado != TareaAbierta {
+		t.Fatalf("normalización inesperada: %+v %v", d, err)
+	}
+	invalidos := []DatosTarea{
+		{Titulo: "", HorasInvertidas: 1},
+		{Titulo: "x", Estado: "cerrado"},
+		{Titulo: "x", HorasInvertidas: -1},
+		{Titulo: "x", HorasInvertidas: MaxHorasPorTarea + 1},
+		{Titulo: strings.Repeat("x", LongitudMaxTitulo+1)},
+	}
+	for _, d := range invalidos {
+		if _, err := d.Normalizar(); !apperr.Es(err, apperr.TipoValidacion) {
+			t.Errorf("%+v debería ser inválido", d)
+		}
+	}
+}
+
+func TestTareaPuedeModificarse(t *testing.T) {
+	ahora := time.Date(2026, 10, 14, 15, 0, 0, 0, time.UTC) // miércoles
+	actual := Tarea{SemanaInicio: fecha(t, "2026-10-12")}
+	if err := actual.PuedeModificarse(ahora, time.UTC); err != nil {
+		t.Errorf("la tarea de la semana activa se puede modificar: %v", err)
+	}
+	pasada := Tarea{SemanaInicio: fecha(t, "2026-10-05")}
+	if !apperr.Es(pasada.PuedeModificarse(ahora, time.UTC), apperr.TipoReglaNegocio) {
+		t.Error("la tarea de una semana cerrada no se puede modificar (RN-34)")
+	}
+	tardia := Tarea{SemanaInicio: fecha(t, "2026-10-05"), Tardia: true}
+	if err := tardia.PuedeModificarse(ahora, time.UTC); !apperr.Es(err, apperr.TipoReglaNegocio) || !strings.Contains(err.Error(), "tardíos") {
+		t.Errorf("un reporte tardío no se puede modificar (RN-33): %v", err)
+	}
+}
+
+func TestValidarSemanaDeRegistro(t *testing.T) {
+	ahora := time.Date(2026, 10, 14, 15, 0, 0, 0, time.UTC)
+	if ValidarSemanaDeRegistro(fecha(t, "2026-10-18"), ahora, time.UTC) != nil {
+		t.Error("el domingo de la semana actual es válido")
+	}
+	if ValidarSemanaDeRegistro(fecha(t, "2026-09-01"), ahora, time.UTC) != nil {
+		t.Error("las semanas pasadas se admiten como reporte tardío (RF-08.3)")
+	}
+	if !apperr.Es(ValidarSemanaDeRegistro(fecha(t, "2026-10-19"), ahora, time.UTC), apperr.TipoValidacion) {
+		t.Error("las semanas futuras no se admiten")
+	}
+}
+
 func TestNormalizarCorreoYPassword(t *testing.T) {
 	if c, err := NormalizarCorreo("  Ana.Perez@Uniandes.EDU.co "); err != nil || c != "ana.perez@uniandes.edu.co" {
 		t.Errorf("correo normalizado = %q, %v", c, err)

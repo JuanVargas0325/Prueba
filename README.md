@@ -1,171 +1,229 @@
-# Paso 33 · Endpoints de vinculaciones
+# Paso 34 · Dominio: tareas semanales
 
-> Rama `paso-a-paso` · paso 33 de 65 · anterior: **Paso 32 · Servicio de vinculaciones** · siguiente: **Paso 34 · Dominio: tareas semanales**
+> Rama `paso-a-paso` · paso 34 de 65 · anterior: **Paso 33 · Endpoints de vinculaciones** · siguiente: **Paso 35 · Repositorio de tareas**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Las vinculaciones se gestionan por HTTP:
-
-| Método | Ruta | Rol | Descripción |
-|---|---|---|---|
-| POST | `/api/v1/vinculaciones` | profesor | Vincula a una persona (por `usuario_id` o `correo`) a un curso o proyecto propio, con rol y horas. Aplica las reglas de horas. |
-| GET | `/api/v1/vinculaciones` | todos | Lista las vinculaciones visibles. Filtros: `?espacio_id=`, `?usuario_id=`, `?solo_activas=true`. Para un monitor es el **listado unificado** de sus cursos y proyectos (RF-11.1). |
-| GET | `/api/v1/vinculaciones/{id}` | quien pueda verla | Detalle. |
-| PUT | `/api/v1/vinculaciones/{id}` | administrador | Rectifica rol y/o horas con un motivo obligatorio. |
-| GET | `/api/v1/vinculaciones/{id}/rectificaciones` | profesor o administrador | Historial de correcciones. |
+Se modeló la **tarea semanal**: el registro de una actividad que un monitor o asistente hace en una de sus vinculaciones durante una semana, con sus estados y las reglas de tiempo (semana activa, tardanza, inmutabilidad).
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/handler/vinculaciones.go` | **Nuevo.** Módulo de vinculaciones. |
-| `backend/internal/handler/formatos.go` | **Modificado.** `espacioRef` y `vinculacionJSON` (compartidos con tareas y seguimiento). |
-| `backend/internal/handler/router.go` | **Modificado.** Servicio `Vinculaciones` y su módulo. |
-| `backend/internal/handler/router_test.go` | **Modificado.** Un monitor no vincula; un profesor no rectifica. |
-| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso y `TestVinculaciones`. |
-| `backend/cmd/api/main.go` | **Modificado.** Repositorio y servicio de vinculaciones. |
-
-Ejemplo del enunciado por HTTP (Laura tiene 12 h de asistencia y una monitoría de 3 h):
-
-```bash
-curl -s -X POST localhost:8080/api/v1/vinculaciones -H "Authorization: Bearer $TOKEN_PROFESOR" -H 'Content-Type: application/json' \
-  -d '{"espacio_id":"<curso>","usuario_id":"<laura>","rol":"monitor","horas_semanales":3}'
-# 422 {"error":"regla_negocio","mensaje":"con 12 horas como asistente graduado, las horas de monitoría
-#      no pueden superar 5 (40 % redondeado hacia arriba); quedaría con 6"}
-```
+| `backend/internal/dominio/tarea.go` | **Nuevo.** `EstadoTarea`, entidad `Tarea`, `DatosTarea` con `Normalizar`, `Aplicar`, `ValidarSemanaDeRegistro`, `PuedeModificarse`, `FiltroTareas` y la entidad `Adjunto`. |
+| `backend/internal/dominio/reglas_test.go` | **Modificado.** Pruebas de normalización, modificabilidad y semanas de registro. |
 
 ---
 
 ## 2. Por qué
 
-- **RF-04 y RF-05** quedan disponibles por la API, con las reglas de horas aplicadas de forma atómica.
-- **El profesor no tiene endpoint para cambiar horas** (RF-04.4): solo existe `PUT` para el administrador (RF-04.5).
-- **422 frente a 409:** violar una regla de horas es una **regla de negocio** (422); vincular dos veces lo mismo es un **conflicto** (409). El cliente puede distinguirlos.
+| Requisito | Regla |
+|---|---|
+| RF-06.1 a RF-06.3 / RN-20 a RN-22 | Cada tarea pertenece a **una** vinculación y tiene título, descripción, estado, horas y observaciones. |
+| RF-06.5 / RN-24 | Las horas son **enteras**. |
+| RF-07 / RN-27 y RN-28 | Estados cerrados: **abierto**, **en desarrollo**, **finalizado**. |
+| RF-06.7, RF-06.8, RF-08.2 / RN-30 | Editar y eliminar solo mientras la semana está **activa**. |
+| RF-08.3 | Se puede registrar en semanas **pasadas**. |
+| RF-08.4 / RN-32 | Registrar en una semana cerrada marca la tarea como **reporte tardío**. |
+| RF-08.5 / RN-33 | Un reporte tardío **no se puede modificar ni eliminar**. |
+| RN-34 | Las tareas de semanas cerradas no se modifican. |
+
+Todas son reglas puras sobre fechas y datos: van en el dominio.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Rutas
+### 3.1 Estados
 
 ```go
-func (h *HandlerVinculaciones) Registrar(g *gin.RouterGroup) {
-	r := g.Group("/vinculaciones")
-	r.GET("", h.Listar)
-	r.GET("/:id", h.Obtener)
-	r.POST("", RequiereRol(dominio.RolProfesor), h.Crear)
-	r.PUT("/:id", RequiereRol(dominio.RolAdministrador), h.Rectificar)
-	r.GET("/:id/rectificaciones", RequiereRol(dominio.RolProfesor, dominio.RolAdministrador), h.ListarRectificaciones)
+type EstadoTarea string
+
+const (
+	TareaAbierta      EstadoTarea = "abierto"
+	TareaEnDesarrollo EstadoTarea = "en_desarrollo"
+	TareaFinalizada   EstadoTarea = "finalizado"
+)
+
+var EstadosTarea = []EstadoTarea{TareaAbierta, TareaEnDesarrollo, TareaFinalizada}
+
+func (e EstadoTarea) Texto() string {
+	if e == TareaEnDesarrollo {
+		return "en desarrollo"
+	}
+	return string(e)
 }
 ```
+- Coinciden con el `CHECK` de la tabla `tareas` (paso 4). `EstadosTarea` sirve para recorrerlos (por ejemplo, contar tareas por estado en el consolidado, paso 41). `Texto` es la versión legible para el PDF.
 
-### 3.2 Peticiones
+### 3.2 La entidad
 
 ```go
-type peticionVinculacion struct {
-	EspacioID      string      `json:"espacio_id"`
-	UsuarioID      string      `json:"usuario_id"`
-	Correo         string      `json:"correo"`
-	Rol            dominio.Rol `json:"rol"`
-	HorasSemanales int         `json:"horas_semanales"`
-}
-
-type peticionRectificacion struct {
-	Rol            *dominio.Rol `json:"rol"`
-	HorasSemanales *int         `json:"horas_semanales"`
-	Motivo         string       `json:"motivo"`
+type Tarea struct {
+	ID               string
+	VinculacionID    string
+	UsuarioID        string
+	UsuarioNombre    string
+	EspacioID        string
+	EspacioNombre    string
+	EspacioTipo      TipoEspacio
+	EspacioEstado    EstadoEspacio
+	ProfesorID       string
+	Rol              Rol
+	SemanaInicio     time.Time // siempre un lunes
+	Titulo           string
+	Descripcion      string
+	Estado           EstadoTarea
+	HorasInvertidas  int // horas enteras (RN-24)
+	Observaciones    string
+	Tardia           bool // RN-32
+	CantidadAdjuntos int
+	Adjuntos         []Adjunto
+	CreadoEn         time.Time
+	ActualizadoEn    time.Time
 }
 ```
-- `HorasSemanales int`: un valor decimal (`4.5`) se rechaza automáticamente con 400 (paso 17): las horas son enteras.
-- En la rectificación, rol y horas son **punteros** (opcionales), igual que en el servicio (paso 32).
-- `Crear` valida con `validarUUIDOpcional` que `espacio_id` y `usuario_id` sean UUID antes de llamar al servicio.
+- Una tarea se identifica por su vinculación; el resto (persona, espacio, profesor, rol) lo traerá el repositorio con `JOIN` (paso 35) para mostrarla y para decidir permisos.
+- **La semana se guarda como su lunes** (`SemanaInicio`).
+- `HorasInvertidas int`: las horas enteras (RN-24) se garantizan con el **tipo**.
+- `Adjuntos` y `CantidadAdjuntos`: la entidad ya contempla la evidencia; la funcionalidad de adjuntos se completa en los pasos 38 a 40.
 
-### 3.3 Formatos compartidos (`formatos.go`)
+### 3.3 Datos editables y su validación
 
 ```go
-type espacioRef struct {
-	ID          string                `json:"id"`
-	Nombre      string                `json:"nombre"`
-	Tipo        dominio.TipoEspacio   `json:"tipo"`
-	Estado      dominio.EstadoEspacio `json:"estado,omitempty"`
-	FechaInicio string                `json:"fecha_inicio,omitempty"`
-	FechaCierre string                `json:"fecha_cierre,omitempty"`
+type DatosTarea struct {
+	Titulo          string
+	Descripcion     string
+	Estado          EstadoTarea
+	HorasInvertidas int
+	Observaciones   string
 }
 
-type vinculacionJSON struct {
-	ID             string      `json:"id"`
-	Usuario        personaRef  `json:"usuario"`
-	Espacio        espacioRef  `json:"espacio"`
-	Profesor       personaRef  `json:"profesor"`
-	Rol            dominio.Rol `json:"rol"`
-	HorasSemanales int         `json:"horas_semanales"`
-	CreadoEn       time.Time   `json:"creado_en"`
-	ActualizadoEn  time.Time   `json:"actualizado_en"`
+func (d DatosTarea) Normalizar() (DatosTarea, error) {
+	var err error
+	if d.Titulo, err = Texto("el título", d.Titulo, true, LongitudMaxTitulo); err != nil {
+		return d, err
+	}
+	if d.Descripcion, err = Texto("la descripción", d.Descripcion, false, LongitudMaxDescripcion); err != nil { ... }
+	if d.Observaciones, err = Texto("las observaciones", d.Observaciones, false, LongitudMaxObservaciones); err != nil { ... }
+	if d.Estado == "" {
+		d.Estado = TareaAbierta
+	}
+	if !d.Estado.EsValido() {
+		return d, apperr.Validacion("estado inválido: use abierto, en_desarrollo o finalizado")
+	}
+	if d.HorasInvertidas < 0 || d.HorasInvertidas > MaxHorasPorTarea {
+		return d, apperr.Validacion("las horas invertidas deben ser un número entero entre 0 y %d", MaxHorasPorTarea)
+	}
+	return d, nil
 }
 ```
-- Una vinculación se muestra con **a quién**, **dónde** y **con qué profesor**, en objetos anidados. Es justo lo que necesita la vista del monitor (RF-11.1: sus cursos y proyectos con rol y horas) y la del profesor (RF-10.2).
-- `espacioRef` es una referencia **resumida** a un espacio; con `omitempty` sirve tanto para respuestas cortas (solo id, nombre y tipo) como completas.
-
-### 3.4 Filtros del listado
+- Separar `DatosTarea` (lo que el usuario puede escribir) de `Tarea` (todo lo demás) deja claro **qué es editable**: la semana, la vinculación y la marca de tardanza no lo son.
+- `if d.Titulo, err = Texto(...); err != nil`: asignación (no declaración) dentro del `if`.
+- El título es obligatorio; si no se indica estado, la tarea queda **abierta**; las horas van de 0 a 168 (las horas de una semana).
 
 ```go
-	vinculaciones, err := h.servicio.Listar(c.Request.Context(), ActorDe(c), dominio.FiltroVinculaciones{
-		EspacioID: espacioID, UsuarioID: usuarioID,
-		SoloEspaciosActivos: c.Query("solo_activas") == "true",
-		Paginacion:          consultaPaginacion(c),
-	})
+func (t *Tarea) Aplicar(d DatosTarea) {
+	t.Titulo, t.Descripcion, t.Estado = d.Titulo, d.Descripcion, d.Estado
+	t.HorasInvertidas, t.Observaciones = d.HorasInvertidas, d.Observaciones
+}
 ```
-- `?solo_activas=true` excluye las vinculaciones de espacios cerrados (útil para mostrar solo lo vigente).
-- `VisiblePara` no viene del cliente: lo fija el servicio (paso 32).
+- Receptor **puntero** (`*Tarea`): modifica la tarea original. Copia solo los campos editables.
 
-### 3.5 Pruebas
+### 3.4 Reglas de tiempo
 
-- `TestControlDeAccesoPorRol` agrega: un monitor no puede vincular; un profesor no puede rectificar (`PUT /vinculaciones/{id}`).
-- `TestVinculaciones` (handler):
-  - vincular por correo pasa correo, rol y horas al servicio (201);
-  - cuando el servicio responde una **regla de negocio**, la API responde **422**;
-  - la rectificación lleva solo las horas (el rol queda en `nil`).
+```go
+func ValidarSemanaDeRegistro(semanaInicio, ahora time.Time, zona *time.Location) error {
+	if InicioSemana(semanaInicio).After(SemanaActual(ahora, zona)) {
+		return apperr.Validacion("no se pueden registrar tareas en semanas futuras")
+	}
+	return nil
+}
+```
+- Se permiten la semana actual y las **pasadas** (RF-08.3); las futuras no.
+
+```go
+func (t Tarea) PuedeModificarse(ahora time.Time, zona *time.Location) error {
+	if t.Tardia {
+		return apperr.ReglaNegocio("los reportes tardíos no pueden modificarse ni eliminarse")
+	}
+	if SemanaCerrada(t.SemanaInicio, ahora, zona) {
+		return apperr.ReglaNegocio("la semana del %s ya cerró: sus tareas no pueden modificarse ni eliminarse",
+			InicioSemana(t.SemanaInicio).Format(FormatoFecha))
+	}
+	return nil
+}
+```
+- **RN-33:** una tarea tardía **nunca** se modifica (aunque su semana fuera la actual, caso que no ocurre en la práctica pero la regla lo cubre).
+- **RN-30 / RN-34:** si la semana ya cerró, tampoco.
+- Ambas son reglas de negocio (422). La marca `Tardia` la pone el servicio al crear (paso 36) con `SemanaCerrada` (paso 20).
+
+### 3.5 Filtro y adjuntos
+
+```go
+type FiltroTareas struct {
+	VisiblePara   string
+	UsuarioID     string
+	EspacioID     string
+	VinculacionID string
+	SemanaInicio  *time.Time
+	Paginacion
+}
+```
+- `SemanaInicio *time.Time`: puntero porque es **opcional** (sin semana = todas).
+
+```go
+type Adjunto struct {
+	ID                 string
+	TareaID            string
+	NombreOriginal     string
+	RutaAlmacenamiento string
+	TipoContenido      string
+	TamanoBytes        int64
+	CreadoEn           time.Time
+}
+```
+- Los **metadatos** de un archivo de evidencia (tabla `tarea_adjuntos`). El archivo en sí se guardará fuera de la base de datos (paso 38). `int64` porque un tamaño en bytes puede superar el rango de un `int` de 32 bits.
+
+### 3.6 Pruebas
+
+El "ahora" de las pruebas es el **miércoles 14 de octubre de 2026** (semana del 12 al 18).
+
+| Prueba | Casos |
+|---|---|
+| `TestDatosTareaNormalizar` | `"  Calificar  "` → `"Calificar"` y estado abierto por defecto. Inválidos: título vacío, estado `cerrado`, horas −1, horas 169 y título de 201 caracteres. |
+| `TestTareaPuedeModificarse` | Semana actual ✔; semana pasada ✘ (RN-34); tardía ✘ con el mensaje de "tardíos" (RN-33). |
+| `TestValidarSemanaDeRegistro` | El domingo 18 (semana actual) ✔; una semana pasada ✔ (RF-08.3); el lunes 19 (semana futura) ✘. |
 
 ---
 
-## 4. Conceptos de este paso
+## 4. Conceptos de Go de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Referencias anidadas reutilizables | `personaRef`, `espacioRef` en varias respuestas. |
-| Parámetros booleanos en la consulta | `c.Query("solo_activas") == "true"`. |
-| 409 vs 422 | Conflicto de existencia frente a regla de negocio. |
+| Asignación en el `if` | `if x, err = f(); err != nil` (sin `:=`, porque `x` ya existe). |
+| Asignación múltiple de campos | `t.A, t.B = d.A, d.B`. |
+| Receptor puntero para modificar | `func (t *Tarea) Aplicar(...)`. |
+| Puntero como opcional | `*time.Time` en un filtro. |
+| `int64` | Entero de 64 bits para tamaños en bytes. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-make pruebas
-docker compose up --build -d --wait
+cd backend
+go test ./internal/dominio/ -v -run 'Tarea|SemanaDeRegistro'
 ```
-
-Con un profesor, una persona con roles `monitor` y `asistente_graduado` (Laura), un período y tres espacios del profesor:
-
-1. Vincular a Laura como **asistente** con 12 h en el espacio 2 (por correo) → 201.
-2. Vincularla como **monitor** con 3 h en el espacio 1 → 201.
-3. Vincularla como **monitor** con 3 h en el espacio 3 → **422** (12 h de asistencia permiten 5 h de monitoría; quedaría con 6).
-4. Repetir la vinculación del paso 2 → **409** "la persona ya está vinculada como monitor en este curso o proyecto".
-5. Con el profesor, `PUT /api/v1/vinculaciones/<id>` → **403**.
-6. Con el administrador, `PUT /api/v1/vinculaciones/<id>` con `{"horas_semanales":10,"motivo":"Error de digitación"}` → 200; `GET .../rectificaciones` muestra 12 → 10 con el motivo.
-7. Con el token de Laura, `GET /api/v1/vinculaciones` → sus 2 vinculaciones.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 32
+## 6. Pasos para lograr esta versión desde el paso 33
 
-1. En `formatos.go`: `espacioRef`, `vinculacionJSON` y `aVinculacionJSON`.
-2. Crear `backend/internal/handler/vinculaciones.go` (interfaz, handler, `Registrar`, peticiones, `rectificacionJSON` y los cinco endpoints).
-3. En `router.go`: campo `Vinculaciones` y `&HandlerVinculaciones{...}`.
-4. En `router_test.go`: casos `POST /api/v1/vinculaciones` (monitor) y `PUT /api/v1/vinculaciones/{uuidA}` (profesor).
-5. En `handler/modulos_test.go`: `servicioVinculacionesFalso` y `TestVinculaciones`.
-6. En `main.go`: `vinculaciones = repositorio.NuevoVinculaciones(db)` y `Vinculaciones: servicio.NuevoVinculaciones(vinculaciones, usuarios, espacios, log)`.
-7. `make pruebas lint` y commit: `git add . && git commit -m "Paso 33: endpoints de vinculaciones"`
+1. Crear `backend/internal/dominio/tarea.go` con las constantes de límites (`LongitudMaxTitulo`, `LongitudMaxDescripcion`, `MaxHorasPorTarea`), `EstadoTarea` con sus constantes, `EstadosTarea`, `EsValido`, `Texto`, `Tarea`, `DatosTarea`, `Normalizar`, `Aplicar`, `ValidarSemanaDeRegistro`, `PuedeModificarse`, `FiltroTareas` y `Adjunto`.
+2. En `reglas_test.go`, después de `TestEspacioFechasYEstado`: `TestDatosTareaNormalizar`, `TestTareaPuedeModificarse` y `TestValidarSemanaDeRegistro`.
+3. `make pruebas lint`
+4. Commit: `git add . && git commit -m "Paso 34: dominio de tareas semanales"`
 
 ---
 
@@ -173,8 +231,10 @@ Con un profesor, una persona con roles `monitor` y `asistente_graduado` (Laura),
 
 | Requisito | Cómo |
 |---|---|
-| RF-04.1 a RF-04.3 Vincular con rol y horas | `POST /api/v1/vinculaciones`. |
-| RF-04.4 Horas no modificables por el profesor | Sin endpoint de edición para el profesor (403 en `PUT`). |
-| RF-04.5 Rectificación | `PUT /api/v1/vinculaciones/{id}` y su historial. |
-| RF-05.1 a RF-05.6 Reglas de horas | Respuesta 422 con el detalle de la regla violada. |
-| RF-10.2 / RF-11.1 Listados | `GET /api/v1/vinculaciones` según quién consulta. |
+| RF-06.3 / RN-22 Información mínima | `DatosTarea` y `Normalizar`. |
+| RF-06.5 / RN-24 Horas enteras | `HorasInvertidas int` y rango 0–168. |
+| RF-07 / RN-27 y RN-28 Estados | `EstadoTarea`. |
+| RF-08.2 / RN-30 Semana activa | `PuedeModificarse`. |
+| RF-08.3 Semanas anteriores | `ValidarSemanaDeRegistro`. |
+| RF-08.5 / RN-33 Tardía inmutable | `PuedeModificarse`. |
+| RN-34 Semanas cerradas | `PuedeModificarse`. |
