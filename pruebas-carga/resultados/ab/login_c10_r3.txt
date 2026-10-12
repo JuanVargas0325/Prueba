@@ -3,7 +3,7 @@ Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
 Licensed to The Apache Software Foundation, http://www.apache.org/
 
 Benchmarking nginx (be patient)
-Finished 2061 requests
+Finished 2659 requests
 
 
 Server Software:        nginx
@@ -15,34 +15,34 @@ Document Length:        509 bytes
 
 Concurrency Level:      10
 Time taken for tests:   15.001 seconds
-Complete requests:      2061
-Failed requests:        218
-   (Connect: 0, Receive: 0, Length: 218, Exceptions: 0)
-Keep-Alive requests:    2061
-Total transferred:      1384760 bytes
-Total body sent:        484614
-HTML transferred:       1048817 bytes
-Requests per second:    137.39 [#/sec] (mean)
-Time per request:       72.787 [ms] (mean)
-Time per request:       7.279 [ms] (mean, across all concurrent requests)
-Transfer rate:          90.15 [Kbytes/sec] received
-                        31.55 kb/s sent
-                        121.69 kb/s total
+Complete requests:      2659
+Failed requests:        301
+   (Connect: 0, Receive: 0, Length: 301, Exceptions: 0)
+Keep-Alive requests:    2659
+Total transferred:      1786501 bytes
+Total body sent:        624546
+HTML transferred:       1353084 bytes
+Requests per second:    177.26 [#/sec] (mean)
+Time per request:       56.416 [ms] (mean)
+Time per request:       5.642 [ms] (mean, across all concurrent requests)
+Transfer rate:          116.30 [Kbytes/sec] received
+                        40.66 kb/s sent
+                        156.96 kb/s total
 
 Connection Times (ms)
               min  mean[+/-sd] median   max
-Connect:        0    0   0.0      0       1
-Processing:    67   72   3.3     71     101
-Waiting:       67   72   3.3     71     101
-Total:         67   72   3.3     71     101
+Connect:        0    0   0.0      0       0
+Processing:    45   56   2.4     56      77
+Waiting:       44   56   2.4     56      77
+Total:         45   56   2.4     56      77
 
 Percentage of the requests served within a certain time (ms)
-  50%     71
-  66%     72
-  75%     73
-  80%     73
-  90%     74
-  95%     77
-  98%     84
-  99%     89
- 100%    101 (longest request)
+  50%     56
+  66%     56
+  75%     57
+  80%     57
+  90%     58
+  95%     60
+  98%     64
+  99%     66
+ 100%     77 (longest request)

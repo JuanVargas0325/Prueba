@@ -345,7 +345,7 @@ func (r *repoVinculacionesFalso) ListarRectificaciones(context.Context, string) 
 	return nil, nil
 }
 
-func entornoVinculaciones(t *testing.T) (*Vinculaciones, *repoVinculacionesFalso, *repoUsuariosFalso, *repoEspaciosFalso) {
+func entornoVinculaciones(t *testing.T) (*Vinculaciones, *repoVinculacionesFalso) {
 	usuarios := nuevoRepoUsuarios()
 	usuarios.usuarios["u1"] = dominio.Usuario{ID: "u1", Correo: "laura@uniandes.edu.co", Activo: true,
 		Roles: []dominio.Rol{dominio.RolMonitor, dominio.RolAsistenteGraduado}}
@@ -356,11 +356,11 @@ func entornoVinculaciones(t *testing.T) (*Vinculaciones, *repoVinculacionesFalso
 		"cerrado": {ID: "cerrado", ProfesorID: "prof-1", Tipo: dominio.EspacioCurso, Estado: dominio.EspacioCerrado},
 	}}
 	repo := &repoVinculacionesFalso{vinculaciones: map[string]dominio.Vinculacion{}}
-	return NuevoVinculaciones(repo, usuarios, espacios, logPrueba), repo, usuarios, espacios
+	return NuevoVinculaciones(repo, usuarios, espacios, logPrueba), repo
 }
 
 func TestCrearVinculacion(t *testing.T) {
-	s, repo, _, _ := entornoVinculaciones(t)
+	s, repo := entornoVinculaciones(t)
 	ctx := context.Background()
 
 	v, err := s.Crear(ctx, profesor, NuevaVinculacion{EspacioID: "e1", Correo: "Laura@uniandes.edu.co", Rol: dominio.RolMonitor, HorasSemanales: 4})
@@ -393,7 +393,7 @@ func TestCrearVinculacion(t *testing.T) {
 }
 
 func TestCrearVinculacionAplicaLasReglasDeHoras(t *testing.T) {
-	s, repo, _, _ := entornoVinculaciones(t)
+	s, repo := entornoVinculaciones(t)
 	ctx := context.Background()
 	// Ejemplo del enunciado: 12 h de asistencia y 3 h de monitoría; otra monitoría de 3 h supera el 40 % (5 h).
 	repo.simultaneas = []dominio.Vinculacion{
@@ -409,7 +409,7 @@ func TestCrearVinculacionAplicaLasReglasDeHoras(t *testing.T) {
 }
 
 func TestRectificarVinculacion(t *testing.T) {
-	s, repo, _, _ := entornoVinculaciones(t)
+	s, repo := entornoVinculaciones(t)
 	ctx := context.Background()
 	repo.vinculaciones["v1"] = dominio.Vinculacion{ID: "v1", UsuarioID: "u2", ProfesorID: "prof-1", Rol: dominio.RolMonitor,
 		HorasSemanales: 4, EspacioEstado: dominio.EspacioActivo}
@@ -436,7 +436,7 @@ func TestRectificarVinculacion(t *testing.T) {
 }
 
 func TestVisibilidadDeVinculaciones(t *testing.T) {
-	s, repo, _, _ := entornoVinculaciones(t)
+	s, repo := entornoVinculaciones(t)
 	ctx := context.Background()
 	repo.vinculaciones["v1"] = dominio.Vinculacion{ID: "v1", UsuarioID: "u1", ProfesorID: "prof-1"}
 

@@ -3,7 +3,7 @@ Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
 Licensed to The Apache Software Foundation, http://www.apache.org/
 
 Benchmarking nginx (be patient)
-Finished 2789 requests
+Finished 3556 requests
 
 
 Server Software:        nginx
@@ -14,35 +14,35 @@ Document Path:          /api/v1/auth/login
 Document Length:        509 bytes
 
 Concurrency Level:      200
-Time taken for tests:   15.132 seconds
-Complete requests:      2789
-Failed requests:        272
-   (Connect: 0, Receive: 0, Length: 272, Exceptions: 0)
-Keep-Alive requests:    2789
-Total transferred:      1873906 bytes
-Total body sent:        699426
-HTML transferred:       1419299 bytes
-Requests per second:    184.31 [#/sec] (mean)
-Time per request:       1085.123 [ms] (mean)
-Time per request:       5.426 [ms] (mean, across all concurrent requests)
-Transfer rate:          120.93 [Kbytes/sec] received
-                        45.14 kb/s sent
-                        166.07 kb/s total
+Time taken for tests:   15.007 seconds
+Complete requests:      3556
+Failed requests:        381
+   (Connect: 0, Receive: 0, Length: 381, Exceptions: 0)
+Keep-Alive requests:    3556
+Total transferred:      2389206 bytes
+Total body sent:        878904
+HTML transferred:       1809578 bytes
+Requests per second:    236.95 [#/sec] (mean)
+Time per request:       844.053 [ms] (mean)
+Time per request:       4.220 [ms] (mean, across all concurrent requests)
+Transfer rate:          155.47 [Kbytes/sec] received
+                        57.19 kb/s sent
+                        212.66 kb/s total
 
 Connection Times (ms)
               min  mean[+/-sd] median   max
-Connect:        0    1   2.3      0      11
-Processing:    80 1020 457.3    963    3380
-Waiting:       69 1020 457.3    963    3380
-Total:         80 1021 458.1    963    3391
+Connect:        0    0   1.2      0       6
+Processing:    51  820 228.2    799    1967
+Waiting:       45  820 228.2    799    1967
+Total:         51  821 228.2    799    1967
 
 Percentage of the requests served within a certain time (ms)
-  50%    963
-  66%   1088
-  75%   1183
-  80%   1260
-  90%   1545
-  95%   1809
-  98%   2370
-  99%   2910
- 100%   3391 (longest request)
+  50%    799
+  66%    890
+  75%    956
+  80%   1004
+  90%   1136
+  95%   1215
+  98%   1350
+  99%   1427
+ 100%   1967 (longest request)

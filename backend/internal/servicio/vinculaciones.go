@@ -136,7 +136,7 @@ func (s *Vinculaciones) Rectificar(ctx context.Context, actor auth.Actor, id str
 	if err := exigirRol(actor, dominio.RolAdministrador); err != nil {
 		return dominio.Vinculacion{}, err
 	}
-	motivo, err := dominio.Texto("el motivo", r.Motivo, true, 1000)
+	motivo, err := dominio.Texto("el motivo", r.Motivo, true, dominio.LongitudMaxMotivo)
 	if err != nil {
 		return dominio.Vinculacion{}, err
 	}

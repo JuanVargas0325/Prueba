@@ -76,3 +76,35 @@ func RegistrarPeticiones(log *slog.Logger) gin.HandlerFunc {
 		)
 	}
 }
+
+// CORS permite que un frontend servido desde otro origen (otro dominio o
+// puerto, por ejemplo un bucket o http://localhost:5173) llame a la API desde
+// el navegador. Solo se aceptan los orígenes configurados; "*" acepta cualquiera.
+// Las peticiones sin cabecera Origin (Postman, curl, otro servidor) no cambian.
+func CORS(origenes []string) gin.HandlerFunc {
+	permitidos := map[string]bool{}
+	for _, o := range origenes {
+		permitidos[o] = true
+	}
+	return func(c *gin.Context) {
+		origen := c.GetHeader("Origin")
+		if origen == "" || (!permitidos["*"] && !permitidos[origen]) {
+			c.Next()
+			return
+		}
+		cabeceras := c.Writer.Header()
+		cabeceras.Set("Access-Control-Allow-Origin", origen)
+		cabeceras.Add("Vary", "Origin")
+		// Consulta previa (preflight): el navegador pregunta si puede enviar la petición real.
+		if c.Request.Method == http.MethodOptions && c.GetHeader("Access-Control-Request-Method") != "" {
+			cabeceras.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE")
+			cabeceras.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			cabeceras.Set("Access-Control-Max-Age", "600")
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		// Permite que el frontend lea el nombre de los archivos descargados.
+		cabeceras.Set("Access-Control-Expose-Headers", "Content-Disposition, Location")
+		c.Next()
+	}
+}

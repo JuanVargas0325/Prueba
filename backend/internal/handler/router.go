@@ -27,7 +27,9 @@ type Dependencias struct {
 	Salud  map[string]ComprobadorSalud
 	// MaxCuerpoArchivosMB limita las peticiones que traen archivos adjuntos.
 	MaxCuerpoArchivosMB int
-	Log                 *slog.Logger
+	// OrigenesCORS son los orígenes de los frontends que pueden usar la API.
+	OrigenesCORS []string
+	Log          *slog.Logger
 }
 
 // modulo es un grupo de endpoints que declara sus propias rutas.
@@ -40,7 +42,7 @@ type modulo interface {
 // a la lista de módulos.
 func NuevoRouter(d Dependencias) *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Recovery(), RegistrarPeticiones(d.Log))
+	r.Use(gin.Recovery(), RegistrarPeticiones(d.Log), CORS(d.OrigenesCORS))
 	// Detrás de Nginx la IP del cliente llega en X-Forwarded-For.
 	_ = r.SetTrustedProxies([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1"})
 	r.MaxMultipartMemory = 8 << 20 // el resto de cada archivo se guarda en disco temporal

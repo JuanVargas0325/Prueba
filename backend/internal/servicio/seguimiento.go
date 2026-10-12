@@ -90,10 +90,11 @@ func (s *Seguimiento) PersonasACargo(ctx context.Context, actor auth.Actor, f Fi
 	}
 
 	personas := dominio.AgruparPorPersona(vinculaciones)
+	tareasDe := tareasPorPersona(vinculaciones, tareas)
 	resultado := make([]ResumenPersona, 0, len(personas))
 	for _, p := range personas {
 		r := ResumenPersona{PersonaACargo: p}
-		for _, semana := range dominio.ConstruirSemanas(p.Vinculaciones, tareas, anterior, actual, s.reloj.Ahora(), s.reloj.Zona()) {
+		for _, semana := range dominio.ConstruirSemanas(p.Vinculaciones, tareasDe[p.UsuarioID], anterior, actual, s.reloj.Ahora(), s.reloj.Zona()) {
 			semana := semana
 			if semana.SemanaInicio.Equal(actual) {
 				r.SemanaActual = &semana
@@ -190,6 +191,21 @@ func (s *Seguimiento) rangoSemanas(desde, hasta *time.Time) (time.Time, time.Tim
 		return inicio, fin, apperr.Validacion("el rango máximo de consulta es de %d semanas", dominio.MaxSemanasConsulta)
 	}
 	return inicio, fin, nil
+}
+
+// tareasPorPersona reparte las tareas según la persona dueña de cada
+// vinculación, para que cada persona procese solo las suyas.
+func tareasPorPersona(vinculaciones []dominio.Vinculacion, tareas []dominio.Tarea) map[string][]dominio.Tarea {
+	duenoDe := make(map[string]string, len(vinculaciones))
+	for _, v := range vinculaciones {
+		duenoDe[v.ID] = v.UsuarioID
+	}
+	resultado := map[string][]dominio.Tarea{}
+	for _, t := range tareas {
+		persona := duenoDe[t.VinculacionID]
+		resultado[persona] = append(resultado[persona], t)
+	}
+	return resultado
 }
 
 func idsDe(vinculaciones []dominio.Vinculacion) []string {

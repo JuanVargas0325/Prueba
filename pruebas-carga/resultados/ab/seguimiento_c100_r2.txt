@@ -3,7 +3,7 @@ Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
 Licensed to The Apache Software Foundation, http://www.apache.org/
 
 Benchmarking nginx (be patient)
-Finished 11169 requests
+Finished 56706 requests
 
 
 Server Software:        nginx
@@ -14,31 +14,31 @@ Document Path:          /api/v1/seguimiento/personas
 Document Length:        26743 bytes
 
 Concurrency Level:      100
-Time taken for tests:   15.001 seconds
-Complete requests:      11169
+Time taken for tests:   15.000 seconds
+Complete requests:      56706
 Failed requests:        0
 Keep-Alive requests:    0
-Total transferred:      300222720 bytes
-HTML transferred:       298692567 bytes
-Requests per second:    744.56 [#/sec] (mean)
-Time per request:       134.308 [ms] (mean)
-Time per request:       1.343 [ms] (mean, across all concurrent requests)
-Transfer rate:          19544.57 [Kbytes/sec] received
+Total transferred:      1524285952 bytes
+HTML transferred:       1516516956 bytes
+Requests per second:    3780.40 [#/sec] (mean)
+Time per request:       26.452 [ms] (mean)
+Time per request:       0.265 [ms] (mean, across all concurrent requests)
+Transfer rate:          99237.33 [Kbytes/sec] received
 
 Connection Times (ms)
               min  mean[+/-sd] median   max
-Connect:        0    0   0.5      0       7
-Processing:    17  133  30.6    129     302
-Waiting:        8  133  30.6    129     302
-Total:         17  134  30.6    130     302
+Connect:        0    0   0.2      0       4
+Processing:     6   26   3.5     26      57
+Waiting:        1   26   3.5     25      53
+Total:          6   26   3.5     26      57
 
 Percentage of the requests served within a certain time (ms)
-  50%    130
-  66%    142
-  75%    151
-  80%    157
-  90%    174
-  95%    190
-  98%    208
-  99%    222
- 100%    302 (longest request)
+  50%     26
+  66%     27
+  75%     28
+  80%     29
+  90%     31
+  95%     33
+  98%     36
+  99%     38
+ 100%     57 (longest request)

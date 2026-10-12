@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"seguimiento/internal/almacenamiento"
 )
 
 const secretoValido = "un-secreto-de-prueba-con-mas-de-32-caracteres"
@@ -26,7 +28,8 @@ func TestCargarConstruyeLaURLDesdeVariablesDePostgres(t *testing.T) {
 	if strings.Contains(c.BaseDatos, "cl@ve:con/") {
 		t.Error("la contraseña debería ir codificada en la URL")
 	}
-	if c.LLM.Proveedor != "simulado" || c.Worker.MaxReintentos != 3 || c.JWT.Expiracion != 8*time.Hour {
+	if c.LLM.Proveedor != "simulado" || c.Almacenamiento != (almacenamiento.Config{Tipo: "local", Ruta: "/data"}) ||
+		c.Worker.MaxReintentos != 3 || c.JWT.Expiracion != 8*time.Hour {
 		t.Errorf("valores por defecto inesperados: %+v", c)
 	}
 	if c.ZonaHoraria.String() != "America/Bogota" {
@@ -64,5 +67,14 @@ func TestCargarValidaFormatos(t *testing.T) {
 	}
 	if c.LLM.Temperatura == nil || *c.LLM.Temperatura != 0.2 {
 		t.Error("la temperatura debería leerse como decimal")
+	}
+}
+
+func TestListaSeparaPorComas(t *testing.T) {
+	t.Setenv("CORS_ORIGENES", " http://localhost:5173 ,, https://ejemplo.com")
+
+	origenes := lista("CORS_ORIGENES")
+	if len(origenes) != 2 || origenes[0] != "http://localhost:5173" || origenes[1] != "https://ejemplo.com" {
+		t.Errorf("orígenes = %q", origenes)
 	}
 }

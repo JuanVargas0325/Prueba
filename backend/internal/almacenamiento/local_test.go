@@ -53,3 +53,12 @@ func TestRutasFueraDeLaRaizSonRechazadas(t *testing.T) {
 		}
 	}
 }
+
+func TestNuevoEligeElTipo(t *testing.T) {
+	if _, err := Nuevo(Config{Tipo: TipoLocal, Ruta: t.TempDir()}); err != nil {
+		t.Fatalf("local: %v", err)
+	}
+	if _, err := Nuevo(Config{Tipo: "nube"}); err == nil {
+		t.Error("un tipo desconocido debería ser un error")
+	}
+}

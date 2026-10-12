@@ -45,8 +45,8 @@ func leerArchivos(form *multipart.Form) ([]servicio.ArchivoAdjunto, func(), erro
 	for _, cabecera := range form.File[campoAdjuntos] {
 		f, err := cabecera.Open()
 		if err != nil {
-			cerrar()
-			return nil, func() { /* los archivos ya abiertos se cerraron arriba */ }, apperr.Validacion("no fue posible leer el archivo %q", cabecera.Filename)
+			cerrar() // cierra los que ya se habían abierto
+			return nil, func() {}, apperr.Validacion("no fue posible leer el archivo %q", cabecera.Filename)
 		}
 		abiertos = append(abiertos, f)
 		archivos = append(archivos, servicio.ArchivoAdjunto{Nombre: cabecera.Filename, Contenido: f})
@@ -83,11 +83,18 @@ func disposicionAdjunto(nombre string) string {
 	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, nombreASCII(nombre), url.PathEscape(nombre))
 }
 
+// quitarTildes convierte, por ejemplo, "Martínez" en "Martinez": separa cada
+// letra de su tilde (forma NFD), elimina las tildes (marcas Unicode Mn) y
+// vuelve a unir el texto (forma NFC).
+func quitarTildes(texto string) string {
+	sinTildes, _, _ := transform.String(transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC), texto)
+	return sinTildes
+}
+
 // nombreASCII elimina tildes y caracteres no seguros de un nombre de archivo.
 func nombreASCII(nombre string) string {
-	sinTildes, _, _ := transform.String(transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC), nombre)
 	var b strings.Builder
-	for _, r := range sinTildes {
+	for _, r := range quitarTildes(nombre) {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
 			b.WriteRune(r)
@@ -104,9 +111,8 @@ func nombreASCII(nombre string) string {
 // nombreArchivo convierte un nombre de persona en un texto seguro para un
 // nombre de archivo: sin tildes, en minúsculas y con guiones.
 func nombreArchivo(nombre string) string {
-	sinTildes, _, _ := transform.String(transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC), nombre)
 	var b strings.Builder
-	for _, r := range strings.ToLower(sinTildes) {
+	for _, r := range strings.ToLower(quitarTildes(nombre)) {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)

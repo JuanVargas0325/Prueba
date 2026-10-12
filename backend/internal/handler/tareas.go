@@ -130,38 +130,39 @@ func (p peticionActualizarTarea) datos() dominio.DatosTarea {
 		HorasInvertidas: p.HorasInvertidas, Observaciones: p.Observaciones}
 }
 
+// leerPeticionTarea lee la tarea de un JSON o, si la petición es multipart, del
+// campo "datos" junto con los archivos del campo "adjuntos". cerrar libera los
+// archivos abiertos y siempre debe invocarse, incluso si hay error.
+func (h *HandlerTareas) leerPeticionTarea(c *gin.Context) (p peticionTarea, archivos []servicio.ArchivoAdjunto, cerrar func(), err error) {
+	cerrar = func() {}
+	if !esMultipart(c) {
+		return p, nil, cerrar, leerJSON(c, &p)
+	}
+	limitarCuerpo(c, h.maxCuerpo)
+	form, err := formularioMultipart(c)
+	if err != nil {
+		return p, nil, cerrar, err
+	}
+	datos := form.Value["datos"]
+	if len(datos) != 1 {
+		return p, nil, cerrar, apperr.Validacion("el formulario debe incluir el campo \"datos\" con el JSON de la tarea")
+	}
+	if err := decodificarJSON(strings.NewReader(datos[0]), &p); err != nil {
+		return p, nil, cerrar, err
+	}
+	archivos, cerrar, err = leerArchivos(form)
+	return p, archivos, cerrar, err
+}
+
 // --- endpoints ------------------------------------------------------------------
 
 // Crear registra una tarea (RF-06.1 a RF-06.6). Acepta JSON, o un formulario
 // multipart con el campo "datos" (el mismo JSON) y los archivos en "adjuntos",
 // para registrar la tarea y su evidencia en una sola operación.
 func (h *HandlerTareas) Crear(c *gin.Context) {
-	var p peticionTarea
-	var archivos []servicio.ArchivoAdjunto
-	if esMultipart(c) {
-		limitarCuerpo(c, h.maxCuerpo)
-		form, err := formularioMultipart(c)
-		if err != nil {
-			responderError(c, h.log, err)
-			return
-		}
-		datos := form.Value["datos"]
-		if len(datos) != 1 {
-			responderError(c, h.log, apperr.Validacion("el formulario debe incluir el campo \"datos\" con el JSON de la tarea"))
-			return
-		}
-		if err := decodificarJSON(strings.NewReader(datos[0]), &p); err != nil {
-			responderError(c, h.log, err)
-			return
-		}
-		var cerrar func()
-		archivos, cerrar, err = leerArchivos(form)
-		if err != nil {
-			responderError(c, h.log, err)
-			return
-		}
-		defer cerrar()
-	} else if err := leerJSON(c, &p); err != nil {
+	p, archivos, cerrar, err := h.leerPeticionTarea(c)
+	defer cerrar()
+	if err != nil {
 		responderError(c, h.log, err)
 		return
 	}

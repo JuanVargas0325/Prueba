@@ -3,7 +3,7 @@ Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
 Licensed to The Apache Software Foundation, http://www.apache.org/
 
 Benchmarking nginx (be patient)
-Finished 61861 requests
+Finished 79098 requests
 
 
 Server Software:        nginx
@@ -15,34 +15,34 @@ Document Length:        661 bytes
 
 Concurrency Level:      50
 Time taken for tests:   15.000 seconds
-Complete requests:      61861
-Failed requests:        6311
-   (Connect: 0, Receive: 0, Length: 6311, Exceptions: 0)
-Keep-Alive requests:    61811
-Total transferred:      55165746 bytes
-Total body sent:        38137176
-HTML transferred:       40876105 bytes
-Requests per second:    4124.00 [#/sec] (mean)
-Time per request:       12.124 [ms] (mean)
-Time per request:       0.242 [ms] (mean, across all concurrent requests)
-Transfer rate:          3591.46 [Kbytes/sec] received
-                        2482.85 kb/s sent
-                        6074.32 kb/s total
+Complete requests:      79098
+Failed requests:        7823
+   (Connect: 0, Receive: 0, Length: 7823, Exceptions: 0)
+Keep-Alive requests:    79048
+Total transferred:      70537764 bytes
+Total body sent:        48755168
+HTML transferred:       52266376 bytes
+Requests per second:    5273.04 [#/sec] (mean)
+Time per request:       9.482 [ms] (mean)
+Time per request:       0.190 [ms] (mean, across all concurrent requests)
+Transfer rate:          4592.16 [Kbytes/sec] received
+                        3174.07 kb/s sent
+                        7766.23 kb/s total
 
 Connection Times (ms)
               min  mean[+/-sd] median   max
-Connect:        0    0   0.1      0       4
-Processing:     5   12   3.8     11      42
-Waiting:        4   12   3.8     11      42
-Total:          5   12   3.8     11      42
+Connect:        0    0   0.0      0       2
+Processing:     6    9   1.2      9      27
+Waiting:        4    9   1.2      9      27
+Total:          6    9   1.2      9      27
 
 Percentage of the requests served within a certain time (ms)
-  50%     11
-  66%     11
-  75%     12
-  80%     13
-  90%     18
-  95%     21
-  98%     25
-  99%     26
- 100%     42 (longest request)
+  50%      9
+  66%     10
+  75%     10
+  80%     10
+  90%     11
+  95%     11
+  98%     12
+  99%     13
+ 100%     27 (longest request)

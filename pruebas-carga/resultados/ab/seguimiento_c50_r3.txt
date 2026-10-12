@@ -3,7 +3,7 @@ Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
 Licensed to The Apache Software Foundation, http://www.apache.org/
 
 Benchmarking nginx (be patient)
-Finished 11017 requests
+Finished 54068 requests
 
 
 Server Software:        nginx
@@ -15,30 +15,30 @@ Document Length:        26743 bytes
 
 Concurrency Level:      50
 Time taken for tests:   15.000 seconds
-Complete requests:      11017
+Complete requests:      54068
 Failed requests:        0
 Keep-Alive requests:    0
-Total transferred:      296136960 bytes
-HTML transferred:       294627631 bytes
-Requests per second:    734.45 [#/sec] (mean)
-Time per request:       68.078 [ms] (mean)
-Time per request:       1.362 [ms] (mean, across all concurrent requests)
-Transfer rate:          19279.28 [Kbytes/sec] received
+Total transferred:      1453436672 bytes
+HTML transferred:       1446028671 bytes
+Requests per second:    3604.53 [#/sec] (mean)
+Time per request:       13.871 [ms] (mean)
+Time per request:       0.277 [ms] (mean, across all concurrent requests)
+Transfer rate:          94624.66 [Kbytes/sec] received
 
 Connection Times (ms)
               min  mean[+/-sd] median   max
-Connect:        0    0   0.2      0       3
-Processing:     7   68  27.4     64     254
-Waiting:        7   67  27.3     63     253
-Total:          7   68  27.4     64     256
+Connect:        0    0   0.2      0       2
+Processing:     4   14   3.2     13      37
+Waiting:        2   13   3.1     13      35
+Total:          4   14   3.2     13      38
 
 Percentage of the requests served within a certain time (ms)
-  50%     64
-  66%     76
-  75%     84
-  80%     89
-  90%    104
-  95%    118
-  98%    133
-  99%    144
- 100%    256 (longest request)
+  50%     13
+  66%     15
+  75%     16
+  80%     16
+  90%     18
+  95%     20
+  98%     22
+  99%     23
+ 100%     38 (longest request)

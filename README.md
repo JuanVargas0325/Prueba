@@ -132,6 +132,8 @@ docker compose down -v                            # detener y BORRAR datos y arc
 
 Al arrancar, la API aplica las migraciones y crea el **administrador inicial** definido por `ADMIN_CORREO` y `ADMIN_PASSWORD`. Con él se crean los demás usuarios.
 
+Para que un frontend servido desde otro origen (por ejemplo `http://localhost:5173` o un bucket) pueda llamar a la API desde el navegador, agregue ese origen a `CORS_ORIGENES` en el `.env` (varios, separados por comas). Postman, curl y Newman no lo necesitan.
+
 ---
 
 ## Configurar el modelo de IA
@@ -272,7 +274,7 @@ sequenceDiagram
 | Carga | Apache Benchmark sobre tres escenarios con concurrencia creciente y tres repeticiones por nivel | `bash pruebas-carga/ejecutar.sh` (ver abajo) |
 | Estático | `gofmt`, `golangci-lint` (errcheck, govet, staticcheck, ineffassign, unused) y SonarQube | `make lint` |
 
-La cobertura con pruebas unitarias e integración es del 79 %, medida entre paquetes (`-coverpkg`). Las capas con lógica superan el 80 %: dominio 88 %, servicio 82 % y PDF 95 %. SonarQube reporta 0 bugs, 0 vulnerabilidades y 0 code smells.
+La cobertura con pruebas unitarias e integración es del 79 %, medida entre paquetes (`-coverpkg`). Las capas con lógica superan el 80 %: dominio 98 %, servicio 83 % y PDF 95 %. SonarQube reporta 0 bugs, 0 vulnerabilidades y 0 code smells.
 
 ### Integración continua
 
@@ -318,10 +320,11 @@ No edite las migraciones existentes. Cree `backend/internal/basedatos/migracione
 
 ### Próximas entregas (puntos de extensión ya previstos)
 
-- **Cloud Storage (E2/E3):** implemente la interfaz `servicio.Almacenamiento` y cámbiela en `cmd/api` y `cmd/worker`.
+- **Cloud Storage (E2):** cree `internal/almacenamiento/gcs.go` con los mismos métodos (`Guardar`, `Abrir`, `Eliminar`) y agregue un `case` en `almacenamiento.Nuevo` para un nuevo valor de `ALMACENAMIENTO_TIPO`. Ni los servicios ni `cmd/api` ni `cmd/worker` cambian.
 - **Cloud SQL (E2):** basta con `DATABASE_URL`.
 - **Pub/Sub (E4):** implemente `servicio.Encolador` y un consumidor que llame a `servicio.GeneradorReportes`.
-- **Frontend (E2):** consume esta misma API; el campo `modificable` de las tareas indica qué acciones mostrar.
+- **Frontend (E2):** consume esta misma API; el campo `modificable` de las tareas indica qué acciones mostrar. Configure su origen en `CORS_ORIGENES`.
+- **Pruebas de carga (E2 a E4):** el enunciado exige k6, Locust, Artillery o JMeter, la misma en las tres entregas. La comparación y la recomendación (k6) están en la página de la Wiki *Entrega 1 – Pruebas de carga*.
 
 ### Reglas de trabajo
 

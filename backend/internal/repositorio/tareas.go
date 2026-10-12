@@ -107,8 +107,27 @@ func (r *Tareas) Listar(ctx context.Context, f dominio.FiltroTareas) ([]dominio.
 	return tareas, traducir(err, recursoTareas)
 }
 
+// selectTareaPropia lee solo las columnas de la tabla tareas, sin datos de
+// usuarios, espacios ni adjuntos.
+const selectTareaPropia = `
+	SELECT t.id, t.vinculacion_id, t.semana_inicio, t.titulo, t.descripcion, t.estado,
+	       t.horas_invertidas, t.observaciones, t.tardia
+	FROM tareas t`
+
+func escanearTareaPropia(fila pgx.Row) (dominio.Tarea, error) {
+	var t dominio.Tarea
+	var estado string
+	err := fila.Scan(&t.ID, &t.VinculacionID, &t.SemanaInicio, &t.Titulo, &t.Descripcion, &estado,
+		&t.HorasInvertidas, &t.Observaciones, &t.Tardia)
+	t.Estado = dominio.EstadoTarea(estado)
+	return t, err
+}
+
 // ListarPorVinculaciones devuelve todas las tareas de las vinculaciones dadas,
 // opcionalmente limitadas a las semanas entre desde y hasta (ambas incluidas).
+// Es la consulta que más filas procesa (la usa el seguimiento), así que solo
+// trae las columnas propias de cada tarea: quien la llama ya conoce las
+// vinculaciones y no necesita repetir sus datos en cada fila.
 func (r *Tareas) ListarPorVinculaciones(ctx context.Context, vinculacionIDs []string, desde, hasta *time.Time) ([]dominio.Tarea, error) {
 	if len(vinculacionIDs) == 0 {
 		return []dominio.Tarea{}, nil
@@ -121,11 +140,11 @@ func (r *Tareas) ListarPorVinculaciones(ctx context.Context, vinculacionIDs []st
 	if hasta != nil {
 		w.agregar("t.semana_inicio <= ?", *hasta)
 	}
-	filas, err := r.db.Query(ctx, selectTarea+w.where()+` ORDER BY t.semana_inicio DESC, t.creado_en`, w.args...)
+	filas, err := r.db.Query(ctx, selectTareaPropia+w.where()+` ORDER BY t.semana_inicio DESC, t.creado_en`, w.args...)
 	if err != nil {
 		return nil, traducir(err, recursoTareas)
 	}
-	tareas, err := recolectar(filas, escanearTarea)
+	tareas, err := recolectar(filas, escanearTareaPropia)
 	return tareas, traducir(err, recursoTareas)
 }
 

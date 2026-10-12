@@ -331,6 +331,47 @@ func TestTareasYAdjuntos(t *testing.T) {
 	}
 }
 
+// TestListarPorVinculaciones verifica la consulta liviana del seguimiento:
+// filtra por vinculaciones y rango de semanas y trae las columnas de la tarea.
+func TestListarPorVinculaciones(t *testing.T) {
+	db := conectar(t)
+	ctx := context.Background()
+	e := crearEscenario(t, db)
+	v, err := vincular(t, repositorio.NuevoVinculaciones(db), e.laura, e.curso, dominio.RolMonitor, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := repositorio.NuevoTareas(db)
+	for _, semana := range []string{"2026-09-28", "2026-10-05", "2026-10-12"} {
+		_, err := repo.Crear(ctx, dominio.Tarea{ID: uuid.NewString(), VinculacionID: v.ID, SemanaInicio: fecha(t, semana),
+			Titulo: "Tarea " + semana, Estado: dominio.TareaEnDesarrollo, HorasInvertidas: 2}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	desde, hasta := fecha(t, "2026-10-05"), fecha(t, "2026-10-12")
+	tareas, err := repo.ListarPorVinculaciones(ctx, []string{v.ID}, &desde, &hasta)
+	if err != nil || len(tareas) != 2 {
+		t.Fatalf("se esperaban las 2 tareas del rango: %d %v", len(tareas), err)
+	}
+	// De la semana más reciente a la más antigua, con los datos propios de la tarea.
+	primera := tareas[0]
+	if !primera.SemanaInicio.Equal(hasta) || primera.VinculacionID != v.ID || primera.Estado != dominio.TareaEnDesarrollo ||
+		primera.HorasInvertidas != 2 || primera.Titulo != "Tarea 2026-10-12" {
+		t.Errorf("tarea inesperada: %+v", primera)
+	}
+
+	todas, err := repo.ListarPorVinculaciones(ctx, []string{v.ID}, nil, nil)
+	if err != nil || len(todas) != 3 {
+		t.Errorf("sin rango deberían ser 3 tareas: %d %v", len(todas), err)
+	}
+	ninguna, err := repo.ListarPorVinculaciones(ctx, nil, nil, nil)
+	if err != nil || len(ninguna) != 0 {
+		t.Errorf("sin vinculaciones no debería haber tareas: %d %v", len(ninguna), err)
+	}
+}
+
 // loteDePrueba es un lote con dos reportes pendientes: Laura (con una tarea
 // en la semana) y Andrés (sin tareas).
 type loteDePrueba struct {

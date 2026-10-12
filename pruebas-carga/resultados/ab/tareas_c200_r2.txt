@@ -3,7 +3,7 @@ Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
 Licensed to The Apache Software Foundation, http://www.apache.org/
 
 Benchmarking nginx (be patient)
-Finished 66666 requests
+Finished 76173 requests
 
 
 Server Software:        nginx
@@ -14,35 +14,35 @@ Document Path:          /api/v1/tareas
 Document Length:        661 bytes
 
 Concurrency Level:      200
-Time taken for tests:   15.000 seconds
-Complete requests:      66666
-Failed requests:        6630
-   (Connect: 0, Receive: 0, Length: 6630, Exceptions: 0)
-Keep-Alive requests:    66666
-Total transferred:      59451242 bytes
-Total body sent:        41189456
-HTML transferred:       44051396 bytes
-Requests per second:    4444.40 [#/sec] (mean)
-Time per request:       45.000 [ms] (mean)
-Time per request:       0.225 [ms] (mean, across all concurrent requests)
-Transfer rate:          3870.52 [Kbytes/sec] received
-                        2681.60 kb/s sent
-                        6552.12 kb/s total
+Time taken for tests:   15.001 seconds
+Complete requests:      76173
+Failed requests:        7524
+   (Connect: 0, Receive: 0, Length: 7524, Exceptions: 0)
+Keep-Alive requests:    76173
+Total transferred:      67929610 bytes
+Total body sent:        47045768
+HTML transferred:       50333647 bytes
+Requests per second:    5077.71 [#/sec] (mean)
+Time per request:       39.388 [ms] (mean)
+Time per request:       0.197 [ms] (mean, across all concurrent requests)
+Transfer rate:          4422.07 [Kbytes/sec] received
+                        3062.58 kb/s sent
+                        7484.65 kb/s total
 
 Connection Times (ms)
               min  mean[+/-sd] median   max
-Connect:        0    0   0.5      0      11
-Processing:    14   45   6.9     43     112
-Waiting:        4   45   6.9     43     112
-Total:         14   45   7.0     43     112
+Connect:        0    0   0.4      0      10
+Processing:    13   39   3.9     38      78
+Waiting:        3   39   3.9     38      78
+Total:         13   39   3.9     38      78
 
 Percentage of the requests served within a certain time (ms)
-  50%     43
-  66%     44
-  75%     46
-  80%     47
-  90%     50
-  95%     54
-  98%     62
-  99%     77
- 100%    112 (longest request)
+  50%     38
+  66%     39
+  75%     40
+  80%     41
+  90%     43
+  95%     46
+  98%     49
+  99%     51
+ 100%     78 (longest request)

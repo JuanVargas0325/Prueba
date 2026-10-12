@@ -46,7 +46,7 @@ func ejecutar(log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	almacen, err := almacenamiento.NuevoLocal(cfg.RutaAlmacenamiento)
+	almacen, err := almacenamiento.Nuevo(cfg.Almacenamiento)
 	if err != nil {
 		return err
 	}

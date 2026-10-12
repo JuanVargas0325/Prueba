@@ -65,7 +65,7 @@ func ejecutar(log *slog.Logger) error {
 	)
 
 	// Infraestructura
-	almacen, err := almacenamiento.NuevoLocal(cfg.RutaAlmacenamiento)
+	almacen, err := almacenamiento.Nuevo(cfg.Almacenamiento)
 	if err != nil {
 		return err
 	}
@@ -101,6 +101,7 @@ func ejecutar(log *slog.Logger) error {
 		Tokens:        tokens,
 		// Todos los adjuntos de una tarea más un margen para los demás campos.
 		MaxCuerpoArchivosMB: cfg.MaxAdjuntoMB*dominio.MaxAdjuntosPorTarea + 1,
+		OrigenesCORS:        cfg.OrigenesCORS,
 		Log:                 log,
 		Salud: map[string]handler.ComprobadorSalud{
 			"postgres": db.Ping,

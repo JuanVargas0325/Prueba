@@ -106,6 +106,42 @@ func TestRutasProtegidasExigenToken(t *testing.T) {
 	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/tareas", "token-invalido", ""), http.StatusUnauthorized)
 }
 
+func TestCORS(t *testing.T) {
+	e := nuevoEntorno(t, func(d *Dependencias) { d.OrigenesCORS = []string{"http://localhost:5173"} })
+	conOrigen := func(metodo, origen string, cabeceras ...string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(metodo, "/salud", nil)
+		req.Header.Set("Origin", origen)
+		for i := 0; i+1 < len(cabeceras); i += 2 {
+			req.Header.Set(cabeceras[i], cabeceras[i+1])
+		}
+		w := httptest.NewRecorder()
+		e.router.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("origen permitido", func(t *testing.T) {
+		w := conOrigen(http.MethodGet, "http://localhost:5173")
+		esperarEstado(t, w, http.StatusOK)
+		if w.Header().Get("Access-Control-Allow-Origin") != "http://localhost:5173" {
+			t.Errorf("cabeceras = %v", w.Header())
+		}
+	})
+	t.Run("consulta previa", func(t *testing.T) {
+		w := conOrigen(http.MethodOptions, "http://localhost:5173", "Access-Control-Request-Method", "POST")
+		esperarEstado(t, w, http.StatusNoContent)
+		if w.Header().Get("Access-Control-Allow-Headers") == "" {
+			t.Errorf("faltan las cabeceras permitidas: %v", w.Header())
+		}
+	})
+	t.Run("origen no permitido", func(t *testing.T) {
+		w := conOrigen(http.MethodGet, "https://otro.com")
+		esperarEstado(t, w, http.StatusOK)
+		if w.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Error("no debería permitir un origen que no está configurado")
+		}
+	})
+}
+
 func TestRutaInexistenteYMetodoNoPermitido(t *testing.T) {
 	e := nuevoEntorno(t, nil)
 	esperarEstado(t, e.peticion(http.MethodGet, "/no-existe", "", ""), http.StatusNotFound)
