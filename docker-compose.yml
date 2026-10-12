@@ -1,0 +1,43 @@
+# Despliegue local.
+#   1. cp .env.example .env   (y ajustar los valores)
+#   2. docker compose up --build -d
+#   3. La API queda disponible en http://localhost:8080.
+
+name: seguimiento
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - datos-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Para conectarse desde una herramienta local (DBeaver, pgAdmin), descomente:
+    # ports:
+    #   - "5433:5432"
+
+  api:
+    build:
+      context: ./backend
+      target: api
+    image: seguimiento-api:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+volumes:
+  datos-postgres:

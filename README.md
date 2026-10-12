@@ -1,180 +1,190 @@
-# Paso 5 · Dockerfile de la API
+# Paso 6 · Docker Compose con PostgreSQL y la API
 
-> Rama `paso-a-paso` · paso 5 de 65 · anterior: **Paso 4 · Migraciones y esquema** · siguiente: **Paso 6 · Docker Compose con PostgreSQL y la API**
+> Rama `paso-a-paso` · paso 6 de 65 · anterior: **Paso 5 · Dockerfile de la API** · siguiente: **Paso 7 · Nginx como proxy inverso**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-La API se puede empaquetar como **imagen de Docker** basada en **Linux Debian 12 (bookworm)**.
+Con **un solo comando** se levanta la base de datos y la API, ya conectadas entre sí.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/Dockerfile` | **Nuevo.** Construcción en varias etapas: compila con Go y copia solo el binario a una imagen Debian mínima. |
-| `backend/.dockerignore` | **Nuevo.** Archivos que no se envían a Docker al construir. |
+| `docker-compose.yml` | **Nuevo.** Define dos servicios (`postgres` y `api`), la red entre ellos y un volumen para los datos. |
+| `Makefile` | **Nuevo.** Atajos: `make arriba`, `make abajo`, `make logs`, `make ayuda`. |
 
 ```bash
-cd backend
-docker build --target api -t seguimiento-api .
+cp .env.example .env          # una sola vez; edite las contraseñas
+docker compose up --build -d --wait
+curl http://localhost:8080/salud
+# {"estado":"ok","componentes":{"postgres":"ok"}}
 ```
-
-La imagen resultante pesa unos 150 MB, frente a unos 900 MB de la imagen con el compilador de Go. Ejecuta la API como un usuario sin privilegios y Docker sabe si está sana gracias a un *healthcheck* sobre `/salud`.
 
 ---
 
 ## 2. Por qué
 
-- **Entregable de la Entrega 1:** el enunciado exige "archivos `Dockerfile`" para ejecutar el sistema de forma reproducible.
-- **Stack del curso:** Linux **Debian** o Ubuntu. Todas las imágenes del proyecto usan Debian 12 (`bookworm`).
-- **Reproducibilidad:** la imagen contiene el programa y todo lo que necesita. Funciona igual en su equipo, en el de sus compañeros, en GitHub Actions y en la nube.
-- **Imagen multietapa:** para compilar se necesita Go (cientos de MB); para ejecutar, solo el binario. Separar las etapas produce una imagen final pequeña, que se descarga y arranca más rápido y tiene menos programas que puedan tener vulnerabilidades.
+- **Entregable de la Entrega 1:** el enunciado pide un `docker-compose.yml` que permita "levantar el sistema de forma local y controlada".
+- **Sin Compose** había que crear la red, el volumen y los dos contenedores a mano, con el orden y las variables correctas (paso 5). Compose describe todo eso **en un archivo versionado**: cualquier integrante obtiene exactamente el mismo entorno.
+- **Un solo `.env` para todo:** las mismas variables (`POSTGRES_USER`, etc.) configuran el contenedor de PostgreSQL y la API (paso 3).
 
 ---
 
-## 3. Explicación detallada del `Dockerfile`
+## 3. Explicación detallada
 
-Un `Dockerfile` es una receta: cada instrucción crea una **capa** de la imagen. Docker guarda las capas en caché y solo reconstruye desde la primera que cambió.
+### 3.1 `docker-compose.yml`
 
-### Etapa 1 · Compilación
-
-```dockerfile
-FROM golang:1.26-bookworm AS compilacion
-WORKDIR /src
+```yaml
+name: seguimiento
 ```
-- `FROM` parte de una imagen existente: la oficial de Go 1.26 sobre Debian 12. `AS compilacion` le da nombre a la etapa para referirse a ella después.
-- `WORKDIR /src` crea la carpeta `/src` y se ubica en ella.
+- Nombre del proyecto. Compose lo usa como prefijo de contenedores, redes y volúmenes (`seguimiento-api-1`, `seguimiento_datos-postgres`).
 
-```dockerfile
-COPY go.mod go.sum ./
-RUN go mod download
+#### Servicio `postgres`
+
+```yaml
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
 ```
-- Primero se copian **solo** `go.mod` y `go.sum` y se descargan las dependencias.
-- **Truco de caché:** las dependencias cambian poco y el código cambia mucho. Al copiarlas por separado, si solo cambió el código Docker reutiliza la capa de dependencias ya descargadas y la construcción tarda segundos en lugar de minutos.
+- Imagen oficial de PostgreSQL 16 sobre Debian 12.
+- `restart: unless-stopped`: si el contenedor se cae, Docker lo reinicia, salvo que usted lo haya detenido a propósito.
+- `${POSTGRES_USER}`: **interpolación**. Compose lee el `.env` de la misma carpeta y reemplaza el valor. Con estas tres variables, la imagen crea el usuario y la base de datos la primera vez que arranca.
 
-```dockerfile
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /salida/api ./cmd/api
+```yaml
+    volumes:
+      - datos-postgres:/var/lib/postgresql/data
 ```
-- Copia el resto del código (menos lo excluido en `.dockerignore`) y compila.
-- `CGO_ENABLED=0`: compila sin depender de librerías de C del sistema. El binario es **estático** y funciona en cualquier Linux.
-- `GOOS=linux`: el sistema operativo destino.
-- `-trimpath`: quita del binario las rutas del equipo donde se compiló (reproducibilidad y privacidad).
-- `-ldflags="-s -w"`: quita la información de depuración; el binario queda más pequeño (unos 18 MB).
-- `-o /salida/api`: dónde dejar el ejecutable. `./cmd/api` es el programa a compilar.
+- Un **volumen con nombre** guarda los archivos de la base de datos **fuera** del contenedor. Si el contenedor se borra o se recrea, los datos siguen ahí.
 
-### Etapa 2 · Base de ejecución
-
-```dockerfile
-FROM debian:bookworm-slim AS base
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates tzdata wget \
- && rm -rf /var/lib/apt/lists/* \
- && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
-USER app
+```yaml
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 ```
-- `debian:bookworm-slim`: Debian 12 en su versión reducida (sin documentación ni herramientas extra).
-- Se instalan solo tres paquetes:
-  - `ca-certificates`: certificados de las autoridades de confianza, necesarios para llamadas **HTTPS** salientes (en el paso 52 la API de IA);
-  - `tzdata`: zonas horarias del sistema (el binario ya trae las suyas desde el paso 1, pero así también las tienen otras herramientas);
-  - `wget`: lo usa el *healthcheck* para consultar `/salud`.
-- `--no-install-recommends` evita instalar paquetes "sugeridos" que no se necesitan.
-- `rm -rf /var/lib/apt/lists/*` borra los índices de paquetes descargados (unos 20 MB que ya no sirven).
-- Todo va en **un solo `RUN`** unido con `&&`. Si se hiciera en varios, los archivos borrados seguirían ocupando espacio en la capa anterior.
-- `useradd ... app` crea un usuario sin contraseña, sin carpeta personal y sin shell. `USER app` hace que todo lo siguiente corra con ese usuario. **Por seguridad:** si alguien encontrara una falla en la API, no tendría permisos de administrador (`root`) dentro del contenedor.
-- La etapa se llama `base` porque en el paso 55 la reutilizará también el worker.
+- `pg_isready` es una herramienta de PostgreSQL que responde si la base de datos acepta conexiones.
+- `$${...}` con **doble `$`**: le dice a Compose "no reemplaces esto tú"; queda como `${POSTGRES_USER}` y lo resuelve el shell **dentro** del contenedor, que tiene esas variables.
 
-### Etapa 3 · API
-
-```dockerfile
-FROM base AS api
-COPY --from=compilacion /salida/api /usr/local/bin/api
-EXPOSE 8080
+```yaml
+    # ports:
+    #   - "5433:5432"
 ```
-- Parte de `base` y copia **únicamente el binario** desde la etapa de compilación. El compilador, el código fuente y las dependencias no llegan a la imagen final.
-- `EXPOSE 8080` documenta en qué puerto escucha. No publica el puerto por sí solo; eso lo hace `docker run -p` o Docker Compose.
+- La base de datos **no se publica** en su computador: solo la API la alcanza, por la red interna. Si quiere explorarla con DBeaver o pgAdmin, descomente estas líneas (se usa 5433 para no chocar con un PostgreSQL que ya tenga instalado).
 
-```dockerfile
-HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=5 \
-  CMD wget -qO- http://127.0.0.1:8080/salud >/dev/null || exit 1
-```
-- Docker ejecuta este comando **dentro del contenedor** cada 10 segundos. Si `/salud` no responde 200 en 3 segundos, cuenta un fallo; con 5 fallos seguidos marca el contenedor como `unhealthy`.
-- `--start-period=20s`: margen inicial (por ejemplo, mientras espera a PostgreSQL) en el que los fallos no cuentan.
-- `wget -qO-` descarga la URL en silencio. Si la respuesta no es exitosa (por ejemplo, 503), `wget` termina con error y `|| exit 1` lo reporta.
-- Se usa `127.0.0.1` porque se consulta a sí mismo.
-- En el paso 6, Docker Compose esperará a que este estado sea `healthy` antes de dar por arrancado el sistema.
+#### Servicio `api`
 
-```dockerfile
-ENTRYPOINT ["/usr/local/bin/api"]
+```yaml
+  api:
+    build:
+      context: ./backend
+      target: api
+    image: seguimiento-api:local
 ```
-- El programa que se ejecuta al iniciar el contenedor. La forma con corchetes (*exec form*) ejecuta el binario directamente, sin pasar por un shell; así recibe las señales de `docker stop` y puede hacer el apagado ordenado del paso 2.
+- `build`: Compose construye la imagen con el `Dockerfile` de `./backend`, hasta la etapa `api` (paso 5).
+- `image`: el nombre con el que se etiqueta la imagen construida.
 
-### `.dockerignore`
+```yaml
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+```
+- `env_file` pasa **todas** las variables del `.env` al contenedor de la API.
+- `environment` **sobrescribe** algunas: en su `.env`, `POSTGRES_HOST=localhost` (para ejecutar la API sin Docker), pero dentro de Compose la base de datos se llama `postgres`, el nombre del servicio. Compose crea una red donde **cada servicio es alcanzable por su nombre**.
 
+```yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
 ```
-*_test.go
-coverage.out
-*.pdf
-.env
+- La API no arranca hasta que PostgreSQL esté **sano** según su healthcheck. Los reintentos del paso 3 siguen siendo útiles: en la nube no siempre existe este orden de arranque.
+
+```yaml
+    ports:
+      - "8080:8080"
 ```
-- Lo que **no** se envía a Docker al construir: las pruebas (no se necesitan para compilar el programa), los reportes de cobertura, los PDF y, sobre todo, cualquier `.env` con secretos, para que nunca termine dentro de una imagen.
+- Publica el puerto: `puerto_de_su_equipo:puerto_del_contenedor`. Es temporal: en el paso 7 Nginx será la única entrada y la API dejará de estar expuesta.
+
+```yaml
+volumes:
+  datos-postgres:
+```
+- Declara el volumen con nombre que usa `postgres`.
+
+### 3.2 `Makefile`
+
+`make` es una herramienta clásica para guardar comandos con nombre. Cada objetivo tiene la forma:
+
+```makefile
+arriba: ## Construye y levanta todo el sistema (requiere .env)
+	docker compose up --build -d --wait
+```
+- El texto después de `##` es la descripción que muestra `make ayuda`.
+- **Las líneas de comandos deben empezar con un TAB**, no con espacios (regla de `make`).
+- `.PHONY` declara que estos nombres son acciones y no archivos.
+- `ayuda` busca con `grep` las líneas `objetivo: ## descripción` y las imprime con `awk`. En un `Makefile`, `$$` se escribe para obtener un `$` literal.
+
+| Comando | Equivale a |
+|---|---|
+| `make arriba` | `docker compose up --build -d --wait`: construye, levanta en segundo plano (`-d`) y **espera** (`--wait`) a que todos los servicios estén sanos. |
+| `make abajo` | `docker compose down`: detiene y borra los contenedores; **los datos del volumen se conservan**. |
+| `make logs` | `docker compose logs -f api`: muestra los logs de la API en vivo (Ctrl+C para salir). |
+| `make ayuda` | Lista los comandos disponibles. |
+
+En Windows, `make` está disponible en Git Bash (si se instaló con los extras), en WSL o con `winget install GnuWin32.Make`. Si no lo tiene, copie el comando de la columna derecha.
 
 ---
 
-## 4. Conceptos de Docker de este paso
+## 4. Conceptos de Docker Compose de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Imagen | Plantilla inmutable con el sistema de archivos y el programa. |
-| Contenedor | Una ejecución de una imagen. |
-| Capa | Resultado de cada instrucción; Docker las cachea. |
-| Multietapa | Varias `FROM` en un archivo; la imagen final copia solo lo necesario (`COPY --from`). |
-| `--target` | Construye hasta la etapa indicada (`api`; en el paso 55 también `worker`). |
-| `HEALTHCHECK` | Comando que Docker ejecuta para saber si el contenedor está sano. |
-| `USER` | Usuario con el que corre el proceso. |
+| Servicio | Un contenedor (o varios iguales) descrito en el archivo. |
+| Red por defecto | Compose crea una red donde los servicios se encuentran por su nombre. |
+| Volumen con nombre | Almacenamiento persistente que sobrevive a los contenedores. |
+| Interpolación `${VAR}` | Compose reemplaza valores con el `.env`; `$$` escapa el `$`. |
+| `env_file` / `environment` | Variables para el contenedor; `environment` tiene prioridad. |
+| `depends_on` + `service_healthy` | Orden de arranque basado en healthchecks. |
+| `--wait` | `up` no termina hasta que todo esté sano (o falle). |
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-docker build --target api -t seguimiento-api .
-docker images seguimiento-api               # ~150 MB
+cp .env.example .env
+# edite .env: al menos POSTGRES_PASSWORD
 
-# Red y base de datos de prueba
-docker network create red-prueba
-docker run -d --name pg --network red-prueba -e POSTGRES_USER=s -e POSTGRES_PASSWORD=s -e POSTGRES_DB=s postgres:16-bookworm
-
-# La API en contenedor, apuntando al contenedor "pg"
-docker run -d --name api --network red-prueba -p 8080:8080 \
-  -e POSTGRES_USER=s -e POSTGRES_PASSWORD=s -e POSTGRES_DB=s -e POSTGRES_HOST=pg seguimiento-api
-
-docker ps                       # después de unos segundos, la columna STATUS dice "(healthy)"
+docker compose up --build -d --wait     # o: make arriba
+docker compose ps                       # api y postgres "(healthy)"
 curl http://localhost:8080/salud
-docker exec api id              # uid=10001(app): no corre como root
+docker compose logs api                 # incluye "migración aplicada"
 
-# Limpieza
-docker rm -f api pg && docker network rm red-prueba
+docker compose down                     # o: make abajo
+docker compose up -d --wait             # los datos siguen: no vuelve a migrar
+docker compose down -v                  # -v borra también el volumen (¡todos los datos!)
 ```
-
-Dentro de una red de Docker, los contenedores se encuentran por su **nombre** (`POSTGRES_HOST=pg`). En el paso 6 Docker Compose crea esa red automáticamente.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 4
+## 6. Pasos para lograr esta versión desde el paso 5
 
-1. Crear `backend/Dockerfile` con las tres etapas (`compilacion`, `base`, `api`) de la sección 3.
-2. Crear `backend/.dockerignore` con las cuatro líneas de la sección 3.
-3. Construir y probar como en la sección 5.
-4. Commit: `git add . && git commit -m "Paso 5: Dockerfile de la API"`
+1. Crear `docker-compose.yml` en la raíz con los servicios `postgres` y `api` y el volumen `datos-postgres` (sección 3.1).
+2. Crear `Makefile` en la raíz con `ayuda`, `arriba`, `abajo` y `logs` (sección 3.2). Recuerde que los comandos van indentados con TAB.
+3. Crear su `.env`: `cp .env.example .env` (no se sube a Git).
+4. Levantar y comprobar (sección 5).
+5. Commit: `git add docker-compose.yml Makefile README.md && git commit -m "Paso 6: Docker Compose con PostgreSQL y la API"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- **La misma imagen sirve para la nube.** En la Entrega 2 se puede construir y ejecutar en una VM; en la Entrega 4, publicar en Artifact Registry y desplegar en Cloud Run.
-- **La etapa `base` compartida** permite agregar el worker (paso 55) u otros procesos sin duplicar la configuración del sistema operativo.
-- **El `HEALTHCHECK`** documenta cómo saber si la instancia está sana. Los grupos de instancias de la Entrega 3 usarán la misma ruta `/salud`.
+- **Cada servicio está aislado y se comunica por nombre y variables.** En la Entrega 2 la base de datos sale de Compose y pasa a ser un servicio administrado: la API seguirá igual, solo cambia `POSTGRES_HOST` o `DATABASE_URL`.
+- **El volumen con nombre** separa datos de contenedores; es la misma idea que el disco persistente de una VM.
 
 ---
 
@@ -182,6 +192,6 @@ Dentro de una red de Docker, los contenedores se encuentran por su **nombre** (`
 
 | Requisito | Cómo |
 |---|---|
-| Entregable: `Dockerfile` | Imagen multietapa de la API. |
-| Stack: Linux Debian | `golang:1.26-bookworm` y `debian:bookworm-slim`. |
-| RNF-01 / seguridad básica | Usuario sin privilegios, imagen mínima, sin secretos dentro de la imagen. |
+| Entregable: `docker-compose.yml` | Levanta la base de datos y la API de forma reproducible. |
+| Stack: Docker Compose, PostgreSQL | Servicios `postgres` y `api`. |
+| Lineamientos 10: reproducibilidad | Un comando, un archivo de configuración y documentación de cómo ejecutarlo. |
