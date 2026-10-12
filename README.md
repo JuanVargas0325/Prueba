@@ -1,247 +1,178 @@
-# Paso 11 · Dominio: usuarios, roles y validaciones
+# Paso 12 · Contraseñas (bcrypt) y tokens (JWT)
 
-> Rama `paso-a-paso` · paso 11 de 65 · anterior: **Paso 10 · Router por módulos** · siguiente: **Paso 12 · Contraseñas (bcrypt) y tokens (JWT)**
+> Rama `paso-a-paso` · paso 12 de 65 · anterior: **Paso 11 · Dominio de usuarios** · siguiente: **Paso 13 · Repositorio de usuarios**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el paquete **`dominio`**, el corazón del sistema: las entidades y las reglas de negocio **puras**, sin HTTP ni base de datos. Este paso agrega lo relativo a usuarios y las validaciones comunes.
+Se creó el paquete **`auth`** con las dos piezas técnicas de la autenticación local:
+
+1. **Guardar y verificar contraseñas** de forma segura con **bcrypt**.
+2. **Emitir y validar tokens JWT**, con los que el cliente demuestra quién es en cada petición.
+
+Además define `Actor`: "quién está haciendo esta operación y con qué roles".
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/dominio/usuario.go` | **Nuevo.** Tipo `Rol` con sus cuatro valores, entidad `Usuario` y filtro de consulta `FiltroUsuarios`. |
-| `backend/internal/dominio/validacion.go` | **Nuevo.** Límites de longitud, paginación y validación de textos, correos y contraseñas. |
-| `backend/internal/dominio/reglas_test.go` | **Nuevo.** Pruebas de correos, contraseñas y paginación. |
+| `backend/go.mod`, `go.sum` | Nuevas dependencias: `github.com/golang-jwt/jwt/v5 v5.3.1` y `golang.org/x/crypto v0.58.0` (bcrypt). |
+| `backend/internal/auth/auth.go` | **Nuevo.** `Actor`, `HashPassword`, `VerificarPassword` y `GestorTokens` (`Generar` / `Validar`). |
+| `backend/internal/auth/auth_test.go` | **Nuevo.** Cinco pruebas: hash, token de ida y vuelta, token expirado, firma ajena y roles. |
 
 ---
 
 ## 2. Por qué
 
-### ¿Por qué una capa de dominio?
-
-Las reglas de negocio (quién tiene qué rol, qué es un correo válido, cuántas horas puede tener un monitor) son lo más valioso del sistema y lo que más debe estar probado. Si viven mezcladas con SQL o con HTTP:
-- para probarlas habría que levantar una base de datos o hacer peticiones HTTP;
-- un cambio de tecnología (otra base de datos, una función serverless) obligaría a reescribirlas.
-
-En `dominio` las reglas son funciones normales de Go que reciben datos y devuelven resultados o errores. Se prueban en milisegundos y no dependen de nada externo (solo de `apperr`).
-
-### ¿Por qué empezar por usuarios?
-
-Todo lo demás depende de ellos: los profesores crean cursos, los monitores registran tareas, el administrador gestiona a todos. Y el primer módulo funcional será el inicio de sesión (pasos 12 a 17).
+- **RF-01.1 y RNF-03:** el sistema debe tener **autenticación local** (usuario y contraseña propios, sin Google ni otros proveedores) y control de acceso por roles.
+- **Nunca se guarda la contraseña.** Si alguien robara la base de datos, no debe poder leer las contraseñas. Se guarda un *hash*: un resultado del que no se puede volver a la contraseña original.
+- **¿Por qué tokens y no sesiones en el servidor?** Con sesiones, el servidor guarda "este usuario inició sesión" en memoria o en una base de datos, y todas las instancias de la API tendrían que compartir esa información. Con un **JWT**, el propio token lleva la información firmada; cualquier instancia que conozca el secreto puede validarlo sin consultar nada. Eso facilita escalar a varias instancias (Entrega 3).
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 `usuario.go`
+### 3.1 `Actor`
 
 ```go
-// Package dominio contiene las entidades, constantes y reglas puras del sistema.
-// No depende de HTTP ni de la base de datos, por lo que sus reglas se prueban
-// de forma aislada.
-package dominio
+type Actor struct {
+	UsuarioID string
+	Roles     []dominio.Rol
+}
+
+func (a Actor) TieneRol(rol dominio.Rol) bool { ... }
+func (a Actor) TieneAlgunRol(roles ...dominio.Rol) bool { ... }
+func (a Actor) EsAdministrador() bool { return a.TieneRol(dominio.RolAdministrador) }
 ```
 
-#### Roles
+- El `Actor` es lo que se obtiene de un token válido. Todos los servicios lo recibirán para decidir permisos (paso 18 en adelante).
+- `TieneAlgunRol(dominio.RolProfesor, dominio.RolAdministrador)`: ¿tiene al menos uno de estos roles? Es variádica (acepta cualquier cantidad).
+- `EsAdministrador` existe porque el administrador tiene **visibilidad global** (RN-05) y esa pregunta se hará muchas veces.
+
+### 3.2 Contraseñas con bcrypt
 
 ```go
-type Rol string
-
-const (
-	RolAdministrador     Rol = "administrador"
-	RolProfesor          Rol = "profesor"
-	RolMonitor           Rol = "monitor"
-	RolAsistenteGraduado Rol = "asistente_graduado"
-)
-```
-
-- Los cuatro roles del enunciado. Los valores en texto coinciden **exactamente** con el `CHECK` de la tabla `usuario_roles` (paso 4).
-
-```go
-var RolesValidos = []Rol{RolAdministrador, RolProfesor, RolMonitor, RolAsistenteGraduado}
-
-var RolesOperativos = []Rol{RolMonitor, RolAsistenteGraduado}
-```
-
-- `RolesValidos`: el catálogo completo, para validar lo que llega del exterior.
-- `RolesOperativos`: los roles de quienes **registran tareas** (monitores y asistentes graduados). Se usará para proteger las rutas de tareas (paso 37).
-- Son `var` y no `const` porque Go no admite constantes de tipo slice.
-
-```go
-func (r Rol) EsValido() bool {
-	for _, v := range RolesValidos {
-		if r == v {
-			return true
-		}
+func HashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("generando hash de contraseña: %w", err)
 	}
-	return false
+	return string(hash), nil
+}
+
+func VerificarPassword(hash, password string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 ```
 
-- Un **método sobre un tipo basado en string**: se usa como `dominio.Rol("rector").EsValido()` (devuelve `false`).
+Un *hash* es una función de una sola vía: de `Clave123*` se obtiene algo como `$2a$10$N9qo8uLOickgx2ZMRZoMye...`, pero del resultado no se puede obtener la contraseña. Para verificar, se vuelve a calcular y se compara.
+
+**¿Por qué bcrypt y no un hash común como SHA-256?**
+- **Sal (salt) automática:** bcrypt agrega un valor aleatorio distinto para cada contraseña, guardado dentro del propio resultado. Dos usuarios con la misma contraseña tienen hashes distintos, y no sirven las tablas precalculadas de hashes.
+- **Es lento a propósito:** `DefaultCost` (10) significa 2¹⁰ rondas internas, unos 50–100 ms por cálculo. Para un usuario que inicia sesión es imperceptible; para un atacante que quiere probar millones de contraseñas es enorme.
+- **El costo está en el hash** (`$2a$10$...`). Si en el futuro se sube, los hashes viejos se siguen verificando.
+
+`[]byte(password)` convierte el texto a bytes, que es lo que pide bcrypt. En las pruebas de carga se verá el efecto de este costo: el inicio de sesión es la operación más intensiva en CPU de la API.
+
+### 3.3 Tokens JWT
+
+Un **JWT** (*JSON Web Token*) tiene tres partes separadas por puntos:
+
+```
+eyJhbGciOiJIUzI1NiIs...  .  eyJyb2xlcyI6WyJwcm9mZXNvciJdLCJzdWIiOiI2ZjFj...  .  kX3n8Q0...
+      cabecera                             datos (claims)                              firma
+```
+
+- Las dos primeras partes son JSON codificado en **Base64**. **No están cifradas**: cualquiera puede leerlas. Por eso el token solo lleva el identificador del usuario y sus roles, nada secreto.
+- La **firma** se calcula con un secreto que solo conoce el servidor. Si alguien cambia los datos (por ejemplo, se agrega el rol administrador), la firma deja de coincidir y el token se rechaza.
 
 ```go
-func (r Rol) EsRolDeVinculacion() bool {
-	return r == RolMonitor || r == RolAsistenteGraduado
+const emisor = "seguimiento-api"
+
+type claims struct {
+	Roles []dominio.Rol `json:"roles"`
+	jwt.RegisteredClaims
 }
 ```
 
-- RN-02: solo se puede **vincular** a una persona a un curso o proyecto como monitor o como asistente graduado (paso 30). Un profesor o un administrador no se vinculan.
+- Los *claims* son los datos del token. `jwt.RegisteredClaims` (embebido) trae los estándar: `sub` (sujeto, el ID del usuario), `iss` (emisor), `iat` (emitido en) y `exp` (expira en). Se agrega `roles`.
 
 ```go
-func (r Rol) Texto() string {
-	switch r {
-	case RolAsistenteGraduado:
-		return "asistente graduado"
-	default:
-		return string(r)
+type GestorTokens struct {
+	secreto    []byte
+	expiracion time.Duration
+	ahora      func() time.Time
+}
+
+func NuevoGestorTokens(secreto string, expiracion time.Duration) *GestorTokens {
+	return &GestorTokens{secreto: []byte(secreto), expiracion: expiracion, ahora: time.Now}
+}
+```
+
+- `ahora` es una **función** guardada en un campo. En producción es `time.Now`; las pruebas la reemplazan por una que devuelve otra hora, para crear tokens ya vencidos sin tener que esperar. Es una técnica habitual para probar código que depende del tiempo.
+- Campos en minúscula: nadie fuera del paquete puede leer el secreto.
+
+```go
+func (g *GestorTokens) Generar(u dominio.Usuario) (string, time.Time, error) {
+	ahora := g.ahora()
+	expira := ahora.Add(g.expiracion)
+	c := claims{
+		Roles: u.Roles,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   u.ID,
+			Issuer:    emisor,
+			IssuedAt:  jwt.NewNumericDate(ahora),
+			ExpiresAt: jwt.NewNumericDate(expira),
+		},
 	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, c).SignedString(g.secreto)
+	...
+	return token, expira, nil
 }
 ```
 
-- Versión legible para los mensajes de error ("no se puede quitar el rol asistente graduado...").
-- `switch` en Go **no necesita `break`**: cada `case` termina solo. `default` cubre todo lo demás.
-- `string(r)` convierte el `Rol` de vuelta a texto.
-
-#### La entidad `Usuario`
+- **HS256** = HMAC con SHA-256: firma simétrica con un secreto compartido. Basta porque la misma API emite y valida.
+- Devuelve también la fecha de expiración, para que el cliente sepa cuándo debe volver a iniciar sesión.
 
 ```go
-type Usuario struct {
-	ID           string
-	Nombre       string
-	Correo       string
-	PasswordHash string
-	Activo       bool
-	Roles        []Rol
-	CreadoEn     time.Time
-}
-```
-
-- Refleja la tabla `usuarios` más sus roles (tabla `usuario_roles`). Una persona puede tener **varios roles** (RF-01.3, RN-01): por ejemplo, ser monitor en un curso y asistente graduado en un proyecto.
-- `PasswordHash`: nunca la contraseña, sino su *hash* (paso 12).
-- Las entidades del dominio **no llevan etiquetas JSON**: cómo se ven en la API lo decide la capa HTTP (paso 17). Así, por ejemplo, el hash nunca puede terminar en una respuesta por accidente.
-
-```go
-func (u Usuario) TieneRol(rol Rol) bool { ... }
-```
-
-#### Filtro de consulta
-
-```go
-type FiltroUsuarios struct {
-	Rol      Rol
-	Busqueda string // coincide con nombre o correo
-	Paginacion
-}
-```
-
-- Lo que el administrador puede pedir al listar usuarios (paso 19).
-- `Paginacion` aparece **sin nombre de campo**: es un **campo embebido**. Sus campos se "suben" al struct que lo contiene: se puede escribir `f.Limite` en lugar de `f.Paginacion.Limite`. Todos los filtros del sistema embeberán `Paginacion`.
-
-### 3.2 `validacion.go`
-
-```go
-const (
-	LongitudMaxNombre        = 150
-	LongitudMaxObservaciones = 4000
-	LongitudMinPassword      = 8
-	LongitudMaxPassword      = 72 // límite de bcrypt
-)
-```
-
-- Límites razonables para que nadie envíe un nombre de un millón de caracteres.
-- **72 en la contraseña:** bcrypt (el algoritmo del paso 12) solo usa los primeros 72 bytes. Una contraseña más larga se truncaría en silencio; es mejor rechazarla y avisar.
-
-#### Paginación
-
-```go
-const (
-	LimitePorDefecto = 50
-	LimiteMaximo     = 200
-)
-
-type Paginacion struct {
-	Limite         int
-	Desplazamiento int
-}
-
-var SinPaginar = Paginacion{Limite: -1}
-
-func (p Paginacion) Normalizar() Paginacion {
-	if p.Limite <= 0 {
-		p.Limite = LimitePorDefecto
+func (g *GestorTokens) Validar(token string) (Actor, error) {
+	var c claims
+	_, err := jwt.ParseWithClaims(token, &c, func(*jwt.Token) (any, error) {
+		return g.secreto, nil
+	},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(emisor),
+		jwt.WithExpirationRequired(),
+		jwt.WithTimeFunc(g.ahora),
+	)
+	if err != nil || c.Subject == "" {
+		return Actor{}, ErrTokenInvalido
 	}
-	if p.Limite > LimiteMaximo {
-		p.Limite = LimiteMaximo
-	}
-	if p.Desplazamiento < 0 {
-		p.Desplazamiento = 0
-	}
-	return p
+	return Actor{UsuarioID: c.Subject, Roles: c.Roles}, nil
 }
 ```
 
-- Los listados de la API nunca devuelven "todo": como máximo 200 elementos por página (50 si no se indica). Así un listado grande no puede tumbar el servidor ni la red.
-- `Desplazamiento` es cuántos elementos saltar (página 2 = desplazamiento 50).
-- `Normalizar` tiene un receptor **por valor** `(p Paginacion)`: trabaja sobre una **copia** y devuelve la copia corregida, sin modificar el original.
-- `SinPaginar` (límite −1) es una señal **interna** para pedir todos los resultados. La usarán los servicios que necesitan calcular con todos los datos (por ejemplo, el seguimiento semanal, paso 43). Las peticiones HTTP nunca pueden pedirlo: el handler solo acepta límites positivos.
-
-#### Validar textos
+Cada opción cierra un tipo de ataque o de error:
+- `WithValidMethods(HS256)`: solo acepta tokens firmados con HS256. Evita el ataque clásico de enviar un token con `"alg":"none"` (sin firma) o con otro algoritmo.
+- `WithIssuer`: el token debe haber sido emitido por esta API.
+- `WithExpirationRequired`: un token **sin** fecha de expiración se rechaza.
+- `WithTimeFunc(g.ahora)`: usa el mismo reloj que `Generar` (necesario para las pruebas).
+- Ante cualquier problema se devuelve el mismo `ErrTokenInvalido`, sin detalles: no se le da pistas a un atacante.
 
 ```go
-func Texto(campo, valor string, obligatorio bool, maximo int) (string, error) {
-	valor = strings.TrimSpace(valor)
-	if obligatorio && valor == "" {
-		return "", apperr.Validacion("%s es obligatorio", campo)
-	}
-	if utf8.RuneCountInString(valor) > maximo {
-		return "", apperr.Validacion("%s no puede superar %d caracteres", campo, maximo)
-	}
-	return valor, nil
-}
+var ErrTokenInvalido = errors.New("token inválido o expirado")
 ```
 
-- Limpia los espacios de los extremos y valida obligatoriedad y longitud. Devuelve el texto limpio, listo para guardar.
-- `campo` es el nombre que verá el usuario: `dominio.Texto("el nombre", n.Nombre, true, LongitudMaxNombre)` produce "el nombre es obligatorio".
-- **`utf8.RuneCountInString` y no `len`:** en Go, `len("ñ")` es **2** (cuenta bytes en UTF-8). Para contar caracteres reales (letras con tilde, eñes) se cuentan *runas*.
+- Un **error centinela**: una variable de error que otros paquetes pueden comparar con `errors.Is`.
 
-#### Validar correos
+### 3.4 Pruebas (`auth_test.go`)
 
-```go
-func NormalizarCorreo(correo string) (string, error) {
-	correo = strings.ToLower(strings.TrimSpace(correo))
-	direccion, err := mail.ParseAddress(correo)
-	if correo == "" || err != nil || direccion.Address != correo {
-		return "", apperr.Validacion("correo inválido")
-	}
-	return correo, nil
-}
-```
-
-- Lo pasa a minúsculas (`Ana@Uniandes.edu.co` y `ana@uniandes.edu.co` son el mismo usuario, igual que en el índice único del paso 4).
-- `mail.ParseAddress` (librería estándar) valida el formato según el estándar de correo.
-- `direccion.Address != correo` rechaza formatos que el estándar acepta pero que no son un correo "simple", como `Ana <ana@x.co>`.
-
-#### Validar contraseñas
-
-```go
-func ValidarPassword(password string) error {
-	n := len(password)
-	if n < LongitudMinPassword || n > LongitudMaxPassword {
-		return apperr.Validacion("la contraseña debe tener entre %d y %d caracteres", LongitudMinPassword, LongitudMaxPassword)
-	}
-	return nil
-}
-```
-
-- Aquí sí se usa `len` (bytes), porque el límite de bcrypt es en **bytes**.
-
-### 3.3 `reglas_test.go`
-
-Este archivo reunirá las pruebas de **todas** las reglas del dominio. Por ahora:
-- `TestNormalizarCorreoYPassword`: un correo con mayúsculas y espacios se normaliza; cuatro formatos inválidos se rechazan; una contraseña de 5 caracteres y una de 73 se rechazan.
-- `TestPaginacion`: sin límite se usa 50; con 5000 se recorta a 200; un desplazamiento negativo pasa a 0.
+| Prueba | Qué verifica |
+|---|---|
+| `TestHashYVerificacionDePassword` | La contraseña correcta se verifica y una incorrecta no. |
+| `TestTokenIdaYVuelta` | Un token generado se valida y conserva el usuario y sus dos roles; la expiración está en el futuro. |
+| `TestTokenExpiradoEsRechazado` | Se genera con el reloj una hora atrás (expiración de 1 minuto) y luego se valida con la hora real: debe rechazarse. |
+| `TestTokenConOtraFirmaEsRechazado` | Un token firmado con otro secreto se rechaza. |
+| `TestTieneAlgunRol` | La lógica de roles del `Actor`. |
 
 ---
 
@@ -249,12 +180,11 @@ Este archivo reunirá las pruebas de **todas** las reglas del dominio. Por ahora
 
 | Concepto | Explicación |
 |---|---|
-| Métodos sobre tipos simples | `func (r Rol) EsValido() bool`: cualquier tipo definido puede tener métodos. |
-| `switch` | Cada `case` termina solo (sin `break`); `default` es el caso por omisión. |
-| Campo embebido | `Paginacion` dentro de `FiltroUsuarios`: sus campos se acceden directamente. |
-| Receptor por valor | `(p Paginacion)` trabaja sobre una copia. |
-| `len` vs runas | `len` cuenta bytes; `utf8.RuneCountInString` cuenta caracteres. |
-| `var` de slice | Las "constantes" de tipo slice se declaran con `var`. |
+| `[]byte(s)` / `string(b)` | Conversión entre texto y bytes. |
+| Función como campo | `ahora func() time.Time`: se puede reemplazar en pruebas. |
+| Error centinela | `var ErrX = errors.New("...")`, comparable con `errors.Is`. |
+| Struct embebido de una librería | `jwt.RegisteredClaims` dentro de `claims`. |
+| Opciones funcionales | `jwt.WithIssuer(...)`, `jwt.WithValidMethods(...)`: configuración por argumentos opcionales. |
 
 ---
 
@@ -262,31 +192,31 @@ Este archivo reunirá las pruebas de **todas** las reglas del dominio. Por ahora
 
 ```bash
 cd backend
-go test ./internal/dominio/ -v
-# === RUN   TestNormalizarCorreoYPassword
-# --- PASS: TestNormalizarCorreoYPassword
-# === RUN   TestPaginacion
-# --- PASS: TestPaginacion
+go test ./internal/auth/ -v
 ```
 
-`-v` (*verbose*) muestra cada prueba. Desde la raíz también sirve `make pruebas`.
+Puede pegar un token generado en <https://jwt.io> para ver su contenido (cabecera y claims), y comprobar que la firma solo es válida con el secreto correcto.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 10
+## 6. Pasos para lograr esta versión desde el paso 11
 
-1. Crear `backend/internal/dominio/usuario.go` con `Rol`, sus constantes, `RolesValidos`, `RolesOperativos`, los métodos `EsValido`, `EsRolDeVinculacion` y `Texto`, la entidad `Usuario` con `TieneRol` y `FiltroUsuarios`.
-2. Crear `backend/internal/dominio/validacion.go` con las constantes de longitud y paginación, `Paginacion` con `Normalizar`, `SinPaginar`, `Texto`, `NormalizarCorreo` y `ValidarPassword`.
-3. Crear `backend/internal/dominio/reglas_test.go` con `TestNormalizarCorreoYPassword` y `TestPaginacion`.
+1. Agregar las dependencias (desde `backend/`):
+   ```bash
+   go get github.com/golang-jwt/jwt/v5@v5.3.1 golang.org/x/crypto@v0.58.0
+   go mod tidy
+   ```
+2. Crear `backend/internal/auth/auth.go` con `Actor` y sus métodos, `HashPassword`, `VerificarPassword`, `ErrTokenInvalido`, `claims`, `GestorTokens`, `NuevoGestorTokens`, `Generar` y `Validar`.
+3. Crear `backend/internal/auth/auth_test.go` con las cinco pruebas.
 4. `make pruebas lint`
-5. Commit: `git add . && git commit -m "Paso 11: dominio de usuarios, roles y validaciones"`
+5. Commit: `git add . && git commit -m "Paso 12: contraseñas con bcrypt y tokens JWT"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- **El dominio no depende de nada.** Si en la Entrega 4 alguna parte se mueve a una función serverless, estas reglas se reutilizan tal cual.
-- **Paginación con máximo** desde el primer listado: protege a la API cuando crezcan los datos y durante las pruebas de carga.
+- **JWT sin estado en el servidor:** varias instancias de la API (Entrega 3) o funciones serverless (Entrega 4) validan el mismo token si comparten `JWT_SECRETO` (paso 15). No hace falta una sesión compartida en Redis ni en la base de datos.
+- **Limitación conocida (deuda técnica DT-04):** un token es válido hasta que expira; no hay cierre de sesión en el servidor. Si se necesitara, se puede agregar una lista de tokens revocados o tokens de corta duración con renovación.
 
 ---
 
@@ -294,7 +224,6 @@ go test ./internal/dominio/ -v
 
 | Requisito | Cómo |
 |---|---|
-| RF-01.3 / RN-01 Múltiples roles | `Usuario.Roles` es una lista. |
-| RF-02.1 Crear usuarios (validaciones) | Nombre, correo y contraseña se validan en el dominio. |
-| RN-02 Roles por vinculación | `EsRolDeVinculacion` (se usará en el paso 32). |
-| RNF-05 Mantenibilidad | Reglas puras, probadas sin infraestructura. |
+| RF-01.1 Inicio de sesión local | Base criptográfica: contraseñas y tokens. |
+| RF-01.2 Control de acceso por rol | Los roles viajan firmados en el token y se exponen en `Actor`. |
+| RNF-03 Autenticación local y seguridad básica | bcrypt con sal y costo; JWT con algoritmo, emisor y expiración obligatorios. |
