@@ -4,6 +4,9 @@ package main
 import (
 	"log/slog"
 	"os"
+	_ "time/tzdata" // incluye las zonas horarias en el binario
+
+	"seguimiento/internal/config"
 )
 
 func main() {
@@ -14,9 +17,13 @@ func main() {
 	}
 }
 
-// ejecutar arma la aplicación. En los siguientes pasos se agregan la
-// configuración, la base de datos y el servidor HTTP.
+// ejecutar arma la aplicación. En los siguientes pasos se agregan el servidor
+// HTTP y la base de datos.
 func ejecutar(log *slog.Logger) error {
-	log.Info("API iniciada")
+	cfg, err := config.Cargar()
+	if err != nil {
+		return err
+	}
+	log.Info("configuración cargada", "entorno", cfg.Entorno, "puerto", cfg.PuertoHTTP, "zona_horaria", cfg.ZonaHoraria.String())
 	return nil
 }
