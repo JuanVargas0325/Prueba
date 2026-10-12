@@ -5,7 +5,7 @@ GO_IMG      := golang:1.26
 LINT_IMG    := golangci/golangci-lint:latest
 DOCKER_GO   := docker run --rm -v "$(CURDIR)/backend:/src" -v gomod:/go/pkg/mod -v gocache:/root/.cache/go-build -w /src
 
-.PHONY: ayuda arriba abajo logs pruebas pruebas-integracion lint formato
+.PHONY: ayuda arriba abajo logs demo pruebas pruebas-integracion lint formato
 
 ayuda: ## Muestra esta ayuda
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-22s %s\n", $$1, $$2}'
@@ -18,6 +18,9 @@ abajo: ## Detiene el sistema (conserva los datos)
 
 logs: ## Muestra los logs de la API y del worker
 	docker compose logs -f api worker
+
+demo: ## Carga los datos de demostración
+	docker compose exec -T postgres psql -U $$(grep '^POSTGRES_USER=' .env | cut -d= -f2) -d $$(grep '^POSTGRES_DB=' .env | cut -d= -f2) < scripts/datos_demo.sql
 
 pruebas: ## Pruebas unitarias con detector de condiciones de carrera
 	$(DOCKER_GO) $(GO_IMG) go test -race ./...

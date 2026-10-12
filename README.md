@@ -1,188 +1,127 @@
-# Paso 58 · Pruebas de integración de la capa de datos
+# Paso 59 · Datos de demostración
 
-> Rama `paso-a-paso` · paso 58 de 65 · anterior: **Paso 57 · Modelo local con Ollama** · siguiente: **Paso 59 · Datos de demostración**
+> Rama `paso-a-paso` · paso 59 de 65 · anterior: **Paso 58 · Pruebas de integración** · siguiente: **Paso 60 · Colección de Postman**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se agregaron **pruebas de integración**: ejecutan los repositorios contra un **PostgreSQL real** y verifican las consultas SQL, las restricciones, las transacciones y la concurrencia. Se ejecutan en GitHub Actions y con `make`.
+Se agregó un script SQL con un **escenario de demostración** listo para usar: una profesora, tres personas a cargo, un período, un curso, un proyecto, vinculaciones y tareas repartidas en varias semanas.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/repositorio/integracion_test.go` | **Nuevo.** Siete pruebas contra PostgreSQL, compiladas solo con la etiqueta `integracion`. |
-| `.github/workflows/ci.yml` | **Modificado.** El job de pruebas levanta un PostgreSQL como **servicio** y ejecuta también las de integración. |
-| `Makefile` | **Modificado.** Objetivo `pruebas-integracion`. |
+| `scripts/datos_demo.sql` | **Nuevo.** Escenario de demostración idempotente. |
+| `Makefile` | **Modificado.** Objetivo `make demo`. |
 
-Con este paso, **todo `backend/` queda idéntico a la versión final**.
+| Usuario (contraseña `Demo123*`) | Rol | Situación |
+|---|---|---|
+| `profesora.rojas@uniandes.edu.co` | profesora | Responsable del curso y del proyecto. |
+| `andres.monitor@uniandes.edu.co` | monitor | 6 h; reporta algunas semanas y otras no. |
+| `laura.asistente@uniandes.edu.co` | asistente graduada y monitora | 12 h + 4 h (dentro del 40 %); tiene un reporte **tardío**. |
+| `pedro.sintareas@uniandes.edu.co` | monitor | 3 h; **nunca reporta**: todas sus semanas cerradas aparecen `sin_reporte`. |
+
+Vista de la profesora después de cargarlo:
+
+```
+Andrés Gómez   | 1 vinculación  |  6 h | semana anterior: sin_reporte
+Laura Martínez | 2 vinculaciones| 16 h | semana anterior: con_reporte
+Pedro Sánchez  | 1 vinculación  |  3 h | semana anterior: sin_reporte
+```
 
 ---
 
 ## 2. Por qué
 
-- Las pruebas unitarias usan repositorios **falsos en memoria**: comprueban la lógica, pero no que el SQL sea correcto. Un error en una consulta, una columna mal escrita o un bloqueo que no funciona solo aparecen contra una base de datos real.
-- Lo más delicado del sistema vive en SQL: la **concurrencia de las reglas de horas** (paso 31), la **idempotencia** de los reportes (paso 46) y las barreras de la base de datos (tareas tardías inmutables, semana en lunes).
-- Esto saldaba la **deuda técnica DT-01** ("las consultas de `repositorio` no tenían pruebas automáticas contra una base de datos real").
+- **Para el video y la sustentación:** el seguimiento (paso 44) y los reportes (paso 55) solo se aprecian con **historia**: semanas con y sin reporte, tareas tardías, horas en varios espacios. Crearla a mano por la API tomaría mucho tiempo y, además, la API fecha todo "hoy" (no se puede crear una vinculación del mes pasado).
+- **Para probar a mano** cualquier funcionalidad con datos realistas, sin preparar nada.
 
 ---
 
-## 3. Explicación detallada
+## 3. Explicación detallada de `datos_demo.sql`
 
-### 3.1 Etiqueta de compilación
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto; -- solo para generar los hash bcrypt de demostración
 
-```go
-//go:build integracion
+BEGIN;
 
-// Pruebas de integración de la capa de datos contra un PostgreSQL real.
-// Se ejecutan con:
-//
-//	DATABASE_URL_PRUEBAS=postgres://usuario:clave@localhost:5432/bd_pruebas?sslmode=disable \
-//	  go test -tags integracion ./internal/repositorio/...
-//
-// ¡Borran todos los datos de esa base de datos! Use una base exclusiva para pruebas.
-package repositorio_test
+INSERT INTO usuarios (id, nombre, correo, password_hash) VALUES
+  ('11111111-1111-4111-8111-111111111111', 'Carolina Rojas', 'profesora.rojas@uniandes.edu.co', crypt('Demo123*', gen_salt('bf', 10))),
+  ...
+ON CONFLICT (id) DO NOTHING;
 ```
-- `//go:build integracion` es una **etiqueta de compilación**: el archivo solo se compila con `go test -tags integracion`. Un `go test ./...` normal (rápido, sin base de datos) lo ignora.
-- `package repositorio_test` (con `_test`): es un **paquete de prueba externo**. Solo puede usar lo **exportado** de `repositorio`, como lo haría cualquier otro paquete. Así se prueban los repositorios a través de su interfaz pública.
-- La configuración `build-tags: integracion` de golangci-lint (paso 8) hace que el linter también lo revise.
+- **`pgcrypto`** es una extensión de PostgreSQL con funciones criptográficas. `crypt('Demo123*', gen_salt('bf', 10))` genera un hash **bcrypt** (`bf` = Blowfish, costo 10): el mismo formato que usa la API (paso 12). Así se puede iniciar sesión con estos usuarios.
+- **IDs fijos y legibles** (`1111…`, `2222…`): permiten relacionar las filas en el script y reconocerlas en las pruebas.
+- **`BEGIN … COMMIT`**: todo el escenario se carga en una transacción: o se crea completo o no se crea nada.
+- **`ON CONFLICT … DO NOTHING`** en cada `INSERT`: el script es **idempotente**; ejecutarlo dos veces no duplica ni falla.
 
-### 3.2 Preparación
-
-```go
-func conectar(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	url := os.Getenv("DATABASE_URL_PRUEBAS")
-	if url == "" {
-		t.Skip("DATABASE_URL_PRUEBAS no está definida")
-	}
-	...
-	t.Cleanup(db.Close)
-	if err := basedatos.Migrar(ctx, db, logPrueba); err != nil { ... }
-	_, err = db.Exec(ctx, `TRUNCATE usuarios, usuario_roles, periodos_academicos, espacios, vinculaciones,
-		vinculacion_rectificaciones, tareas, tarea_adjuntos, lotes_reportes, reportes_semanales CASCADE`)
-	...
-}
+```sql
+-- Laura: 12 h como asistente graduada y 4 h como monitora (máximo permitido: 40 % de 12 = 4,8 → 5 h).
+-- Las vinculaciones se fechan al inicio del semestre para que exijan reporte desde entonces.
+INSERT INTO vinculaciones (id, usuario_id, espacio_id, rol, horas_semanales, creado_en, actualizado_en) VALUES ...
 ```
-- Sin `DATABASE_URL_PRUEBAS`, la prueba se **omite** (`t.Skip`) en lugar de fallar.
-- Se usa una variable **distinta** de `DATABASE_URL` a propósito: así es imposible correr las pruebas contra la base de datos de desarrollo por error, porque **`TRUNCATE` borra todo** para que cada prueba empiece limpia.
-- `t.Cleanup(db.Close)` registra una limpieza que Go ejecuta al terminar la prueba.
+- **Respeta las reglas de horas**: los datos de demostración son un ejemplo **válido** del negocio.
+- `creado_en` = 3 de agosto: la vigencia de cada vinculación empieza ahí (paso 30), así que las semanas cerradas sin tareas salen como `sin_reporte`.
 
-```go
-type escenario struct {
-	profesor, laura, andres dominio.Usuario
-	periodo                 dominio.PeriodoAcademico
-	curso, proyecto         dominio.Espacio
-}
-
-func crearEscenario(t *testing.T, db *pgxpool.Pool) escenario { ... }
+```sql
+INSERT INTO tareas (..., tardia) VALUES
+  -- Semana del 21 de septiembre
+  ...
+  -- Semana del 28 de septiembre (Laura reporta tarde; Andrés no reporta)
+  ... 'Registrada después del cierre de la semana.', true),
+  -- Semana del 5 de octubre
+  ...
 ```
-- Un **escenario** reutilizable: una profesora, Laura (monitora y asistente), Andrés (monitor), un período 2026-20, un curso y un proyecto. Se crea **con los repositorios reales**, que así también quedan probados.
+- Las tareas están en las semanas del 21/09, 28/09 y 05/10 de 2026, con distintos estados, observaciones y dos reportes **tardíos**.
+- **Este script escribe directo en la base de datos y se salta las reglas de la API** (por ejemplo, puede crear tareas tardías o fechar vinculaciones en el pasado). Solo es para demostración; **nunca** se debe usar en producción.
 
-### 3.3 Las pruebas
+---
 
-| Prueba | Qué verifica contra PostgreSQL |
-|---|---|
-| `TestMigracionesSobreBaseVacia` | Sobre un esquema vacío (`DROP SCHEMA public CASCADE`), migrar **dos veces**: 1 migración registrada y 11 tablas, sin errores la segunda vez (paso 4). |
-| `TestUsuarios` | Búsqueda por correo sin distinguir mayúsculas y con sus 2 roles; correo repetido → conflicto; filtro por rol y búsqueda parcial (`ndr`); reemplazo de roles; ID inexistente → no encontrado. |
-| `TestEspaciosVisibilidadYCierre` | La profesora ve 2 espacios, Laura solo el curso donde está vinculada y Andrés ninguno; vienen el código del período y el nombre de la profesora (`JOIN`); cerrar dos veces → conflicto. |
-| `TestVinculacionesReglasYConcurrencia` | **Concurrencia:** dos goroutines vinculan a Laura como asistente con 12 h en dos espacios **a la vez** (24 h > 22 h): **exactamente una** falla con regla de negocio. Luego: duplicado → conflicto; rectificación 12 → 10 h con su historial; una rectificación a 23 h se rechaza y **no** cambia las horas. |
-| `TestTareasYAdjuntos` | Tarea con adjunto (trae persona, profesor y conteo de adjuntos); `semana_inicio` en miércoles → validación (el `CHECK` del paso 4); visibilidad; actualización; máximo de adjuntos; eliminar devuelve la ruta del archivo; una tarea **tardía** no se actualiza ni se elimina. |
-| `TestListarPorVinculaciones` | La consulta liviana del seguimiento (paso 42): con 3 tareas en 3 semanas, el rango 05/10–12/10 devuelve 2, de la más reciente a la más antigua y con sus datos propios (semana, estado, horas, título); sin rango devuelve las 3; sin vinculaciones, ninguna. Verifica contra PostgreSQL real que el SQL propio de esa consulta es correcto. |
-| `TestCreacionDeLoteDeReportes` | 2 personas y 2 reportes; el lote cuenta como activo; repetir la creación **no duplica**; los datos de la semana de Laura (1 tarea, 3 h, nombres). |
-| `TestFinalizacionDeReportes` | Un reporte completado (completarlo dos veces **no cuenta dos veces**) y otro fallido → lote `completado_con_errores` con contadores 1 y 1 y fecha de finalización. |
-
-La prueba de concurrencia usa `sync.WaitGroup`: `wg.Add(1)` por cada goroutine, `defer wg.Done()` dentro de cada una y `wg.Wait()` para esperar a que terminen las dos.
-
-### 3.4 En GitHub Actions
-
-```yaml
-  pruebas:
-    name: Pruebas unitarias y de integración
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-bookworm
-        env:
-          POSTGRES_USER: pruebas
-          POSTGRES_PASSWORD: pruebas
-          POSTGRES_DB: pruebas
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U pruebas -d pruebas"
-          ...
-    env:
-      DATABASE_URL_PRUEBAS: postgres://pruebas:pruebas@localhost:5432/pruebas?sslmode=disable
-    ...
-      - name: Pruebas con cobertura
-        run: go test -race -tags integracion -covermode=atomic -coverprofile=coverage.out ./...
-```
-- `services:` levanta un contenedor de PostgreSQL **al lado** del job, accesible en `localhost:5432`. Las `options` le dan un healthcheck: el job espera a que esté listo.
-- Las credenciales son de un contenedor desechable que solo existe durante el job; no son secretos reales.
-- Ahora el job ejecuta **unitarias e integración** juntas (`-tags integracion`).
-
-### 3.5 Localmente con `make`
+## 4. `make demo`
 
 ```makefile
-pruebas-integracion: ## Pruebas unitarias y de integración contra un PostgreSQL temporal
-	-docker network create red-pruebas >/dev/null 2>&1
-	-docker rm -f pg-pruebas >/dev/null 2>&1
-	docker run -d --name pg-pruebas --network red-pruebas -e POSTGRES_USER=pruebas ... postgres:16-bookworm
-	sleep 5
-	$(DOCKER_GO) --network red-pruebas -e DATABASE_URL_PRUEBAS=postgres://pruebas:pruebas@pg-pruebas:5432/pruebas?sslmode=disable \
-		$(GO_IMG) go test -race -tags integracion -coverpkg=./internal/... -cover ./... ; status=$$?; docker rm -f pg-pruebas >/dev/null; exit $$status
+demo: ## Carga los datos de demostración
+	docker compose exec -T postgres psql -U $$(grep '^POSTGRES_USER=' .env | cut -d= -f2) -d $$(grep '^POSTGRES_DB=' .env | cut -d= -f2) < scripts/datos_demo.sql
 ```
-- Crea una red y un PostgreSQL **temporal**, ejecuta las pruebas en un contenedor de Go en esa red y **siempre** borra el PostgreSQL al final, guardando el código de salida de las pruebas (`status=$$?` ... `exit $$status`) para que `make` informe si fallaron.
-- El `-` al inicio de una línea le dice a `make` que ignore su error (por ejemplo, si la red ya existía).
-- `-coverpkg=./internal/...` cuenta la cobertura **entre paquetes**: por ejemplo, las migraciones de `basedatos` que ejecutan las pruebas de `repositorio`.
-
----
-
-## 4. Conceptos de este paso
-
-| Concepto | Explicación |
-|---|---|
-| Prueba de integración | Prueba varios componentes reales juntos (aquí, código + PostgreSQL). |
-| `//go:build etiqueta` | El archivo solo se compila si se pide esa etiqueta. |
-| Paquete `_test` externo | Prueba solo la API pública del paquete. |
-| `t.Skip` / `t.Cleanup` | Omitir una prueba / registrar una limpieza. |
-| `sync.WaitGroup` | Esperar a que terminen varias goroutines. |
-| Servicios en GitHub Actions | Contenedores auxiliares (bases de datos) para un job. |
+- Ejecuta `psql` **dentro** del contenedor de PostgreSQL y le pasa el script por la entrada estándar (`<`). `-T` desactiva la terminal interactiva, necesario para redirigir un archivo.
+- Lee el usuario y la base de datos de su `.env` (`grep … | cut -d= -f2` toma lo que está después del `=`). En un `Makefile`, `$$(...)` produce `$(...)` para el shell.
 
 ---
 
 ## 5. Cómo comprobarlo
 
 ```bash
-make pruebas-integracion
-# ok  seguimiento/internal/repositorio  ...
+docker compose up --build -d --wait
+make demo
+# o: docker compose exec -T postgres psql -U seguimiento -d seguimiento < scripts/datos_demo.sql
+
+# Iniciar sesión como la profesora y ver a sus personas
+TOKEN=$(curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"correo":"profesora.rojas@uniandes.edu.co","password":"Demo123*"}' | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+curl -s localhost:8080/api/v1/seguimiento/personas -H "Authorization: Bearer $TOKEN"
 ```
 
-O a mano, con un PostgreSQL de pruebas:
+Ideas para la demostración:
+- detalle semanal de Pedro (todo `sin_reporte`) y de Laura (con su tarea tardía);
+- un lote de reportes de la semana del 28/09 y la descarga de los PDF;
+- intentar vincular a Laura a otra monitoría de 2 h: se rechaza (4 + 2 = 6 > 5 h).
 
-```bash
-DATABASE_URL_PRUEBAS=postgres://pruebas:pruebas@localhost:5432/pruebas?sslmode=disable \
-  go test -tags integracion -v ./internal/repositorio/
-```
-
-Resultado esperado: las 7 pruebas en `PASS`. En GitHub, el job se llama "Pruebas unitarias y de integración".
+Ejecutar `make demo` otra vez no cambia nada (idempotente).
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 57
+## 6. Pasos para lograr esta versión desde el paso 58
 
-1. Crear `backend/internal/repositorio/integracion_test.go` (sección 3).
-2. En `.github/workflows/ci.yml`: el servicio `postgres`, la variable `DATABASE_URL_PRUEBAS`, `-tags integracion` en el comando de pruebas, el nuevo nombre del job y el comentario inicial.
-3. En el `Makefile`: el objetivo `pruebas-integracion` y agregarlo a `.PHONY`.
-4. `make pruebas-integracion`
-5. Commit: `git add . && git commit -m "Paso 58: pruebas de integración de la capa de datos"`
+1. Crear `scripts/datos_demo.sql` (sección 3).
+2. En el `Makefile`: el objetivo `demo` y agregarlo a `.PHONY`.
+3. `make demo` sobre el sistema levantado.
+4. Commit: `git add . && git commit -m "Paso 59: datos de demostración"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- Antes de migrar a **Cloud SQL** (Entrega 2) se pueden ejecutar estas mismas pruebas contra una instancia de prueba en la nube: basta con apuntar `DATABASE_URL_PRUEBAS` a ella.
-- Cualquier optimización SQL futura queda cubierta por estas pruebas. Por ejemplo, la consulta liviana del seguimiento (paso 42, deuda técnica DT-08) tiene su propia prueba: si alguien cambia sus columnas o su filtro, el pipeline lo detecta.
+- Sirve igual contra la base de datos de la nube (Entrega 2): basta con ejecutarlo con `psql` contra Cloud SQL para tener datos con los cuales probar el frontend.
+- Si las fechas de la demostración quedan muy atrás, se pueden ajustar las de las tareas y las vinculaciones; las reglas de semanas se calculan sobre la fecha real del sistema.
 
 ---
 
@@ -190,7 +129,6 @@ Resultado esperado: las 7 pruebas en `PASS`. En GitHub, el job se llama "Pruebas
 
 | Requisito | Cómo |
 |---|---|
-| 06-pruebas: pruebas automáticas en el pipeline | Integración con PostgreSQL en GitHub Actions. |
-| RF-05.6 / RN-19 Reglas atómicas | Prueba de concurrencia real. |
-| RNF-06 Consistencia | Restricciones, transacciones e idempotencia verificadas en la base de datos. |
-| Deuda técnica DT-01 | Resuelta. |
+| Sustentación en video (lineamientos §3) | Escenario listo para mostrar las funcionalidades. |
+| RF-09 / RF-10 | Datos con semanas con reporte, sin reporte y tardías. |
+| RF-05 | Vinculaciones que respetan las reglas de horas. |
