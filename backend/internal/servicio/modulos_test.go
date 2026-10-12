@@ -304,3 +304,165 @@ func TestVisibilidadYCierreDeEspacios(t *testing.T) {
 		t.Errorf("el profesor responsable puede cerrar el espacio: %+v %v", e, err)
 	}
 }
+
+// --- vinculaciones -------------------------------------------------------------------------
+
+type repoVinculacionesFalso struct {
+	simultaneas   []dominio.Vinculacion
+	vinculaciones map[string]dominio.Vinculacion
+	creada        dominio.Vinculacion
+	rectificada   struct {
+		rol    dominio.Rol
+		horas  int
+		motivo string
+	}
+	filtro dominio.FiltroVinculaciones
+}
+
+func (r *repoVinculacionesFalso) Crear(_ context.Context, v dominio.Vinculacion, validar dominio.ValidadorCarga) (dominio.Vinculacion, error) {
+	if err := validar(r.simultaneas, v); err != nil {
+		return dominio.Vinculacion{}, err
+	}
+	v.ID = "v-nueva"
+	r.creada = v
+	return v, nil
+}
+
+func (r *repoVinculacionesFalso) Rectificar(_ context.Context, id string, rol dominio.Rol, horas int, _, motivo string, validar dominio.ValidadorCarga) (dominio.Vinculacion, error) {
+	v := r.vinculaciones[id]
+	v.Rol, v.HorasSemanales = rol, horas
+	if err := validar(r.simultaneas, v); err != nil {
+		return dominio.Vinculacion{}, err
+	}
+	r.rectificada.rol, r.rectificada.horas, r.rectificada.motivo = rol, horas, motivo
+	return v, nil
+}
+
+func (r *repoVinculacionesFalso) Obtener(_ context.Context, id string) (dominio.Vinculacion, error) {
+	v, ok := r.vinculaciones[id]
+	if !ok {
+		return v, apperr.NoEncontrado("vinculación no encontrada")
+	}
+	return v, nil
+}
+
+func (r *repoVinculacionesFalso) Listar(_ context.Context, f dominio.FiltroVinculaciones) ([]dominio.Vinculacion, error) {
+	r.filtro = f
+	var resultado []dominio.Vinculacion
+	for _, v := range r.vinculaciones {
+		if (f.UsuarioID == "" || v.UsuarioID == f.UsuarioID) && (f.ProfesorID == "" || v.ProfesorID == f.ProfesorID) {
+			resultado = append(resultado, v)
+		}
+	}
+	return resultado, nil
+}
+
+func (r *repoVinculacionesFalso) ListarRectificaciones(context.Context, string) ([]dominio.Rectificacion, error) {
+	return nil, nil
+}
+
+func entornoVinculaciones(t *testing.T) (*Vinculaciones, *repoVinculacionesFalso) {
+	usuarios := nuevoRepoUsuarios()
+	usuarios.usuarios["u1"] = dominio.Usuario{ID: "u1", Correo: "laura@uniandes.edu.co", Activo: true,
+		Roles: []dominio.Rol{dominio.RolMonitor, dominio.RolAsistenteGraduado}}
+	usuarios.usuarios["u2"] = dominio.Usuario{ID: "u2", Correo: "solo-monitor@uniandes.edu.co", Activo: true, Roles: []dominio.Rol{dominio.RolMonitor}}
+	espacios := &repoEspaciosFalso{espacios: map[string]dominio.Espacio{
+		"e1": {ID: "e1", ProfesorID: "prof-1", Tipo: dominio.EspacioCurso, Estado: dominio.EspacioActivo,
+			FechaInicio: fechaP(t, "2026-08-03"), FechaCierre: fechaP(t, "2026-12-04")},
+		"cerrado": {ID: "cerrado", ProfesorID: "prof-1", Tipo: dominio.EspacioCurso, Estado: dominio.EspacioCerrado},
+	}}
+	repo := &repoVinculacionesFalso{vinculaciones: map[string]dominio.Vinculacion{}}
+	return NuevoVinculaciones(repo, usuarios, espacios, logPrueba), repo
+}
+
+func TestCrearVinculacion(t *testing.T) {
+	s, repo := entornoVinculaciones(t)
+	ctx := context.Background()
+
+	v, err := s.Crear(ctx, profesor, NuevaVinculacion{EspacioID: "e1", Correo: "Laura@uniandes.edu.co", Rol: dominio.RolMonitor, HorasSemanales: 4})
+	if err != nil || v.UsuarioID != "u1" || repo.creada.EspacioFechaCierre.IsZero() {
+		t.Fatalf("vinculación inesperada: %+v %v", v, err)
+	}
+
+	casos := []struct {
+		nombre string
+		actor  auth.Actor
+		n      NuevaVinculacion
+		tipo   apperr.Tipo
+	}{
+		{"solo profesores", monitor, NuevaVinculacion{EspacioID: "e1", UsuarioID: "u1", Rol: dominio.RolMonitor, HorasSemanales: 2}, apperr.TipoProhibido},
+		{"profesor no responsable", otroProf, NuevaVinculacion{EspacioID: "e1", UsuarioID: "u1", Rol: dominio.RolMonitor, HorasSemanales: 2}, apperr.TipoProhibido},
+		{"espacio cerrado (RN-09)", profesor, NuevaVinculacion{EspacioID: "cerrado", UsuarioID: "u1", Rol: dominio.RolMonitor, HorasSemanales: 2}, apperr.TipoReglaNegocio},
+		{"espacio inexistente", profesor, NuevaVinculacion{EspacioID: "x", UsuarioID: "u1", Rol: dominio.RolMonitor, HorasSemanales: 2}, apperr.TipoValidacion},
+		{"rol inválido", profesor, NuevaVinculacion{EspacioID: "e1", UsuarioID: "u1", Rol: dominio.RolProfesor, HorasSemanales: 2}, apperr.TipoValidacion},
+		{"horas en cero", profesor, NuevaVinculacion{EspacioID: "e1", UsuarioID: "u1", Rol: dominio.RolMonitor}, apperr.TipoValidacion},
+		{"persona sin el rol", profesor, NuevaVinculacion{EspacioID: "e1", UsuarioID: "u2", Rol: dominio.RolAsistenteGraduado, HorasSemanales: 2}, apperr.TipoReglaNegocio},
+		{"persona inexistente", profesor, NuevaVinculacion{EspacioID: "e1", Correo: "nadie@x.co", Rol: dominio.RolMonitor, HorasSemanales: 2}, apperr.TipoValidacion},
+		{"sin persona", profesor, NuevaVinculacion{EspacioID: "e1", Rol: dominio.RolMonitor, HorasSemanales: 2}, apperr.TipoValidacion},
+	}
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			_, err := s.Crear(ctx, c.actor, c.n)
+			esperarTipo(t, err, c.tipo)
+		})
+	}
+}
+
+func TestCrearVinculacionAplicaLasReglasDeHoras(t *testing.T) {
+	s, repo := entornoVinculaciones(t)
+	ctx := context.Background()
+	// Ejemplo del enunciado: 12 h de asistencia y 3 h de monitoría; otra monitoría de 3 h supera el 40 % (5 h).
+	repo.simultaneas = []dominio.Vinculacion{
+		{Rol: dominio.RolAsistenteGraduado, HorasSemanales: 12, EspacioEstado: dominio.EspacioActivo},
+		{Rol: dominio.RolMonitor, HorasSemanales: 3, EspacioEstado: dominio.EspacioActivo},
+	}
+	_, err := s.Crear(ctx, profesor, NuevaVinculacion{EspacioID: "e1", UsuarioID: "u1", Rol: dominio.RolMonitor, HorasSemanales: 3})
+	esperarTipo(t, err, apperr.TipoReglaNegocio)
+
+	if _, err := s.Crear(ctx, profesor, NuevaVinculacion{EspacioID: "e1", UsuarioID: "u1", Rol: dominio.RolMonitor, HorasSemanales: 2}); err != nil {
+		t.Errorf("3 + 2 = 5 h de monitoría está permitido: %v", err)
+	}
+}
+
+func TestRectificarVinculacion(t *testing.T) {
+	s, repo := entornoVinculaciones(t)
+	ctx := context.Background()
+	repo.vinculaciones["v1"] = dominio.Vinculacion{ID: "v1", UsuarioID: "u2", ProfesorID: "prof-1", Rol: dominio.RolMonitor,
+		HorasSemanales: 4, EspacioEstado: dominio.EspacioActivo}
+	seis, trece := 6, 13
+	asistente := dominio.RolAsistenteGraduado
+
+	_, err := s.Rectificar(ctx, profesor, "v1", SolicitudRectificacion{HorasSemanales: &seis, Motivo: "x"})
+	esperarTipo(t, err, apperr.TipoProhibido) // RF-04.4: solo el administrador
+	_, err = s.Rectificar(ctx, admin, "v1", SolicitudRectificacion{HorasSemanales: &seis})
+	esperarTipo(t, err, apperr.TipoValidacion) // motivo obligatorio
+	_, err = s.Rectificar(ctx, admin, "v1", SolicitudRectificacion{Motivo: "sin cambios"})
+	esperarTipo(t, err, apperr.TipoValidacion)
+	_, err = s.Rectificar(ctx, admin, "v1", SolicitudRectificacion{HorasSemanales: &trece, Motivo: "x"})
+	esperarTipo(t, err, apperr.TipoReglaNegocio) // 13 h de monitoría
+	_, err = s.Rectificar(ctx, admin, "v1", SolicitudRectificacion{Rol: &asistente, Motivo: "x"})
+	esperarTipo(t, err, apperr.TipoReglaNegocio) // la persona no tiene el rol
+
+	if _, err := s.Rectificar(ctx, admin, "v1", SolicitudRectificacion{HorasSemanales: &seis, Motivo: "Error de digitación"}); err != nil {
+		t.Fatal(err)
+	}
+	if repo.rectificada.horas != 6 || repo.rectificada.motivo != "Error de digitación" {
+		t.Errorf("rectificación inesperada: %+v", repo.rectificada)
+	}
+}
+
+func TestVisibilidadDeVinculaciones(t *testing.T) {
+	s, repo := entornoVinculaciones(t)
+	ctx := context.Background()
+	repo.vinculaciones["v1"] = dominio.Vinculacion{ID: "v1", UsuarioID: "u1", ProfesorID: "prof-1"}
+
+	_, _ = s.Listar(ctx, monitor, dominio.FiltroVinculaciones{})
+	if repo.filtro.VisiblePara != "mon-1" {
+		t.Error("los listados deben filtrarse por el actor")
+	}
+	_, err := s.Obtener(ctx, otroProf, "v1")
+	esperarTipo(t, err, apperr.TipoNoEncontrado)
+	if _, err := s.Obtener(ctx, auth.Actor{UsuarioID: "u1", Roles: []dominio.Rol{dominio.RolMonitor}}, "v1"); err != nil {
+		t.Errorf("la persona vinculada puede ver su vinculación: %v", err)
+	}
+}

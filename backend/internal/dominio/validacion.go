@@ -12,6 +12,7 @@ import (
 const (
 	LongitudMaxNombre        = 150
 	LongitudMaxObservaciones = 4000
+	LongitudMaxMotivo        = 1000
 	LongitudMinPassword      = 8
 	LongitudMaxPassword      = 72 // límite de bcrypt
 )
