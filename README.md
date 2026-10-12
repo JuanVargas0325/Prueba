@@ -1,114 +1,122 @@
-# Paso 20 · Dominio: fechas y semanas
+# Paso 21 · Dominio: períodos académicos
 
-> Rama `paso-a-paso` · paso 20 de 65 · anterior: **Paso 19 · Endpoints de usuarios** · siguiente: **Paso 21 · Dominio: períodos académicos**
+> Rama `paso-a-paso` · paso 21 de 65 · anterior: **Paso 20 · Fechas y semanas** · siguiente: **Paso 22 · Repositorio de períodos**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se agregaron al dominio las funciones para trabajar con **fechas de calendario** y **semanas de lunes a domingo**, la unidad de tiempo de todo el sistema.
+Se modeló el **período académico** (por ejemplo `2026-20`) y sus reglas: formato del código, fechas coherentes y cuándo se pueden crear cursos y proyectos en él.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/dominio/semana.go` | **Nuevo.** `FormatoFecha`, `Fecha`, `ParsearFecha`, `InicioSemana`, `FinSemana`, `SemanaActual` y `SemanaCerrada`. |
-| `backend/internal/dominio/semana_test.go` | **Nuevo.** Pruebas con casos límite: domingo, cruce de año y cambio de día por zona horaria. |
+| `backend/internal/dominio/espacio.go` | **Nuevo.** `EstadoPeriodo`, `PeriodoAcademico`, `ValidarCodigoPeriodo`, `ValidarFechas`, `PermiteCrearEspacios` y `FiltroPeriodos`. |
+| `backend/internal/dominio/reglas_test.go` | **Modificado.** Pruebas de las reglas de períodos. |
+
+El archivo se llama `espacio.go` porque en el paso 25 recibirá también los cursos y proyectos ("espacios"), que siempre pertenecen a un período.
 
 ---
 
 ## 2. Por qué
 
-Casi todas las reglas del proyecto dependen de la semana:
-- **RF-08.1 / RN-29:** la semana operativa va de **lunes a domingo**.
-- **RF-08.2:** las tareas solo se editan mientras su semana está **activa**.
-- **RF-08.4 / RN-32:** registrar una tarea en una semana ya cerrada la marca como **reporte tardío**.
-- **RF-09:** una semana cerrada sin tareas queda **sin reporte**.
-- **RF-14:** los reportes con IA son de una semana concreta.
+**RF-03.2** dice: "El sistema debe permitir la creación de cursos y proyectos únicamente dentro de un período académico previamente definido y habilitado para creación... registrando como mínimo la identificación del período (por ejemplo 2026-10 o 2026-20), la fecha de inicio, la fecha de cierre y su estado, como activo o cerrado... No deberá permitir la creación en períodos cerrados, inactivos o no habilitados."
 
-Si cada módulo calculara las semanas a su manera, aparecerían diferencias sutiles (¿el domingo es fin o inicio de semana?, ¿en qué zona horaria?). Por eso se resuelve **una vez**, en el dominio, con pruebas de los casos difíciles.
+Y **RN-07**: "Los cursos y proyectos solo pueden ser creados al inicio de un período académico... El sistema debe bloquear la creación fuera de la ventana autorizada."
+
+Estas reglas son puras (no necesitan base de datos) y por eso viven en el dominio.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Cómo se representan las fechas
+### 3.1 Estado y entidad
 
 ```go
-const FormatoFecha = "2006-01-02"
+type EstadoPeriodo string
+
+const (
+	PeriodoActivo  EstadoPeriodo = "activo"
+	PeriodoCerrado EstadoPeriodo = "cerrado"
+)
+
+func (e EstadoPeriodo) EsValido() bool { return e == PeriodoActivo || e == PeriodoCerrado }
 ```
-- En Go, los formatos de fecha se escriben **con una fecha de ejemplo fija**: el 2 de enero de 2006 a las 15:04:05 (1-2-3-4-5-6). `"2006-01-02"` significa "año de 4 dígitos, mes de 2, día de 2": el formato ISO `AAAA-MM-DD` que usa la API.
-
-> Las fechas sin hora (`DATE` en PostgreSQL) se representan como `time.Time` **a medianoche UTC**. Así una fecha no cambia de día al pasar entre zonas horarias.
-
-Un `time.Time` siempre tiene hora y zona. Si "12 de octubre" se guardara como medianoche de Bogotá y luego se convirtiera a UTC, quedaría "12 de octubre 05:00", y en otra zona podría verse como el 11. Al fijar todas las fechas a **medianoche UTC**, el día de calendario nunca se mueve.
-
-### 3.2 Funciones
+- Mismo patrón que los roles (paso 11): un tipo basado en `string`, sus valores posibles y un método para validar lo que llega del exterior.
 
 ```go
-func Fecha(t time.Time, zona *time.Location) time.Time {
-	if zona != nil {
-		t = t.In(zona)
+type PeriodoAcademico struct {
+	ID          string
+	Codigo      string // por ejemplo 2026-20
+	FechaInicio time.Time
+	FechaCierre time.Time
+	Estado      EstadoPeriodo
+	// CreacionHabilitada abre o cierra la ventana en la que los profesores
+	// pueden crear cursos y proyectos (RN-07).
+	CreacionHabilitada bool
+	CreadoEn           time.Time
+}
+```
+- `CreacionHabilitada` es la **ventana de creación** de RN-07. El administrador la abre al inicio del semestre y la cierra cuando ya no se deben crear más cursos o proyectos.
+- **Decisión de diseño:** se eligió un interruptor que controla el administrador en lugar de una fecha límite automática, porque el enunciado no define cuántos días dura "el inicio del período". Una alternativa válida (propuesta en el equipo) es una columna `fecha_limite_creacion`; se puede agregar en el futuro con una migración nueva.
+
+### 3.2 Reglas
+
+```go
+var formatoCodigoPeriodo = regexp.MustCompile(`^\d{4}-\d{2}$`)
+
+func ValidarCodigoPeriodo(codigo string) error {
+	if !formatoCodigoPeriodo.MatchString(codigo) {
+		return apperr.Validacion("el código del período debe tener formato AAAA-NN, por ejemplo 2026-20")
 	}
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	return nil
 }
 ```
-- Convierte un **instante** (por ejemplo, "ahora") en la **fecha de calendario** que le corresponde en la zona dada.
-- Ejemplo de la prueba: el lunes 12 de octubre de 2026 a las 02:00 **UTC** todavía es **domingo 11** en Bogotá (UTC−5). `Fecha(instante, bogota)` devuelve 2026-10-11. Sin la zona horaria, un monitor que reporta el domingo a las 9 p. m. vería su tarea en la semana siguiente.
+- Una **expresión regular**: `^` inicio, `\d{4}` cuatro dígitos, `-` un guion, `\d{2}` dos dígitos, `$` fin. Acepta `2026-20` y rechaza `2026-2` o `20262`.
+- `regexp.MustCompile` compila la expresión **una sola vez** al cargar el programa (variable de paquete) y entra en pánico si estuviera mal escrita: un error de programación, no de datos.
+- El texto entre comillas invertidas evita tener que escribir `\\d`.
 
 ```go
-func ParsearFecha(texto string) (time.Time, error) {
-	return time.ParseInLocation(FormatoFecha, strings.TrimSpace(texto), time.UTC)
+func (p PeriodoAcademico) ValidarFechas() error {
+	if !p.FechaCierre.After(p.FechaInicio) {
+		return apperr.Validacion("la fecha de cierre del período debe ser posterior a la de inicio")
+	}
+	return nil
 }
 ```
-- Interpreta `"2026-10-08"` como medianoche UTC de ese día. Falla con otros formatos (`"14/10/2026"`).
+- Coincide con el `CHECK (fecha_cierre > fecha_inicio)` de la tabla (paso 4), pero aquí produce un mensaje claro (400) en lugar de un error de la base de datos.
 
 ```go
-func InicioSemana(fecha time.Time) time.Time {
-	d := time.Date(fecha.Year(), fecha.Month(), fecha.Day(), 0, 0, 0, 0, time.UTC)
-	desplazamiento := (int(d.Weekday()) + 6) % 7 // lunes=0 ... domingo=6
-	return d.AddDate(0, 0, -desplazamiento)
+func (p PeriodoAcademico) PermiteCrearEspacios(hoy time.Time) error {
+	switch {
+	case p.Estado != PeriodoActivo:
+		return apperr.ReglaNegocio("el período %s está cerrado", p.Codigo)
+	case !p.CreacionHabilitada:
+		return apperr.ReglaNegocio("el período %s no está habilitado para crear cursos o proyectos", p.Codigo)
+	case hoy.After(p.FechaCierre):
+		return apperr.ReglaNegocio("el período %s ya terminó", p.Codigo)
+	}
+	return nil
 }
 ```
-- Devuelve el **lunes** de la semana de cualquier fecha.
-- `Weekday()` numera los días a la manera estadounidense: domingo = 0, lunes = 1, …, sábado = 6. Con `(día + 6) % 7` se reacomoda a lunes = 0, …, domingo = 6, que es exactamente cuántos días hay que retroceder.
-  - jueves (4) → (4+6) % 7 = 3 → retrocede 3 días → lunes;
-  - domingo (0) → (0+6) % 7 = 6 → retrocede 6 días → el lunes anterior.
-- `%` es el resto de la división. `AddDate(0, 0, -n)` resta n días.
-- Toda semana se identifica por **su lunes**. Por eso la tabla `tareas` exige que `semana_inicio` sea lunes (paso 4).
+- Tres condiciones para poder crear cursos o proyectos (RF-03.2, RN-07): el período está **activo**, su ventana de creación está **habilitada** y **no ha terminado**.
+- Son violaciones de **reglas de negocio** (422), no errores de formato.
+- Recibe `hoy` como parámetro (no llama a `time.Now`), para poder probarla con cualquier fecha.
 
 ```go
-func FinSemana(fecha time.Time) time.Time {
-	return InicioSemana(fecha).AddDate(0, 0, 6)
-}
-
-func SemanaActual(ahora time.Time, zona *time.Location) time.Time {
-	return InicioSemana(Fecha(ahora, zona))
-}
-
-func SemanaCerrada(semanaInicio, ahora time.Time, zona *time.Location) bool {
-	return InicioSemana(semanaInicio).Before(SemanaActual(ahora, zona))
+type FiltroPeriodos struct {
+	Estado EstadoPeriodo
+	Paginacion
 }
 ```
-- `FinSemana`: el domingo (lunes + 6 días).
-- `SemanaActual`: el lunes de la semana en curso **según la zona horaria**.
-- `SemanaCerrada`: una semana está cerrada si su lunes es anterior al lunes de la semana actual. Es la base de la tardanza (RN-32) y de la inmutabilidad de las tareas (RN-34).
-- Las funciones reciben `ahora` como parámetro en lugar de llamar a `time.Now()`: así las pruebas pueden fijar el "hoy" que quieran. En el paso 27 se agregará un **reloj inyectable** con la misma idea para los servicios.
 
-### 3.3 Pruebas (`semana_test.go`)
-
-```go
-func fecha(t *testing.T, texto string) time.Time { ... }
-```
-- Auxiliar para escribir fechas legibles en las pruebas: `fecha(t, "2026-10-05")`. Se reutilizará en las pruebas de reglas.
+### 3.3 Pruebas
 
 | Prueba | Casos |
 |---|---|
-| `TestInicioSemanaDevuelveLunes` | Lunes → el mismo; jueves → lunes; **domingo → el lunes anterior**; **1 de enero de 2026 (jueves) → 29 de diciembre de 2025** (cruce de año). |
-| `TestFinSemanaDevuelveDomingo` | Miércoles 7 → domingo 11. |
-| `TestFechaUsaLaZonaHoraria` | 02:00 UTC del lunes 12 es domingo 11 en Bogotá, y la semana actual es la del 5. |
-| `TestSemanaCerrada` | La semana en curso no está cerrada; la anterior sí. |
-| `TestParsearFechaRechazaFormatoInvalido` | `14/10/2026` es inválido. |
+| `TestPeriodoPermiteCrearEspacios` | Un período activo, habilitado y vigente permite crear. Cerrado, inhabilitado o ya terminado → regla de negocio. Fechas iguales (cierre = inicio) → inválido. |
+| `TestCodigoPeriodo` | `2026-20` válido; `2026-2` y `20262` inválidos. |
 
-Las pruebas usan un **mapa entrada → resultado esperado** y un ciclo: es el estilo de *pruebas por tabla*, muy común en Go.
+La prueba crea copias modificadas del período (`cerrado := p; cerrado.Estado = PeriodoCerrado`): asignar un struct **copia** todos sus campos, así que modificar la copia no afecta al original.
 
 ---
 
@@ -116,13 +124,10 @@ Las pruebas usan un **mapa entrada → resultado esperado** y un ciclo: es el es
 
 | Concepto | Explicación |
 |---|---|
-| Formato de fechas | Se escribe con la fecha de referencia `2006-01-02 15:04:05`. |
-| `time.Date(...)` | Construye una fecha con año, mes, día, hora y zona. |
-| `t.In(zona)` | El mismo instante visto en otra zona horaria. |
-| `AddDate(años, meses, días)` | Suma o resta tiempo de calendario. |
-| `Before` / `After` | Comparación de instantes. |
-| `%` | Resto de la división entera. |
-| Pruebas por tabla | Mapa o lista de casos recorrida en un ciclo. |
+| `regexp` | Expresiones regulares; `MustCompile` para patrones fijos. |
+| Variables de paquete | `var formatoCodigoPeriodo = ...` se inicializa una vez al arrancar. |
+| Copia de structs | `b := a` copia todos los campos. |
+| `switch` con condiciones | Devuelve en el primer caso que se cumpla. |
 
 ---
 
@@ -130,31 +135,23 @@ Las pruebas usan un **mapa entrada → resultado esperado** y un ciclo: es el es
 
 ```bash
 cd backend
-go test ./internal/dominio/ -v -run 'Semana|Fecha'
+go test ./internal/dominio/ -v -run 'Periodo'
 ```
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 19
+## 6. Pasos para lograr esta versión desde el paso 20
 
-1. Crear `backend/internal/dominio/semana.go` con `FormatoFecha`, el comentario sobre fechas a medianoche UTC y las seis funciones.
-2. Crear `backend/internal/dominio/semana_test.go` con el auxiliar `fecha` y las cinco pruebas.
+1. Crear `backend/internal/dominio/espacio.go` con `EstadoPeriodo` (y sus constantes y `EsValido`), `PeriodoAcademico`, `formatoCodigoPeriodo`, `ValidarCodigoPeriodo`, `ValidarFechas`, `PermiteCrearEspacios` y `FiltroPeriodos`.
+2. Agregar a `reglas_test.go` (antes de las pruebas de correo) `TestPeriodoPermiteCrearEspacios` y `TestCodigoPeriodo`, con el import de `apperr`.
 3. `make pruebas lint`
-4. Commit: `git add . && git commit -m "Paso 20: dominio de fechas y semanas"`
+4. Commit: `git add . && git commit -m "Paso 21: dominio de períodos académicos"`
 
 ---
 
-## 7. Preparación para las próximas entregas
-
-- **Todo depende de `APP_ZONA_HORARIA`, no de la zona del servidor.** Las máquinas de la nube suelen estar en UTC; gracias a esto, las semanas se siguen calculando en hora de Bogotá aunque la API corra en otra región.
-- La futura notificación de los viernes (fuera del alcance de la Entrega 1) podrá usar estas mismas funciones para saber qué semana está por cerrar.
-
----
-
-## 8. Requisitos que atiende
+## 7. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-08.1 / RN-29 Semana de lunes a domingo | `InicioSemana`, `FinSemana`. |
-| RF-08.2 Semana activa | `SemanaActual` con zona horaria. |
-| RN-32 Tardanza | `SemanaCerrada` (se usará en el paso 34). |
+| RF-03.2 Períodos explícitos | Código, fechas, estado y ventana de creación. |
+| RN-07 Creación solo en la ventana autorizada | `PermiteCrearEspacios`. |
