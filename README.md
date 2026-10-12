@@ -144,10 +144,10 @@ El proveedor se elige **solo con el `.env`**; no hay que tocar código. Por defe
 | Gemini | `openai` | `https://generativelanguage.googleapis.com/v1beta/openai` | clave de AI Studio | modelo Gemini |
 | OpenAI | `openai` | `https://api.openai.com/v1` | clave | modelo |
 | Groq / OpenRouter | `openai` | URL compatible del proveedor | clave | modelo |
-| Ollama local | `openai` | `http://ollama:11434/v1` | (vacío) | p. ej. `qwen2.5:1.5b` |
+| Ollama local | `openai` | `http://ollama:11434/v1` | (vacío) | `qwen2.5:3b` o mayor |
 | Anthropic (Claude) | `anthropic` | (vacío) | clave | opcional, por defecto `claude-opus-5-5` |
 
-Después de cambiar el `.env`, ejecute `docker compose up -d worker`. El log del worker muestra `proveedor de IA configurado` con el proveedor y el modelo activos. Para Ollama: `docker compose --profile ollama up -d` y luego `docker compose exec ollama ollama pull qwen2.5:1.5b`.
+Después de cambiar el `.env`, ejecute `docker compose up -d worker`. El log del worker muestra `proveedor de IA configurado` con el proveedor y el modelo activos. Para Ollama: `docker compose --profile ollama up -d` y luego `docker compose exec ollama ollama pull qwen2.5:3b`. No use modelos más pequeños: con `qwen2.5:1.5b` los resúmenes inventan datos (fechas, reportes tardíos) y llegan a evaluar a la persona, lo que prohíbe RN-46.
 
 ---
 
