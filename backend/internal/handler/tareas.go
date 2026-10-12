@@ -2,12 +2,15 @@ package handler
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"seguimiento/internal/apperr"
 	"seguimiento/internal/auth"
 	"seguimiento/internal/dominio"
 	"seguimiento/internal/servicio"
@@ -20,13 +23,18 @@ type ServicioTareas interface {
 	Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Tarea, error)
 	Actualizar(ctx context.Context, actor auth.Actor, id string, d dominio.DatosTarea) (dominio.Tarea, error)
 	Eliminar(ctx context.Context, actor auth.Actor, id string) error
+	AgregarAdjuntos(ctx context.Context, actor auth.Actor, id string, archivos []servicio.ArchivoAdjunto) (dominio.Tarea, error)
+	AbrirAdjunto(ctx context.Context, actor auth.Actor, tareaID, adjuntoID string) (io.ReadCloser, dominio.Adjunto, error)
+	EliminarAdjunto(ctx context.Context, actor auth.Actor, tareaID, adjuntoID string) error
 	Modificable(actor auth.Actor, t dominio.Tarea) bool
 }
 
 // HandlerTareas expone el registro semanal de tareas (RF-06 a RF-08).
 type HandlerTareas struct {
 	servicio ServicioTareas
-	log      *slog.Logger
+	// maxCuerpo limita las peticiones con archivos (todos los adjuntos juntos).
+	maxCuerpo int64
+	log       *slog.Logger
 }
 
 // Registrar declara las rutas del módulo. Registrar, editar y eliminar es
@@ -40,31 +48,45 @@ func (h *HandlerTareas) Registrar(g *gin.RouterGroup) {
 	r.POST("", operativos, h.Crear)
 	r.PUT("/:id", operativos, h.Actualizar)
 	r.DELETE("/:id", operativos, h.Eliminar)
+	r.POST("/:id/adjuntos", operativos, h.AgregarAdjuntos)
+	r.GET("/:id/adjuntos/:adjunto_id", h.DescargarAdjunto)
+	r.DELETE("/:id/adjuntos/:adjunto_id", operativos, h.EliminarAdjunto)
 }
 
 // --- formatos -------------------------------------------------------------------
 
 type tareaJSON struct {
-	ID              string              `json:"id"`
-	VinculacionID   string              `json:"vinculacion_id"`
-	Usuario         personaRef          `json:"usuario"`
-	Espacio         espacioRef          `json:"espacio"`
-	Rol             dominio.Rol         `json:"rol"`
-	SemanaInicio    string              `json:"semana_inicio"`
-	SemanaFin       string              `json:"semana_fin"`
-	Titulo          string              `json:"titulo"`
-	Descripcion     string              `json:"descripcion"`
-	Estado          dominio.EstadoTarea `json:"estado"`
-	HorasInvertidas int                 `json:"horas_invertidas"`
-	Observaciones   string              `json:"observaciones"`
-	Tardia          bool                `json:"tardia"`
-	Modificable     bool                `json:"modificable"`
-	CreadoEn        time.Time           `json:"creado_en"`
-	ActualizadoEn   time.Time           `json:"actualizado_en"`
+	ID               string              `json:"id"`
+	VinculacionID    string              `json:"vinculacion_id"`
+	Usuario          personaRef          `json:"usuario"`
+	Espacio          espacioRef          `json:"espacio"`
+	Rol              dominio.Rol         `json:"rol"`
+	SemanaInicio     string              `json:"semana_inicio"`
+	SemanaFin        string              `json:"semana_fin"`
+	Titulo           string              `json:"titulo"`
+	Descripcion      string              `json:"descripcion"`
+	Estado           dominio.EstadoTarea `json:"estado"`
+	HorasInvertidas  int                 `json:"horas_invertidas"`
+	Observaciones    string              `json:"observaciones"`
+	Tardia           bool                `json:"tardia"`
+	Modificable      bool                `json:"modificable"`
+	CantidadAdjuntos int                 `json:"cantidad_adjuntos"`
+	Adjuntos         []adjuntoJSON       `json:"adjuntos,omitempty"`
+	CreadoEn         time.Time           `json:"creado_en"`
+	ActualizadoEn    time.Time           `json:"actualizado_en"`
+}
+
+type adjuntoJSON struct {
+	ID            string    `json:"id"`
+	Nombre        string    `json:"nombre"`
+	TipoContenido string    `json:"tipo_contenido"`
+	TamanoBytes   int64     `json:"tamano_bytes"`
+	CreadoEn      time.Time `json:"creado_en"`
+	URLDescarga   string    `json:"url_descarga"`
 }
 
 func (h *HandlerTareas) aTareaJSON(actor auth.Actor, t dominio.Tarea) tareaJSON {
-	return tareaJSON{
+	j := tareaJSON{
 		ID: t.ID, VinculacionID: t.VinculacionID,
 		Usuario:      personaRef{ID: t.UsuarioID, Nombre: t.UsuarioNombre},
 		Espacio:      espacioRef{ID: t.EspacioID, Nombre: t.EspacioNombre, Tipo: t.EspacioTipo, Estado: t.EspacioEstado},
@@ -72,8 +94,15 @@ func (h *HandlerTareas) aTareaJSON(actor auth.Actor, t dominio.Tarea) tareaJSON 
 		SemanaInicio: fecha(t.SemanaInicio), SemanaFin: fecha(dominio.FinSemana(t.SemanaInicio)),
 		Titulo: t.Titulo, Descripcion: t.Descripcion, Estado: t.Estado, HorasInvertidas: t.HorasInvertidas,
 		Observaciones: t.Observaciones, Tardia: t.Tardia, Modificable: h.servicio.Modificable(actor, t),
-		CreadoEn: t.CreadoEn, ActualizadoEn: t.ActualizadoEn,
+		CantidadAdjuntos: t.CantidadAdjuntos, CreadoEn: t.CreadoEn, ActualizadoEn: t.ActualizadoEn,
 	}
+	for _, a := range t.Adjuntos {
+		j.Adjuntos = append(j.Adjuntos, adjuntoJSON{
+			ID: a.ID, Nombre: a.NombreOriginal, TipoContenido: a.TipoContenido, TamanoBytes: a.TamanoBytes, CreadoEn: a.CreadoEn,
+			URLDescarga: "/api/v1/tareas/" + t.ID + "/adjuntos/" + a.ID,
+		})
+	}
+	return j
 }
 
 // peticionTarea crea una tarea. semana es cualquier fecha (AAAA-MM-DD) de la
@@ -101,12 +130,39 @@ func (p peticionActualizarTarea) datos() dominio.DatosTarea {
 		HorasInvertidas: p.HorasInvertidas, Observaciones: p.Observaciones}
 }
 
+// leerPeticionTarea lee la tarea de un JSON o, si la petición es multipart, del
+// campo "datos" junto con los archivos del campo "adjuntos". cerrar libera los
+// archivos abiertos y siempre debe invocarse, incluso si hay error.
+func (h *HandlerTareas) leerPeticionTarea(c *gin.Context) (p peticionTarea, archivos []servicio.ArchivoAdjunto, cerrar func(), err error) {
+	cerrar = func() {}
+	if !esMultipart(c) {
+		return p, nil, cerrar, leerJSON(c, &p)
+	}
+	limitarCuerpo(c, h.maxCuerpo)
+	form, err := formularioMultipart(c)
+	if err != nil {
+		return p, nil, cerrar, err
+	}
+	datos := form.Value["datos"]
+	if len(datos) != 1 {
+		return p, nil, cerrar, apperr.Validacion("el formulario debe incluir el campo \"datos\" con el JSON de la tarea")
+	}
+	if err := decodificarJSON(strings.NewReader(datos[0]), &p); err != nil {
+		return p, nil, cerrar, err
+	}
+	archivos, cerrar, err = leerArchivos(form)
+	return p, archivos, cerrar, err
+}
+
 // --- endpoints ------------------------------------------------------------------
 
-// Crear registra una tarea (RF-06.1 a RF-06.6).
+// Crear registra una tarea (RF-06.1 a RF-06.6). Acepta JSON, o un formulario
+// multipart con el campo "datos" (el mismo JSON) y los archivos en "adjuntos",
+// para registrar la tarea y su evidencia en una sola operación.
 func (h *HandlerTareas) Crear(c *gin.Context) {
-	var p peticionTarea
-	if err := leerJSON(c, &p); err != nil {
+	p, archivos, cerrar, err := h.leerPeticionTarea(c)
+	defer cerrar()
+	if err != nil {
 		responderError(c, h.log, err)
 		return
 	}
@@ -129,7 +185,7 @@ func (h *HandlerTareas) Crear(c *gin.Context) {
 		Semana:        semana,
 		Datos: peticionActualizarTarea{Titulo: p.Titulo, Descripcion: p.Descripcion, Estado: p.Estado,
 			HorasInvertidas: p.HorasInvertidas, Observaciones: p.Observaciones}.datos(),
-	}, nil) // los archivos del formulario multipart llegan en el paso 40
+	}, archivos)
 	if err != nil {
 		responderError(c, h.log, err)
 		return
@@ -162,7 +218,7 @@ func (h *HandlerTareas) Listar(c *gin.Context) {
 	c.JSON(http.StatusOK, convertir(tareas, func(t dominio.Tarea) tareaJSON { return h.aTareaJSON(actor, t) }))
 }
 
-// Obtener devuelve una tarea.
+// Obtener devuelve una tarea con sus adjuntos.
 func (h *HandlerTareas) Obtener(c *gin.Context) {
 	id, err := parametroUUID(c, "id")
 	if err != nil {
@@ -207,6 +263,78 @@ func (h *HandlerTareas) Eliminar(c *gin.Context) {
 		return
 	}
 	if err := h.servicio.Eliminar(c.Request.Context(), ActorDe(c), id); err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// AgregarAdjuntos añade archivos (campo multipart "adjuntos") a la tarea (RF-06.4).
+func (h *HandlerTareas) AgregarAdjuntos(c *gin.Context) {
+	id, err := parametroUUID(c, "id")
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	if !esMultipart(c) {
+		responderError(c, h.log, apperr.Validacion("envíe los archivos como multipart/form-data en el campo \"adjuntos\""))
+		return
+	}
+	limitarCuerpo(c, h.maxCuerpo)
+	form, err := formularioMultipart(c)
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	archivos, cerrar, err := leerArchivos(form)
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	defer cerrar()
+	actor := ActorDe(c)
+	t, err := h.servicio.AgregarAdjuntos(c.Request.Context(), actor, id, archivos)
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	c.JSON(http.StatusCreated, h.aTareaJSON(actor, t))
+}
+
+// DescargarAdjunto entrega el archivo adjunto.
+func (h *HandlerTareas) DescargarAdjunto(c *gin.Context) {
+	id, err := parametroUUID(c, "id")
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	adjuntoID, err := parametroUUID(c, "adjunto_id")
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	contenido, a, err := h.servicio.AbrirAdjunto(c.Request.Context(), ActorDe(c), id, adjuntoID)
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	defer func() { _ = contenido.Close() }()
+	servirArchivo(c, contenido, a.TamanoBytes, a.TipoContenido, a.NombreOriginal)
+}
+
+// EliminarAdjunto quita un archivo de la tarea.
+func (h *HandlerTareas) EliminarAdjunto(c *gin.Context) {
+	id, err := parametroUUID(c, "id")
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	adjuntoID, err := parametroUUID(c, "adjunto_id")
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	if err := h.servicio.EliminarAdjunto(c.Request.Context(), ActorDe(c), id, adjuntoID); err != nil {
 		responderError(c, h.log, err)
 		return
 	}

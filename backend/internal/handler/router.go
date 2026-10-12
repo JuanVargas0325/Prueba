@@ -24,6 +24,8 @@ type Dependencias struct {
 
 	Tokens ValidadorTokens
 	Salud  map[string]ComprobadorSalud
+	// MaxCuerpoArchivosMB limita las peticiones que traen archivos adjuntos.
+	MaxCuerpoArchivosMB int
 	// OrigenesCORS son los orígenes de los frontends que pueden usar la API.
 	OrigenesCORS []string
 	Log          *slog.Logger
@@ -42,6 +44,7 @@ func NuevoRouter(d Dependencias) *gin.Engine {
 	r.Use(gin.Recovery(), RegistrarPeticiones(d.Log), CORS(d.OrigenesCORS))
 	// Detrás de Nginx la IP del cliente llega en X-Forwarded-For.
 	_ = r.SetTrustedProxies([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1"})
+	r.MaxMultipartMemory = 8 << 20 // el resto de cada archivo se guarda en disco temporal
 	r.NoRoute(func(c *gin.Context) {
 		c.JSON(http.StatusNotFound, RespuestaError{Error: "no_encontrado", Mensaje: "ruta no encontrada"})
 	})
@@ -63,7 +66,7 @@ func NuevoRouter(d Dependencias) *gin.Engine {
 		&HandlerPeriodos{servicio: d.Periodos, log: d.Log},
 		&HandlerEspacios{servicio: d.Espacios, log: d.Log},
 		&HandlerVinculaciones{servicio: d.Vinculaciones, log: d.Log},
-		&HandlerTareas{servicio: d.Tareas, log: d.Log},
+		&HandlerTareas{servicio: d.Tareas, maxCuerpo: int64(d.MaxCuerpoArchivosMB) << 20, log: d.Log},
 	}
 	for _, m := range modulos {
 		m.Registrar(protegidas)

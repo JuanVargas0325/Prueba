@@ -18,6 +18,7 @@ import (
 	"seguimiento/internal/auth"
 	"seguimiento/internal/basedatos"
 	"seguimiento/internal/config"
+	"seguimiento/internal/dominio"
 	"seguimiento/internal/handler"
 	"seguimiento/internal/repositorio"
 	"seguimiento/internal/servicio"
@@ -84,8 +85,10 @@ func ejecutar(log *slog.Logger) error {
 		Vinculaciones: servicio.NuevoVinculaciones(vinculaciones, usuarios, espacios, log),
 		Tareas:        servicio.NuevoTareas(tareas, vinculaciones, almacen, reloj, maxBytesAdjunto, log),
 		Tokens:        tokens,
-		OrigenesCORS:  cfg.OrigenesCORS,
-		Log:           log,
+		// Todos los adjuntos de una tarea más un margen para los demás campos.
+		MaxCuerpoArchivosMB: cfg.MaxAdjuntoMB*dominio.MaxAdjuntosPorTarea + 1,
+		OrigenesCORS:        cfg.OrigenesCORS,
+		Log:                 log,
 		Salud: map[string]handler.ComprobadorSalud{
 			"postgres": db.Ping,
 		},

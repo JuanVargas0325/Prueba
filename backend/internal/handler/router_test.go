@@ -34,9 +34,10 @@ func nuevoEntorno(t *testing.T, configurar func(*Dependencias)) entorno {
 	gin.SetMode(gin.TestMode)
 	tokens := auth.NuevoGestorTokens(secretoPrueba, time.Hour)
 	d := Dependencias{
-		Tokens: tokens,
-		Salud:  map[string]ComprobadorSalud{"postgres": func(context.Context) error { return nil }},
-		Log:    logPrueba,
+		Tokens:              tokens,
+		Salud:               map[string]ComprobadorSalud{"postgres": func(context.Context) error { return nil }},
+		MaxCuerpoArchivosMB: 1,
+		Log:                 logPrueba,
 	}
 	if configurar != nil {
 		configurar(&d)

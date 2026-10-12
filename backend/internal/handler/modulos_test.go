@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"testing"
@@ -18,6 +21,7 @@ import (
 
 type servicioTareasFalso struct {
 	nueva       servicio.NuevaTarea
+	archivos    map[string]string // nombre → contenido
 	actualizada dominio.DatosTarea
 	filtro      dominio.FiltroTareas
 	eliminada   string
@@ -29,30 +33,42 @@ func tareaFalsa() dominio.Tarea {
 		Adjuntos: []dominio.Adjunto{{ID: uuidB, NombreOriginal: "evidencia.pdf", TipoContenido: "application/pdf", TamanoBytes: 4}}}
 }
 
-func (s *servicioTareasFalso) Crear(_ context.Context, _ auth.Actor, n servicio.NuevaTarea, _ []servicio.ArchivoAdjunto) (dominio.Tarea, error) {
+func (s *servicioTareasFalso) Crear(_ context.Context, _ auth.Actor, n servicio.NuevaTarea, archivos []servicio.ArchivoAdjunto) (dominio.Tarea, error) {
 	s.nueva = n
+	s.archivos = map[string]string{}
+	for _, a := range archivos {
+		b, _ := io.ReadAll(a.Contenido)
+		s.archivos[a.Nombre] = string(b)
+	}
 	return tareaFalsa(), nil
 }
-
 func (s *servicioTareasFalso) Listar(_ context.Context, _ auth.Actor, f dominio.FiltroTareas) ([]dominio.Tarea, error) {
 	s.filtro = f
 	return []dominio.Tarea{tareaFalsa()}, nil
 }
-
 func (s *servicioTareasFalso) Obtener(context.Context, auth.Actor, string) (dominio.Tarea, error) {
 	return tareaFalsa(), nil
 }
-
 func (s *servicioTareasFalso) Actualizar(_ context.Context, _ auth.Actor, _ string, d dominio.DatosTarea) (dominio.Tarea, error) {
 	s.actualizada = d
 	return tareaFalsa(), nil
 }
-
 func (s *servicioTareasFalso) Eliminar(_ context.Context, _ auth.Actor, id string) error {
 	s.eliminada = id
 	return nil
 }
-
+func (s *servicioTareasFalso) AgregarAdjuntos(_ context.Context, _ auth.Actor, _ string, archivos []servicio.ArchivoAdjunto) (dominio.Tarea, error) {
+	if len(archivos) == 0 {
+		return dominio.Tarea{}, apperr.Validacion("sin archivos")
+	}
+	return tareaFalsa(), nil
+}
+func (s *servicioTareasFalso) AbrirAdjunto(context.Context, auth.Actor, string, string) (io.ReadCloser, dominio.Adjunto, error) {
+	return io.NopCloser(strings.NewReader("%PDF")), tareaFalsa().Adjuntos[0], nil
+}
+func (s *servicioTareasFalso) EliminarAdjunto(context.Context, auth.Actor, string, string) error {
+	return nil
+}
 func (s *servicioTareasFalso) Modificable(auth.Actor, dominio.Tarea) bool { return true }
 
 func entornoTareas(t *testing.T) (entorno, *servicioTareasFalso) {
@@ -71,7 +87,8 @@ func TestCrearTareaConJSON(t *testing.T) {
 	}
 	var j tareaJSON
 	_ = json.Unmarshal(w.Body.Bytes(), &j)
-	if j.SemanaInicio != "2026-10-05" || j.SemanaFin != "2026-10-11" || !j.Modificable {
+	if j.SemanaInicio != "2026-10-05" || j.SemanaFin != "2026-10-11" || !j.Modificable ||
+		j.Adjuntos[0].URLDescarga != "/api/v1/tareas/"+uuidA+"/adjuntos/"+uuidB {
 		t.Errorf("respuesta inesperada: %+v", j)
 	}
 }
@@ -100,6 +117,47 @@ func TestCrearTareaRechazaHorasNoEnterasYCamposDesconocidos(t *testing.T) {
 	}
 }
 
+func formulario(t *testing.T, datos string, archivos map[string]string) (string, *bytes.Buffer) {
+	t.Helper()
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	if datos != "" {
+		_ = mw.WriteField("datos", datos)
+	}
+	for nombre, contenido := range archivos {
+		fw, err := mw.CreateFormFile(campoAdjuntos, nombre)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fw.Write([]byte(contenido))
+	}
+	_ = mw.Close()
+	return mw.FormDataContentType(), &b
+}
+
+func TestCrearTareaConAdjuntosMultipart(t *testing.T) {
+	e, srv := entornoTareas(t)
+	tipo, cuerpo := formulario(t, `{"vinculacion_id":"`+uuidB+`","titulo":"Con evidencia","horas_invertidas":1}`,
+		map[string]string{"evidencia.pdf": "%PDF-contenido", "foto.png": "png"})
+	w := e.peticionCon(http.MethodPost, "/api/v1/tareas", e.token(t, dominio.RolMonitor), tipo, cuerpo)
+	esperarEstado(t, w, http.StatusCreated)
+	if srv.nueva.Datos.Titulo != "Con evidencia" || srv.archivos["evidencia.pdf"] != "%PDF-contenido" || len(srv.archivos) != 2 {
+		t.Errorf("el servicio debería recibir datos y archivos: %+v %v", srv.nueva, srv.archivos)
+	}
+}
+
+func TestCrearTareaMultipartSinDatosEsInvalida(t *testing.T) {
+	e, _ := entornoTareas(t)
+	tipo, cuerpo := formulario(t, "", map[string]string{"a.pdf": "x"})
+	esperarEstado(t, e.peticionCon(http.MethodPost, "/api/v1/tareas", e.token(t, dominio.RolMonitor), tipo, cuerpo), http.StatusBadRequest)
+}
+
+func TestPeticionDemasiadoGrandeResponde413(t *testing.T) {
+	e, _ := entornoTareas(t) // límite de 1 MB en el entorno de prueba
+	tipo, cuerpo := formulario(t, `{"vinculacion_id":"`+uuidB+`","titulo":"x"}`, map[string]string{"grande.pdf": strings.Repeat("x", 2<<20)})
+	esperarEstado(t, e.peticionCon(http.MethodPost, "/api/v1/tareas", e.token(t, dominio.RolMonitor), tipo, cuerpo), http.StatusRequestEntityTooLarge)
+}
+
 func TestListarActualizarYEliminarTareas(t *testing.T) {
 	e, srv := entornoTareas(t)
 	monitor := e.token(t, dominio.RolMonitor)
@@ -120,6 +178,24 @@ func TestListarActualizarYEliminarTareas(t *testing.T) {
 	}
 }
 
+func TestAdjuntosDeTareas(t *testing.T) {
+	e, _ := entornoTareas(t)
+	monitor := e.token(t, dominio.RolMonitor)
+
+	esperarEstado(t, e.peticion(http.MethodPost, "/api/v1/tareas/"+uuidA+"/adjuntos", monitor, `{}`), http.StatusBadRequest)
+
+	tipo, cuerpo := formulario(t, "", map[string]string{"nuevo.pdf": "%PDF"})
+	esperarEstado(t, e.peticionCon(http.MethodPost, "/api/v1/tareas/"+uuidA+"/adjuntos", monitor, tipo, cuerpo), http.StatusCreated)
+
+	w := e.peticion(http.MethodGet, "/api/v1/tareas/"+uuidA+"/adjuntos/"+uuidB, e.token(t, dominio.RolProfesor), "")
+	esperarEstado(t, w, http.StatusOK)
+	if w.Header().Get("Content-Type") != "application/pdf" || !strings.Contains(w.Header().Get("Content-Disposition"), "evidencia.pdf") {
+		t.Errorf("cabeceras inesperadas: %v", w.Header())
+	}
+
+	esperarEstado(t, e.peticion(http.MethodDelete, "/api/v1/tareas/"+uuidA+"/adjuntos/"+uuidB, monitor, ""), http.StatusNoContent)
+}
+
 // --- usuarios, períodos, espacios y vinculaciones ------------------------------------
 
 type servicioUsuariosFalso struct{ nuevo servicio.NuevoUsuario }
@@ -128,15 +204,12 @@ func (s *servicioUsuariosFalso) Crear(_ context.Context, _ auth.Actor, n servici
 	s.nuevo = n
 	return dominio.Usuario{ID: uuidA, Nombre: n.Nombre, Correo: n.Correo, Roles: n.Roles, PasswordHash: "secreto"}, nil
 }
-
 func (s *servicioUsuariosFalso) Listar(context.Context, auth.Actor, dominio.FiltroUsuarios) ([]dominio.Usuario, error) {
 	return []dominio.Usuario{{ID: uuidA}}, nil
 }
-
 func (s *servicioUsuariosFalso) Obtener(context.Context, auth.Actor, string) (dominio.Usuario, error) {
 	return dominio.Usuario{ID: uuidA}, nil
 }
-
 func (s *servicioUsuariosFalso) AsignarRoles(_ context.Context, _ auth.Actor, _ string, roles []dominio.Rol) (dominio.Usuario, error) {
 	return dominio.Usuario{ID: uuidA, Roles: roles}, nil
 }
@@ -165,15 +238,12 @@ func (s *servicioPeriodosFalso) Crear(_ context.Context, _ auth.Actor, n servici
 	s.nuevo = n
 	return dominio.PeriodoAcademico{ID: uuidA, Codigo: n.Codigo, FechaInicio: n.FechaInicio, FechaCierre: n.FechaCierre}, nil
 }
-
 func (s *servicioPeriodosFalso) Listar(context.Context, auth.Actor, dominio.FiltroPeriodos) ([]dominio.PeriodoAcademico, error) {
 	return nil, nil
 }
-
 func (s *servicioPeriodosFalso) Obtener(context.Context, auth.Actor, string) (dominio.PeriodoAcademico, error) {
 	return dominio.PeriodoAcademico{}, nil
 }
-
 func (s *servicioPeriodosFalso) Actualizar(_ context.Context, _ auth.Actor, _ string, c servicio.CambiosPeriodo) (dominio.PeriodoAcademico, error) {
 	s.cambios = c
 	return dominio.PeriodoAcademico{}, nil
@@ -204,15 +274,12 @@ func (s *servicioEspaciosFalso) Crear(_ context.Context, _ auth.Actor, n servici
 	s.nuevo = n
 	return dominio.Espacio{ID: uuidA, Estado: dominio.EspacioActivo}, nil
 }
-
 func (s *servicioEspaciosFalso) Listar(context.Context, auth.Actor, dominio.FiltroEspacios) ([]dominio.Espacio, error) {
 	return nil, nil
 }
-
 func (s *servicioEspaciosFalso) Obtener(context.Context, auth.Actor, string) (dominio.Espacio, error) {
 	return dominio.Espacio{}, apperr.NoEncontrado("curso o proyecto no encontrado")
 }
-
 func (s *servicioEspaciosFalso) Cerrar(context.Context, auth.Actor, string) (dominio.Espacio, error) {
 	return dominio.Espacio{ID: uuidA, Estado: dominio.EspacioCerrado}, nil
 }
@@ -247,20 +314,16 @@ func (s *servicioVinculacionesFalso) Crear(_ context.Context, _ auth.Actor, n se
 	}
 	return dominio.Vinculacion{ID: uuidA}, nil
 }
-
 func (s *servicioVinculacionesFalso) Listar(context.Context, auth.Actor, dominio.FiltroVinculaciones) ([]dominio.Vinculacion, error) {
 	return nil, nil
 }
-
 func (s *servicioVinculacionesFalso) Obtener(context.Context, auth.Actor, string) (dominio.Vinculacion, error) {
 	return dominio.Vinculacion{ID: uuidA}, nil
 }
-
 func (s *servicioVinculacionesFalso) Rectificar(_ context.Context, _ auth.Actor, _ string, r servicio.SolicitudRectificacion) (dominio.Vinculacion, error) {
 	s.rectificacion = r
 	return dominio.Vinculacion{ID: uuidA}, nil
 }
-
 func (s *servicioVinculacionesFalso) ListarRectificaciones(context.Context, auth.Actor, string) ([]dominio.Rectificacion, error) {
 	return nil, nil
 }

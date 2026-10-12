@@ -42,7 +42,6 @@ type repoUsuariosFalso struct {
 func nuevoRepoUsuarios() *repoUsuariosFalso {
 	return &repoUsuariosFalso{usuarios: map[string]dominio.Usuario{}, rolesEnUso: map[dominio.Rol]bool{}}
 }
-
 func (r *repoUsuariosFalso) BuscarPorID(_ context.Context, id string) (dominio.Usuario, error) {
 	u, ok := r.usuarios[id]
 	if !ok {
@@ -50,7 +49,6 @@ func (r *repoUsuariosFalso) BuscarPorID(_ context.Context, id string) (dominio.U
 	}
 	return u, nil
 }
-
 func (r *repoUsuariosFalso) BuscarPorCorreo(_ context.Context, correo string) (dominio.Usuario, error) {
 	for _, u := range r.usuarios {
 		if u.Correo == strings.ToLower(correo) {
@@ -59,28 +57,23 @@ func (r *repoUsuariosFalso) BuscarPorCorreo(_ context.Context, correo string) (d
 	}
 	return dominio.Usuario{}, apperr.NoEncontrado("usuario no encontrado")
 }
-
 func (r *repoUsuariosFalso) Crear(_ context.Context, u dominio.Usuario) (dominio.Usuario, error) {
 	u.ID = "nuevo-" + u.Correo
 	r.usuarios[u.ID] = u
 	return u, nil
 }
-
 func (r *repoUsuariosFalso) Listar(context.Context, dominio.FiltroUsuarios) ([]dominio.Usuario, error) {
 	return nil, nil
 }
-
 func (r *repoUsuariosFalso) ReemplazarRoles(_ context.Context, id string, roles []dominio.Rol) error {
 	u := r.usuarios[id]
 	u.Roles = roles
 	r.usuarios[id] = u
 	return nil
 }
-
 func (r *repoUsuariosFalso) TieneVinculacionesActivas(_ context.Context, _ string, rol dominio.Rol) (bool, error) {
 	return r.rolesEnUso[rol], nil
 }
-
 func (r *repoUsuariosFalso) TieneEspaciosActivos(context.Context, string) (bool, error) {
 	return r.espaciosActivo, nil
 }
@@ -156,7 +149,6 @@ func (r *repoPeriodosFalso) Crear(_ context.Context, p dominio.PeriodoAcademico)
 	r.periodos[p.ID] = p
 	return p, nil
 }
-
 func (r *repoPeriodosFalso) Obtener(_ context.Context, id string) (dominio.PeriodoAcademico, error) {
 	p, ok := r.periodos[id]
 	if !ok {
@@ -164,11 +156,9 @@ func (r *repoPeriodosFalso) Obtener(_ context.Context, id string) (dominio.Perio
 	}
 	return p, nil
 }
-
 func (r *repoPeriodosFalso) Listar(context.Context, dominio.FiltroPeriodos) ([]dominio.PeriodoAcademico, error) {
 	return nil, nil
 }
-
 func (r *repoPeriodosFalso) Actualizar(_ context.Context, p dominio.PeriodoAcademico) (dominio.PeriodoAcademico, error) {
 	r.periodos[p.ID] = p
 	return p, nil
@@ -212,7 +202,6 @@ func (r *repoEspaciosFalso) Crear(_ context.Context, e dominio.Espacio) (dominio
 	r.espacios[e.ID] = e
 	return e, nil
 }
-
 func (r *repoEspaciosFalso) Obtener(_ context.Context, id string) (dominio.Espacio, error) {
 	e, ok := r.espacios[id]
 	if !ok {
@@ -220,18 +209,15 @@ func (r *repoEspaciosFalso) Obtener(_ context.Context, id string) (dominio.Espac
 	}
 	return e, nil
 }
-
 func (r *repoEspaciosFalso) Listar(_ context.Context, f dominio.FiltroEspacios) ([]dominio.Espacio, error) {
 	r.filtro = f
 	return nil, nil
 }
-
 func (r *repoEspaciosFalso) Cerrar(_ context.Context, id string) (dominio.Espacio, error) {
 	e := r.espacios[id]
 	e.Estado = dominio.EspacioCerrado
 	return e, nil
 }
-
 func (r *repoEspaciosFalso) EsParticipante(context.Context, string, string) (bool, error) {
 	return r.participante, nil
 }
@@ -329,7 +315,6 @@ func (r *repoVinculacionesFalso) Crear(_ context.Context, v dominio.Vinculacion,
 	r.creada = v
 	return v, nil
 }
-
 func (r *repoVinculacionesFalso) Rectificar(_ context.Context, id string, rol dominio.Rol, horas int, _, motivo string, validar dominio.ValidadorCarga) (dominio.Vinculacion, error) {
 	v := r.vinculaciones[id]
 	v.Rol, v.HorasSemanales = rol, horas
@@ -339,7 +324,6 @@ func (r *repoVinculacionesFalso) Rectificar(_ context.Context, id string, rol do
 	r.rectificada.rol, r.rectificada.horas, r.rectificada.motivo = rol, horas, motivo
 	return v, nil
 }
-
 func (r *repoVinculacionesFalso) Obtener(_ context.Context, id string) (dominio.Vinculacion, error) {
 	v, ok := r.vinculaciones[id]
 	if !ok {
@@ -347,7 +331,6 @@ func (r *repoVinculacionesFalso) Obtener(_ context.Context, id string) (dominio.
 	}
 	return v, nil
 }
-
 func (r *repoVinculacionesFalso) Listar(_ context.Context, f dominio.FiltroVinculaciones) ([]dominio.Vinculacion, error) {
 	r.filtro = f
 	var resultado []dominio.Vinculacion
@@ -358,7 +341,6 @@ func (r *repoVinculacionesFalso) Listar(_ context.Context, f dominio.FiltroVincu
 	}
 	return resultado, nil
 }
-
 func (r *repoVinculacionesFalso) ListarRectificaciones(context.Context, string) ([]dominio.Rectificacion, error) {
 	return nil, nil
 }
@@ -486,7 +468,6 @@ func (r *repoTareasFalso) Crear(_ context.Context, t dominio.Tarea, adjuntos []d
 	r.creada, r.adjuntos = t, adjuntos
 	return t, nil
 }
-
 func (r *repoTareasFalso) Obtener(_ context.Context, id string) (dominio.Tarea, error) {
 	t, ok := r.tareas[id]
 	if !ok {
@@ -494,30 +475,24 @@ func (r *repoTareasFalso) Obtener(_ context.Context, id string) (dominio.Tarea, 
 	}
 	return t, nil
 }
-
 func (r *repoTareasFalso) Listar(context.Context, dominio.FiltroTareas) ([]dominio.Tarea, error) {
 	return nil, nil
 }
-
 func (r *repoTareasFalso) Actualizar(_ context.Context, t dominio.Tarea) (dominio.Tarea, error) {
 	r.tareas[t.ID] = t
 	return t, nil
 }
-
 func (r *repoTareasFalso) Eliminar(_ context.Context, id string) ([]string, error) {
 	r.eliminadas = append(r.eliminadas, id)
 	return []string{"adjuntos/" + id + "/a.pdf"}, nil
 }
-
 func (r *repoTareasFalso) AgregarAdjuntos(_ context.Context, _ string, adjuntos []dominio.Adjunto, _ int) error {
 	r.adjuntos = append(r.adjuntos, adjuntos...)
 	return nil
 }
-
 func (r *repoTareasFalso) ObtenerAdjunto(context.Context, string, string) (dominio.Adjunto, error) {
 	return dominio.Adjunto{}, nil
 }
-
 func (r *repoTareasFalso) EliminarAdjunto(context.Context, string, string) (string, error) {
 	return "", nil
 }

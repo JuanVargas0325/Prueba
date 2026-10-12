@@ -1,224 +1,236 @@
-# Paso 39 · Adjuntos en el servicio de tareas
+# Paso 40 · Endpoints de adjuntos (multipart)
 
-> Rama `paso-a-paso` · paso 39 de 65 · anterior: **Paso 38 · Almacenamiento local** · siguiente: **Paso 40 · Endpoints de adjuntos (multipart)**
+> Rama `paso-a-paso` · paso 40 de 65 · anterior: **Paso 39 · Adjuntos en el servicio** · siguiente: **Paso 41 · Dominio: seguimiento semanal y "sin reporte"**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-El servicio de tareas ahora maneja **archivos de evidencia**: se pueden enviar al crear la tarea, agregar después, descargar y eliminar, con validación de tipo, tamaño y cantidad.
+Los archivos de evidencia ya se pueden enviar y descargar por HTTP:
+
+| Método | Ruta | Rol | Descripción |
+|---|---|---|---|
+| POST | `/api/v1/tareas` | monitor o asistente | Además de JSON, acepta un formulario **multipart** con el campo `datos` (el JSON de la tarea) y los archivos en `adjuntos`: tarea y evidencia en una sola petición. |
+| POST | `/api/v1/tareas/{id}/adjuntos` | monitor o asistente (dueño) | Agrega archivos a una tarea modificable. |
+| GET | `/api/v1/tareas/{id}/adjuntos/{adjunto_id}` | quien pueda ver la tarea | Descarga el archivo. |
+| DELETE | `/api/v1/tareas/{id}/adjuntos/{adjunto_id}` | monitor o asistente (dueño) | Elimina un adjunto. |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/dominio/tarea.go` | **Modificado.** Límites `MaxAdjuntosPorTarea` (5) y `LongitudMaxNombreArchivo`, lista blanca de tipos permitidos y `ValidarArchivoAdjunto`. |
-| `backend/internal/dominio/reglas_test.go` | **Modificado.** `TestValidarArchivoAdjunto`. |
-| `backend/internal/servicio/tareas.go` | **Modificado.** `ArchivoAdjunto`; el servicio recibe un `Almacenamiento` y un tamaño máximo; `Crear` acepta archivos; nuevos `AgregarAdjuntos`, `AbrirAdjunto` y `EliminarAdjunto`; `Eliminar` borra también los archivos; interfaz `Almacenamiento`. |
-| `backend/internal/servicio/modulos_test.go` | **Modificado.** Entorno de tareas con almacenamiento falso y límite de 10 bytes; dos pruebas nuevas. |
-| `backend/internal/servicio/autenticacion_test.go` | **Modificado.** Doble `almacenamientoFalso` (archivos en memoria). |
-| `backend/internal/handler/tareas.go` y `handler/modulos_test.go` | **Modificados (mínimo).** Se adaptan a la nueva firma de `Crear`; por ahora el handler pasa `nil` como archivos. |
-| `backend/cmd/api/main.go` | **Modificado.** Crea el almacenamiento local y le pasa el tamaño máximo al servicio. |
+| `backend/internal/handler/archivos.go` | **Nuevo.** Lectura de formularios multipart, límite del cuerpo y entrega segura de archivos. |
+| `backend/internal/handler/tareas.go` | **Modificado.** `Crear` acepta multipart; rutas y endpoints de adjuntos; cada tarea muestra sus adjuntos con la URL de descarga. |
+| `backend/internal/handler/router.go` | **Modificado.** `MaxCuerpoArchivosMB` y memoria máxima para formularios. |
+| `backend/internal/handler/router_test.go` y `modulos_test.go` | **Modificados.** Pruebas de multipart, 413 y adjuntos. |
+| `backend/cmd/api/main.go` | **Modificado.** Límite del cuerpo = 5 adjuntos × `ADJUNTO_MAX_MB` + 1 MB. |
+| `nginx/nginx.conf` | **Modificado.** `client_max_body_size 51m`. |
+| `.env.example` | **Modificado.** Nota sobre el límite de Nginx. |
+| `backend/go.mod` | `golang.org/x/text` pasa a ser dependencia directa (quitar tildes de los nombres de archivo). |
+
+```bash
+curl -s -X POST localhost:8080/api/v1/tareas -H "Authorization: Bearer $TOKEN_MONITOR" \
+  -F 'datos={"vinculacion_id":"<id>","titulo":"Con evidencia","horas_invertidas":1}' \
+  -F 'adjuntos=@evidencia.txt'
+# {... "cantidad_adjuntos":1,"adjuntos":[{"id":"450e...","nombre":"evidencia.txt","tipo_contenido":"text/plain; charset=utf-8",
+#   "tamano_bytes":23,"url_descarga":"/api/v1/tareas/ec19.../adjuntos/450e..."}] ...}
+```
 
 ---
 
 ## 2. Por qué
 
-- **RF-06.4 / RN-23:** una tarea puede llevar archivos de evidencia.
-- **Adjuntos al crear:** un reporte **tardío** no se puede modificar después (RN-33); si los adjuntos solo pudieran agregarse luego, una tarea tardía nunca podría tener evidencia. Por eso `Crear` también recibe archivos.
-- **Seguridad:** sin límites, cualquiera podría subir ejecutables, páginas HTML con código o archivos gigantes que llenen el disco.
+- **RF-06.4** queda completo por la API.
+- **`multipart/form-data`** es el formato estándar de los navegadores para enviar archivos. JSON no sirve para binarios (habría que codificarlos en Base64, que ocupa un 33 % más).
+- **Dos límites coordinados:** Nginx corta peticiones enormes antes de que lleguen a la API, y la API también limita (por si algún día se expone sin Nginx). Además, cada archivo tiene su propio máximo (paso 39).
+- **Descargas seguras:** un archivo subido por un usuario nunca debe ejecutarse en el navegador de otro (por ejemplo, un SVG o HTML con código). Siempre se entrega como descarga.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Dominio: qué archivos se aceptan
+### 3.1 `archivos.go`: lectura del formulario
 
 ```go
-const (
-	...
-	MaxAdjuntosPorTarea      = 5
-	LongitudMaxNombreArchivo = 200
-)
+const campoAdjuntos = "adjuntos"
 
-var tiposPermitidos = map[string]string{
-	".pdf":  "application/pdf",
-	".png":  "image/png",
-	...
-	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-	...
-	".zip":  "application/zip",
+func limitarCuerpo(c *gin.Context, maxBytes int64) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+}
+
+func esMultipart(c *gin.Context) bool {
+	return strings.HasPrefix(c.ContentType(), "multipart/form-data")
 }
 ```
-- **Lista blanca**: solo PDF, imágenes, texto, Office y ZIP. Es más segura que una lista negra (siempre aparece una extensión peligrosa que nadie anotó). Quedan fuera `.exe` y `.html`.
-- El tipo de contenido (*MIME type*) que se guarda **lo decide el servidor** según la extensión, no lo que diga el navegador.
+- `http.MaxBytesReader` envuelve el cuerpo: si se leen más bytes del máximo, la lectura falla con `*http.MaxBytesError`, que `responderError` (paso 17) traduce en **413 Payload Too Large**.
 
 ```go
-func ValidarArchivoAdjunto(nombre string) (nombreLimpio, extension, tipo string, err error) {
-	nombreLimpio = strings.TrimSpace(filepath.Base(strings.ReplaceAll(nombre, "\\", "/")))
-	...
-	if r := []rune(nombreLimpio); len(r) > LongitudMaxNombreArchivo {
-		nombreLimpio = string(r[:LongitudMaxNombreArchivo])
-	}
-	extension = strings.ToLower(filepath.Ext(nombreLimpio))
-	tipo, ok := tiposPermitidos[extension]
-	if !ok {
-		return "", "", "", apperr.Validacion("tipo de archivo no permitido (%s): use PDF, imágenes, texto, Office o ZIP", extension)
-	}
-	return nombreLimpio, extension, tipo, nil
-}
-```
-- **Resultados con nombre:** `(nombreLimpio, extension, tipo string, err error)` declara las variables de retorno en la firma.
-- Algunos navegadores (Internet Explorer, ciertas versiones de Edge) envían la ruta completa (`C:\fakepath\..\Informe Final.PDF`). Se reemplazan `\` por `/` y `filepath.Base` deja solo el nombre: `Informe Final.PDF`.
-- La extensión se compara en minúsculas (`.PDF` = `.pdf`).
-
-### 3.2 La interfaz `Almacenamiento`
-
-```go
-// Almacenamiento guarda y recupera archivos binarios.
-type Almacenamiento interface {
-	Guardar(ctx context.Context, ruta string, contenido io.Reader) (int64, error)
-	Abrir(ctx context.Context, ruta string) (io.ReadCloser, error)
-	Eliminar(ctx context.Context, ruta string) error
-}
-```
-- El servicio depende de **esta interfaz**, no de `almacenamiento.Local` (paso 38), que la cumple. Por ahora se declara al final de `tareas.go`; en el paso 48 se trasladará a `reportes.go`, junto a las demás interfaces de infraestructura que también usa el generador de reportes.
-
-### 3.3 `Crear` con archivos
-
-```go
-type ArchivoAdjunto struct {
-	Nombre    string
-	Contenido io.Reader
-}
-
-func (s *Tareas) Crear(ctx context.Context, actor auth.Actor, n NuevaTarea, archivos []ArchivoAdjunto) (dominio.Tarea, error) {
-	... (validaciones del paso 36) ...
-	if len(archivos) > dominio.MaxAdjuntosPorTarea {
-		return dominio.Tarea{}, apperr.Validacion("una tarea admite máximo %d adjuntos", dominio.MaxAdjuntosPorTarea)
-	}
-
-	t := dominio.Tarea{ID: uuid.NewString(), ...}
-	t.Aplicar(datos)
-
-	adjuntos, err := s.guardarArchivos(ctx, t.ID, archivos)
+func formularioMultipart(c *gin.Context) (*multipart.Form, error) {
+	form, err := c.MultipartForm()
 	if err != nil {
-		return dominio.Tarea{}, err
-	}
-	creada, err := s.repo.Crear(ctx, t, adjuntos)
-	if err != nil {
-		s.eliminarArchivos(ctx, adjuntos)
-		return dominio.Tarea{}, err
-	}
-	...
-}
-```
-- El servicio recibe los archivos como **lectores** (`io.Reader`), no como bytes: el contenido pasa del formulario HTTP al disco sin cargarse entero en memoria.
-- Orden: (1) guardar los archivos; (2) guardar la tarea y sus metadatos en una transacción (paso 35). **Si falla la base de datos, se borran los archivos** ya escritos: no quedan archivos huérfanos.
-- Aquí se ve por qué el ID se genera en el servicio (paso 36): los archivos van a `adjuntos/<id de la tarea>/...` **antes** de que exista la fila.
-
-### 3.4 `guardarArchivos`: tamaño máximo sin confiar en el cliente
-
-```go
-func (s *Tareas) guardarArchivos(ctx context.Context, tareaID string, archivos []ArchivoAdjunto) ([]dominio.Adjunto, error) {
-	adjuntos := make([]dominio.Adjunto, 0, len(archivos))
-	for _, archivo := range archivos {
-		nombre, extension, tipo, err := dominio.ValidarArchivoAdjunto(archivo.Nombre)
-		if err != nil {
-			s.eliminarArchivos(ctx, adjuntos)
+		var demasiadoGrande *http.MaxBytesError
+		if errors.As(err, &demasiadoGrande) {
 			return nil, err
 		}
-		id := uuid.NewString()
-		ruta := fmt.Sprintf("adjuntos/%s/%s%s", tareaID, id, extension)
-		// Se lee un byte más del máximo para detectar archivos demasiado grandes.
-		tamano, err := s.almacenamiento.Guardar(ctx, ruta, io.LimitReader(archivo.Contenido, s.maxBytes+1))
-		if err == nil && tamano > s.maxBytes {
-			s.eliminarArchivo(ctx, ruta)
-			err = apperr.Validacion("el archivo %q supera el tamaño máximo de %d MB", nombre, s.maxBytes>>20)
+		return nil, apperr.Validacion("formulario multipart inválido")
+	}
+	return form, nil
+}
+```
+- Interpreta el formulario. Gin guarda en memoria hasta `MaxMultipartMemory` (8 MB, ver 3.3) y el resto **en archivos temporales del sistema**, así un archivo grande no se queda en la RAM.
+
+```go
+func leerArchivos(form *multipart.Form) ([]servicio.ArchivoAdjunto, func(), error) {
+	var abiertos []multipart.File
+	cerrar := func() {
+		for _, f := range abiertos {
+			_ = f.Close()
 		}
-		if err == nil && tamano == 0 {
-			s.eliminarArchivo(ctx, ruta)
-			err = apperr.Validacion("el archivo %q está vacío", nombre)
-		}
+	}
+	var archivos []servicio.ArchivoAdjunto
+	for _, cabecera := range form.File[campoAdjuntos] {
+		f, err := cabecera.Open()
 		if err != nil {
-			s.eliminarArchivos(ctx, adjuntos)
-			return nil, err
+			cerrar() // cierra los que ya se habían abierto
+			return nil, func() {}, apperr.Validacion(...)
 		}
-		adjuntos = append(adjuntos, dominio.Adjunto{...})
+		abiertos = append(abiertos, f)
+		archivos = append(archivos, servicio.ArchivoAdjunto{Nombre: cabecera.Filename, Contenido: f})
 	}
-	return adjuntos, nil
+	return archivos, cerrar, nil
 }
 ```
-- **El nombre en disco no es el del usuario:** es `<UUID><extensión>`. El nombre original se guarda solo en la base de datos (para mostrarlo y para la descarga). Así no hay choques de nombres ni nombres maliciosos en el disco.
-- **El truco del byte extra:** se leen como máximo `maxBytes + 1` bytes. Si se escribieron más de `maxBytes`, el archivo era demasiado grande: se borra y se responde 400. No se confía en el tamaño que declare el cliente, y nunca se escriben gigabytes.
-- `s.maxBytes>>20` convierte bytes a MB (desplazar 20 bits = dividir por 2²⁰).
-- **Todo o nada:** si cualquier archivo falla, se borran los que ya se habían guardado.
+- Abre cada archivo del campo `adjuntos` y lo entrega al servicio como `servicio.ArchivoAdjunto` (nombre + lector).
+- Devuelve **una función para cerrarlos** (`cerrar`); el handler la llama con `defer cerrar()`. Es un patrón común en Go para recursos que hay que liberar.
+- Si un archivo no se puede abrir, cierra los que ya abrió y devuelve una función **vacía** (`func() {}`): así quien la reciba puede llamarla siempre sin preguntar si hubo error.
 
-### 3.5 Agregar, abrir y eliminar adjuntos
+### 3.2 `archivos.go`: entrega segura
 
 ```go
-func (s *Tareas) AgregarAdjuntos(ctx context.Context, actor auth.Actor, id string, archivos []ArchivoAdjunto) (dominio.Tarea, error) {
-	if len(archivos) == 0 { ... 400 ... }
-	if _, err := s.obtenerModificable(ctx, actor, id); err != nil { ... }
-	adjuntos, err := s.guardarArchivos(ctx, id, archivos)
+func servirArchivo(c *gin.Context, contenido io.Reader, tamano int64, tipo, nombre string) {
+	c.DataFromReader(http.StatusOK, tamano, tipo, contenido, map[string]string{
+		"Content-Disposition":    disposicionAdjunto(nombre),
+		"X-Content-Type-Options": "nosniff",
+		"Cache-Control":          "private, no-store",
+	})
+}
+```
+- `DataFromReader` envía el archivo **en flujo** (*streaming*), sin cargarlo entero en memoria.
+- `Content-Disposition: attachment` → el navegador lo **descarga**, nunca lo abre ni ejecuta.
+- `X-Content-Type-Options: nosniff` → el navegador no "adivina" el tipo a partir del contenido; usa el que dice el servidor.
+- `Cache-Control: private, no-store` → ningún proxy ni caché intermedio guarda copias de evidencias personales.
+
+```go
+func disposicionAdjunto(nombre string) string {
+	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, nombreASCII(nombre), url.PathEscape(nombre))
+}
+```
+- **RFC 6266:** `filename` lleva una versión **solo ASCII** (para navegadores antiguos) y `filename*` el nombre original en UTF-8 codificado. Un archivo `Informe Final ñ.pdf` llega como `Informe_Final_n.pdf` o con su nombre exacto, según el navegador.
+
+```go
+func quitarTildes(texto string) string {
+	sinTildes, _, _ := transform.String(transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC), texto)
+	return sinTildes
+}
+
+func nombreASCII(nombre string) string {
+	var b strings.Builder
+	for _, r := range quitarTildes(nombre) {
+		...
+	}
 	...
-	if err := s.repo.AgregarAdjuntos(ctx, id, adjuntos, dominio.MaxAdjuntosPorTarea); err != nil {
-		s.eliminarArchivos(ctx, adjuntos)
-		return dominio.Tarea{}, err
-	}
-	return s.repo.Obtener(ctx, id)
 }
 ```
-- Solo sobre tareas **modificables** (propias, semana activa, no tardías). El máximo de 5 lo controla el repositorio con bloqueo (paso 35).
+- `quitarTildes` usa la técnica estándar de Unicode: `NFD` separa cada letra de su tilde (`é` → `e` + `´`), `runes.Remove(runes.In(unicode.Mn))` borra las marcas diacríticas y `NFC` vuelve a componer. Usa el paquete `golang.org/x/text`. Está en su propia función porque el paso 49 la reutiliza para el nombre de los PDF.
+- `nombreASCII` recorre el texto sin tildes y solo deja letras, números, `.`, `-` y `_` (espacios → `_`).
+
+### 3.3 `router.go`
 
 ```go
-func (s *Tareas) AbrirAdjunto(ctx context.Context, actor auth.Actor, tareaID, adjuntoID string) (io.ReadCloser, dominio.Adjunto, error) {
-	if _, err := s.Obtener(ctx, actor, tareaID); err != nil { ... }
-	a, err := s.repo.ObtenerAdjunto(ctx, tareaID, adjuntoID)
+	// MaxCuerpoArchivosMB limita las peticiones que traen archivos adjuntos.
+	MaxCuerpoArchivosMB int
 	...
-	contenido, err := s.almacenamiento.Abrir(ctx, a.RutaAlmacenamiento)
-	return contenido, a, err
-}
+	r.MaxMultipartMemory = 8 << 20 // el resto de cada archivo se guarda en disco temporal
+	...
+	&HandlerTareas{servicio: d.Tareas, maxCuerpo: int64(d.MaxCuerpoArchivosMB) << 20, log: d.Log},
 ```
-- Descargar exige poder **ver** la tarea (su dueña, su profesor o el administrador).
 
-### 3.6 Borrar archivos sin romper la operación
+### 3.4 `tareas.go`: `Crear` con JSON o multipart
 
 ```go
-func (s *Tareas) eliminarArchivo(ctx context.Context, ruta string) {
-	if err := s.almacenamiento.Eliminar(context.WithoutCancel(ctx), ruta); err != nil {
-		s.log.Warn("no fue posible eliminar el archivo", "ruta", ruta, "error", err)
+func (h *HandlerTareas) leerPeticionTarea(c *gin.Context) (p peticionTarea, archivos []servicio.ArchivoAdjunto, cerrar func(), err error) {
+	cerrar = func() {}
+	if !esMultipart(c) {
+		return p, nil, cerrar, leerJSON(c, &p)
 	}
+	limitarCuerpo(c, h.maxCuerpo)
+	form, err := formularioMultipart(c)
+	if err != nil {
+		return p, nil, cerrar, err
+	}
+	datos := form.Value["datos"]
+	if len(datos) != 1 {
+		return p, nil, cerrar, apperr.Validacion("el formulario debe incluir el campo \"datos\" con el JSON de la tarea")
+	}
+	if err := decodificarJSON(strings.NewReader(datos[0]), &p); err != nil {
+		return p, nil, cerrar, err
+	}
+	archivos, cerrar, err = leerArchivos(form)
+	return p, archivos, cerrar, err
+}
+
+func (h *HandlerTareas) Crear(c *gin.Context) {
+	p, archivos, cerrar, err := h.leerPeticionTarea(c)
+	defer cerrar()
+	if err != nil {
+		responderError(c, h.log, err)
+		return
+	}
+	... (igual que en el paso 37) ...
+	t, err := h.servicio.Crear(c.Request.Context(), actor, servicio.NuevaTarea{...}, archivos)
+```
+- **Un endpoint, dos formatos:** con JSON (como en el paso 37) o con multipart. El campo `datos` trae el **mismo JSON** y se valida con la misma función estricta `decodificarJSON` (paso 17): campos desconocidos, horas decimales, etc.
+- **Por qué una función aparte.** Leer la petición tiene dos caminos y varios errores posibles. Si todo eso estuviera dentro de `Crear`, el método quedaría con `if` anidados y sería difícil ver qué hace el endpoint. Así, `Crear` se lee de arriba abajo: leer la petición, validar, llamar al servicio, responder.
+- **Resultados con nombre:** `(p peticionTarea, archivos ..., cerrar func(), err error)` declara las variables de retorno en la firma. Ya existen al empezar la función (con su valor cero), por eso se puede asignar `cerrar = func() {}` al inicio.
+- `cerrar` **siempre** es una función válida (la vacía si no se abrió nada), así `Crear` puede hacer `defer cerrar()` antes de revisar el error.
+
+```go
+type adjuntoJSON struct {
+	ID            string    `json:"id"`
+	Nombre        string    `json:"nombre"`
+	TipoContenido string    `json:"tipo_contenido"`
+	TamanoBytes   int64     `json:"tamano_bytes"`
+	CreadoEn      time.Time `json:"creado_en"`
+	URLDescarga   string    `json:"url_descarga"`
 }
 ```
-- Si falla el borrado de un archivo, **solo se registra**: la base de datos ya quedó consistente y un archivo huérfano no afecta al usuario.
-- `context.WithoutCancel(ctx)`: la limpieza se hace aunque el cliente haya cerrado la conexión.
-- `Eliminar` (de la tarea) ahora usa las rutas que devuelve el repositorio para borrar los archivos.
+- La tarea ahora incluye `cantidad_adjuntos` y la lista `adjuntos` (en el detalle), cada uno con su **URL de descarga** lista para usar. La ruta interna del archivo en el disco **nunca** se expone.
 
-### 3.7 Cambios mínimos fuera del servicio
+### 3.5 Límites coordinados
 
-- El handler pasa `nil` como archivos (`}, nil)`): en el paso 40 se leerán del formulario multipart.
-- `main.go` crea el almacenamiento configurado (con la función `Nuevo` del paso 38, que hoy entrega el local) y calcula el tamaño máximo:
-  ```go
-  	// Infraestructura
-  	almacen, err := almacenamiento.Nuevo(cfg.Almacenamiento)
-  	...
-  	maxBytesAdjunto := int64(cfg.MaxAdjuntoMB) << 20
-  	...
-  	Tareas: servicio.NuevoTareas(tareas, vinculaciones, almacen, reloj, maxBytesAdjunto, log),
-  ```
-  `<< 20` multiplica por 2²⁰ (MB → bytes).
+```go
+		// Todos los adjuntos de una tarea más un margen para los demás campos.
+		MaxCuerpoArchivosMB: cfg.MaxAdjuntoMB*dominio.MaxAdjuntosPorTarea + 1,
+```
+```nginx
+    # Tamaño máximo de las peticiones: hasta 5 adjuntos de ADJUNTO_MAX_MB (10 MB)
+    # por tarea, más los demás campos. La API aplica el mismo límite.
+    client_max_body_size 51m;
+```
+- 5 archivos × 10 MB + 1 MB de margen = **51 MB**, igual en Nginx y en la API. Por defecto Nginx solo acepta **1 MB**, así que sin este ajuste ningún adjunto real pasaría.
+- Si cambia `ADJUNTO_MAX_MB`, hay que ajustar Nginx a mano (está anotado en `.env.example`).
 
 ---
 
 ## 4. Las pruebas
 
-El entorno de tareas usa un **almacenamiento falso en memoria** y un tamaño máximo de **10 bytes**, para probar el límite sin crear archivos grandes.
-
 | Prueba | Qué verifica |
 |---|---|
-| `TestValidarArchivoAdjunto` (dominio) | `C:\fakepath\..\Informe Final.PDF` → `Informe Final.PDF`, `.pdf`, `application/pdf`. Se rechazan `virus.exe`, `pagina.html`, un nombre sin extensión y uno vacío. |
-| `TestCrearTareaConAdjuntos` | Un PDF se guarda en `adjuntos/<id de la tarea>/...` con su tipo; un archivo de 50 bytes supera el límite → 400 y **no queda nada guardado** (tampoco el archivo válido que iba antes); `virus.exe` → 400; si falla la base de datos, el archivo se borra. |
-| `TestAgregarAdjuntosATareaModificable` | Sin archivos → 400; un PNG se agrega y se guarda. |
-| `TestModificarTareas` (actualizada) | Eliminar una tarea ahora pasa por el almacenamiento. |
+| `TestCrearTareaConJSON` (actualizada) | La respuesta incluye la URL de descarga del adjunto. |
+| `TestCrearTareaConAdjuntosMultipart` | Datos y dos archivos llegan al servicio con su contenido. |
+| `TestCrearTareaMultipartSinDatosEsInvalida` | Un formulario sin `datos` → 400. |
+| `TestPeticionDemasiadoGrandeResponde413` | Con un límite de 1 MB en el entorno de prueba, un archivo de 2 MB → **413**. |
+| `TestAdjuntosDeTareas` | Agregar adjuntos sin multipart → 400; con multipart → 201; la descarga trae `Content-Type` y `Content-Disposition` correctos; eliminar → 204. |
+
+La función de prueba `formulario` arma un cuerpo multipart con `mime/multipart.NewWriter`, igual que un navegador.
 
 ---
 
@@ -226,37 +238,43 @@ El entorno de tareas usa un **almacenamiento falso en memoria** y un tamaño má
 
 | Concepto | Explicación |
 |---|---|
-| Resultados con nombre | `func f() (a, b string, err error)`. |
-| Lista blanca | Solo se acepta lo explícitamente permitido. |
-| `io.LimitReader(r, n+1)` | Detectar archivos que superan `n` bytes sin leerlos completos. |
-| Compensación | Si un paso posterior falla, se deshace lo anterior (borrar archivos). |
-| `<<` / `>>` | Desplazamiento de bits: multiplicar o dividir por potencias de 2. |
+| Resultados con nombre | `func f() (p T, err error)`: las variables de retorno se declaran en la firma. |
+| `multipart/form-data` | Formato de los formularios con archivos. |
+| `http.MaxBytesReader` | Limita el tamaño del cuerpo; al superarlo, 413. |
+| Función de limpieza devuelta | `archivos, cerrar, err := ...; defer cerrar()`. |
+| Streaming | `DataFromReader`, `io.Copy`: datos por partes, sin cargar todo en memoria. |
+| Cabeceras de seguridad | `attachment`, `nosniff`, `no-store`. |
+| Normalización Unicode | NFD + quitar marcas + NFC para eliminar tildes. |
 
 ---
 
 ## 6. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/dominio/ ./internal/servicio/ -v -run 'Adjunto|Tarea'
+make pruebas
+docker compose up --build -d --wait
 ```
 
-Por HTTP los adjuntos estarán disponibles en el paso 40.
+Con Laura vinculada como monitora y su token:
+1. `curl -X POST .../api/v1/tareas -H "Authorization: Bearer $TOKEN" -F 'datos={...}' -F 'adjuntos=@evidencia.txt'` → la tarea con `cantidad_adjuntos: 1` y su `url_descarga`.
+2. Con el token del profesor: `curl -D - localhost:8080<url_descarga>` → 200, `Content-Disposition: attachment; filename="evidencia.txt"...` y `X-Content-Type-Options: nosniff`.
+3. Un PDF de 11 MB → **400** "supera el tamaño máximo de 10 MB" (y no queda guardado: `docker compose exec api find /data -type f`).
+4. Un `.exe` → **400** "tipo de archivo no permitido".
+
+En PowerShell, use `curl.exe` (no el alias `curl`) para que `-F` funcione.
 
 ---
 
-## 7. Pasos para lograr esta versión desde el paso 38
+## 7. Pasos para lograr esta versión desde el paso 39
 
-1. En `dominio/tarea.go`: `MaxAdjuntosPorTarea` y `LongitudMaxNombreArchivo` en las constantes, `tiposPermitidos` y `ValidarArchivoAdjunto`. En `reglas_test.go`: `TestValidarArchivoAdjunto`.
-2. En `servicio/tareas.go`:
-   - en `RepositorioTareas`, los métodos `AgregarAdjuntos`, `ObtenerAdjunto` y `EliminarAdjunto`;
-   - el tipo `ArchivoAdjunto`; los campos `almacenamiento` y `maxBytes` y los parámetros de `NuevoTareas`;
-   - `Crear` con `archivos`; `Eliminar` que borra los archivos; `AgregarAdjuntos`, `AbrirAdjunto`, `EliminarAdjunto`, `guardarArchivos`, `eliminarArchivos` y `eliminarArchivo`;
-   - al final, la interfaz `Almacenamiento`.
-3. En `autenticacion_test.go`: `almacenamientoFalso`. En `modulos_test.go`: `entornoTareas` con almacenamiento y límite de 10 bytes, `Crear(..., nil)` en las pruebas existentes y las dos pruebas nuevas.
-4. En `handler/tareas.go`: la nueva firma de `Crear` en `ServicioTareas` y `nil` en la llamada; en `handler/modulos_test.go`, la firma del servicio falso.
-5. En `main.go`: `almacen` con `almacenamiento.Nuevo(cfg.Almacenamiento)`, `maxBytesAdjunto` y los nuevos argumentos de `NuevoTareas`.
-6. `make pruebas lint` y commit: `git add . && git commit -m "Paso 39: adjuntos en el servicio de tareas"`
+1. `go get golang.org/x/text@v0.43.0 && go mod tidy` (desde `backend/`).
+2. Crear `backend/internal/handler/archivos.go` con `campoAdjuntos`, `limitarCuerpo`, `esMultipart`, `leerArchivos`, `formularioMultipart`, `servirArchivo`, `disposicionAdjunto`, `quitarTildes` y `nombreASCII`.
+3. En `handler/tareas.go`: interfaz completa (`AgregarAdjuntos`, `AbrirAdjunto`, `EliminarAdjunto`), campo `maxCuerpo`, las tres rutas de adjuntos, `adjuntoJSON` y los adjuntos en `aTareaJSON`, `leerPeticionTarea` y `Crear` con multipart, y los endpoints `AgregarAdjuntos`, `DescargarAdjunto` y `EliminarAdjunto`.
+4. En `router.go`: `MaxCuerpoArchivosMB`, `r.MaxMultipartMemory = 8 << 20` y `maxCuerpo` en `HandlerTareas`.
+5. En `router_test.go`: `MaxCuerpoArchivosMB: 1` en `nuevoEntorno`. En `modulos_test.go`: servicio falso completo (guarda el contenido de los archivos), `formulario` y las pruebas de la sección 4.
+6. En `main.go`: `MaxCuerpoArchivosMB: cfg.MaxAdjuntoMB*dominio.MaxAdjuntosPorTarea + 1`.
+7. En `nginx/nginx.conf`: `client_max_body_size 51m;` con su comentario. En `.env.example`: la nota sobre Nginx.
+8. `make pruebas lint`, probar con `curl` y commit: `git add . && git commit -m "Paso 40: endpoints de adjuntos"`
 
 ---
 
@@ -264,7 +282,6 @@ Por HTTP los adjuntos estarán disponibles en el paso 40.
 
 | Requisito | Cómo |
 |---|---|
-| RF-06.4 / RN-23 Evidencias | Adjuntos al crear o después; descarga y eliminación. |
-| RF-08.5 / RN-33 | Los adjuntos de una tarea tardía se envían al crearla (después no se modifica). |
-| RNF-03 Seguridad básica | Lista blanca de tipos, tamaño máximo verificado en el servidor, nombres en disco generados. |
-| RNF-06 Consistencia | Archivos y metadatos se guardan o se descartan juntos. |
+| RF-06.4 / RN-23 Evidencias | Subir (al crear o después), descargar y eliminar adjuntos. |
+| RF-08.5 / RN-33 | Una tarea tardía recibe su evidencia en la misma petición con que se crea. |
+| RNF-03 Seguridad básica | Límite de tamaño en Nginx y en la API (413), descargas como adjunto con `nosniff`. |
