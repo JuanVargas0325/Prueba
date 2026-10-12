@@ -2,15 +2,123 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"seguimiento/internal/apperr"
 	"seguimiento/internal/auth"
 	"seguimiento/internal/dominio"
 	"seguimiento/internal/servicio"
 )
+
+// --- tareas -----------------------------------------------------------------------
+
+type servicioTareasFalso struct {
+	nueva       servicio.NuevaTarea
+	actualizada dominio.DatosTarea
+	filtro      dominio.FiltroTareas
+	eliminada   string
+}
+
+func tareaFalsa() dominio.Tarea {
+	return dominio.Tarea{ID: uuidA, VinculacionID: uuidB, UsuarioID: "usuario-1", Titulo: "Tarea",
+		SemanaInicio: time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC), Estado: dominio.TareaAbierta,
+		Adjuntos: []dominio.Adjunto{{ID: uuidB, NombreOriginal: "evidencia.pdf", TipoContenido: "application/pdf", TamanoBytes: 4}}}
+}
+
+func (s *servicioTareasFalso) Crear(_ context.Context, _ auth.Actor, n servicio.NuevaTarea) (dominio.Tarea, error) {
+	s.nueva = n
+	return tareaFalsa(), nil
+}
+
+func (s *servicioTareasFalso) Listar(_ context.Context, _ auth.Actor, f dominio.FiltroTareas) ([]dominio.Tarea, error) {
+	s.filtro = f
+	return []dominio.Tarea{tareaFalsa()}, nil
+}
+
+func (s *servicioTareasFalso) Obtener(context.Context, auth.Actor, string) (dominio.Tarea, error) {
+	return tareaFalsa(), nil
+}
+
+func (s *servicioTareasFalso) Actualizar(_ context.Context, _ auth.Actor, _ string, d dominio.DatosTarea) (dominio.Tarea, error) {
+	s.actualizada = d
+	return tareaFalsa(), nil
+}
+
+func (s *servicioTareasFalso) Eliminar(_ context.Context, _ auth.Actor, id string) error {
+	s.eliminada = id
+	return nil
+}
+
+func (s *servicioTareasFalso) Modificable(auth.Actor, dominio.Tarea) bool { return true }
+
+func entornoTareas(t *testing.T) (entorno, *servicioTareasFalso) {
+	srv := &servicioTareasFalso{}
+	return nuevoEntorno(t, func(d *Dependencias) { d.Tareas = srv }), srv
+}
+
+func TestCrearTareaConJSON(t *testing.T) {
+	e, srv := entornoTareas(t)
+	w := e.peticion(http.MethodPost, "/api/v1/tareas", e.token(t, dominio.RolMonitor),
+		`{"vinculacion_id":"`+uuidB+`","semana":"2026-10-07","titulo":"Calificar","estado":"en_desarrollo","horas_invertidas":3}`)
+	esperarEstado(t, w, http.StatusCreated)
+	if srv.nueva.VinculacionID != uuidB || srv.nueva.Semana.Format(dominio.FormatoFecha) != "2026-10-07" ||
+		srv.nueva.Datos.HorasInvertidas != 3 || srv.nueva.Datos.Estado != dominio.TareaEnDesarrollo {
+		t.Errorf("datos recibidos inesperados: %+v", srv.nueva)
+	}
+	var j tareaJSON
+	_ = json.Unmarshal(w.Body.Bytes(), &j)
+	if j.SemanaInicio != "2026-10-05" || j.SemanaFin != "2026-10-11" || !j.Modificable {
+		t.Errorf("respuesta inesperada: %+v", j)
+	}
+}
+
+func TestCrearTareaSinSemanaUsaLaSemanaEnCurso(t *testing.T) {
+	e, srv := entornoTareas(t)
+	esperarEstado(t, e.peticion(http.MethodPost, "/api/v1/tareas", e.token(t, dominio.RolAsistenteGraduado),
+		`{"vinculacion_id":"`+uuidB+`","titulo":"x"}`), http.StatusCreated)
+	if !srv.nueva.Semana.IsZero() {
+		t.Error("sin semana, el handler debe dejar que el servicio use la semana en curso")
+	}
+}
+
+func TestCrearTareaRechazaHorasNoEnterasYCamposDesconocidos(t *testing.T) {
+	e, _ := entornoTareas(t)
+	monitor := e.token(t, dominio.RolMonitor)
+	for _, cuerpo := range []string{
+		`{"vinculacion_id":"` + uuidB + `","titulo":"x","horas_invertidas":2.5}`, // RN-24: horas enteras
+		`{"vinculacion_id":"` + uuidB + `","titulo":"x","prioridad":"alta"}`,
+		`{"vinculacion_id":"no-uuid","titulo":"x"}`,
+		`{"vinculacion_id":"` + uuidB + `","titulo":"x","semana":"07/10/2026"}`,
+	} {
+		if w := e.peticion(http.MethodPost, "/api/v1/tareas", monitor, cuerpo); w.Code != http.StatusBadRequest {
+			t.Errorf("cuerpo %s: estado = %d", cuerpo, w.Code)
+		}
+	}
+}
+
+func TestListarActualizarYEliminarTareas(t *testing.T) {
+	e, srv := entornoTareas(t)
+	monitor := e.token(t, dominio.RolMonitor)
+
+	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/tareas?semana=2026-10-08&vinculacion_id="+uuidB+"&limite=5", monitor, ""), http.StatusOK)
+	if srv.filtro.SemanaInicio.Format(dominio.FormatoFecha) != "2026-10-05" || srv.filtro.VinculacionID != uuidB || srv.filtro.Limite != 5 {
+		t.Errorf("filtro inesperado: %+v", srv.filtro)
+	}
+
+	esperarEstado(t, e.peticion(http.MethodPut, "/api/v1/tareas/"+uuidA, monitor, `{"titulo":"Nuevo","estado":"finalizado","horas_invertidas":4}`), http.StatusOK)
+	if srv.actualizada.Titulo != "Nuevo" || srv.actualizada.Estado != dominio.TareaFinalizada {
+		t.Errorf("datos de actualización inesperados: %+v", srv.actualizada)
+	}
+
+	esperarEstado(t, e.peticion(http.MethodDelete, "/api/v1/tareas/"+uuidA, monitor, ""), http.StatusNoContent)
+	if srv.eliminada != uuidA {
+		t.Error("debería eliminarse la tarea indicada")
+	}
+}
 
 // --- usuarios, períodos, espacios y vinculaciones ------------------------------------
 

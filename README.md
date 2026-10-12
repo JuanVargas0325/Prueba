@@ -1,205 +1,217 @@
-# Paso 36 · Servicio de tareas
+# Paso 37 · Endpoints de tareas
 
-> Rama `paso-a-paso` · paso 36 de 65 · anterior: **Paso 35 · Repositorio de tareas** · siguiente: **Paso 37 · Endpoints de tareas**
+> Rama `paso-a-paso` · paso 37 de 65 · anterior: **Paso 36 · Servicio de tareas** · siguiente: **Paso 38 · Almacenamiento local de archivos**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el caso de uso del **registro semanal de tareas**: los monitores y asistentes registran tareas en sus vinculaciones, las editan o eliminan mientras la semana está activa, y cada usuario consulta lo que le corresponde. Los adjuntos se agregarán en el paso 39.
+El registro semanal de tareas queda disponible por HTTP (con JSON; los archivos adjuntos llegan en el paso 40):
+
+| Método | Ruta | Rol | Descripción |
+|---|---|---|---|
+| POST | `/api/v1/tareas` | monitor o asistente | Registra una tarea. `semana` (cualquier fecha de la semana) es opcional: sin ella se usa la semana en curso. |
+| GET | `/api/v1/tareas` | todos | Lista las tareas visibles. Filtros: `?semana=`, `?vinculacion_id=`, `?espacio_id=`, `?usuario_id=`. |
+| GET | `/api/v1/tareas/{id}` | quien pueda verla | Detalle. |
+| PUT | `/api/v1/tareas/{id}` | monitor o asistente (dueño) | Reemplaza los datos editables mientras la semana está activa. |
+| DELETE | `/api/v1/tareas/{id}` | monitor o asistente (dueño) | Elimina la tarea (204). |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/servicio/tareas.go` | **Nuevo.** Servicio `Tareas` con `Crear`, `Listar`, `Obtener`, `Actualizar`, `Eliminar` y `Modificable`, más `obtenerModificable`, `verificarModificable` y `espacioDe`. |
-| `backend/internal/servicio/modulos_test.go` | **Modificado.** Repositorio falso de tareas, lector falso de vinculaciones y cinco pruebas. |
+| `backend/internal/handler/tareas.go` | **Nuevo.** Módulo de tareas. |
+| `backend/internal/handler/respuestas.go` | **Modificado.** `consultaFecha` y `consultaSemana`. |
+| `backend/internal/handler/router.go` | **Modificado.** Servicio `Tareas` y su módulo. |
+| `backend/internal/handler/router_test.go` | **Modificado.** `/api/v1/tareas` exige token; un profesor no registra tareas (403). |
+| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso de tareas y cuatro pruebas. |
+| `backend/cmd/api/main.go` | **Modificado.** Repositorio y servicio de tareas. |
+
+```bash
+curl -s -X POST localhost:8080/api/v1/tareas -H "Authorization: Bearer $TOKEN_MONITOR" -H 'Content-Type: application/json' \
+  -d '{"vinculacion_id":"<id>","titulo":"Calificar taller 2","estado":"en_desarrollo","horas_invertidas":3}'
+# {"id":"...","vinculacion_id":"...","usuario":{...},"espacio":{...},"rol":"monitor",
+#  "semana_inicio":"2026-10-05","semana_fin":"2026-10-11","titulo":"Calificar taller 2",
+#  "estado":"en_desarrollo","horas_invertidas":3,"observaciones":"","tardia":false,"modificable":true,...}
+```
 
 ---
 
 ## 2. Por qué
 
-| Requisito | Cómo lo resuelve el servicio |
-|---|---|
-| RF-06.1 / RN-21 Registrar tareas en **una vinculación propia** | Verifica que la vinculación sea del actor. |
-| RF-06.6 Varias tareas por semana | No hay límite por semana. |
-| RF-08.1 Semana de lunes a domingo | Cualquier fecha se normaliza al lunes. |
-| RF-08.3 Semanas pasadas | Se aceptan. |
-| RF-08.4 / RN-32 Tardanza | Si la semana ya cerró, la tarea se marca `Tardia`. |
-| RF-06.7, RF-06.8 / RN-30, RN-33, RN-34 | Editar o eliminar solo si es propia, la semana sigue activa, no es tardía y el espacio no está cerrado. |
-| RN-09 Espacio cerrado | No admite tareas nuevas ni cambios. |
-| RF-10.5, RF-11.2, RF-12 Visibilidad | Cada uno ve las suyas; el profesor, las de sus espacios; el administrador, todas. |
+- **RF-06 a RF-08** quedan disponibles: registrar, consultar, editar y eliminar tareas con las reglas de semana activa, tardanza e inmutabilidad.
+- **Solo monitores y asistentes registran tareas** (`dominio.RolesOperativos`, paso 11). El profesor las **consulta** (RF-10.5).
+- **`semana_inicio`, `semana_fin`, `tardia` y `modificable` en cada respuesta:** el cliente sabe a qué semana pertenece la tarea, si fue un reporte tardío y si todavía puede editarla, sin calcular nada.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Dependencias
+### 3.1 Rutas
 
 ```go
-type RepositorioTareas interface {
-	Crear(ctx context.Context, t dominio.Tarea, adjuntos []dominio.Adjunto) (dominio.Tarea, error)
-	Obtener(ctx context.Context, id string) (dominio.Tarea, error)
-	Listar(ctx context.Context, f dominio.FiltroTareas) ([]dominio.Tarea, error)
-	Actualizar(ctx context.Context, t dominio.Tarea) (dominio.Tarea, error)
-	Eliminar(ctx context.Context, id string) ([]string, error)
-}
-
-type LectorVinculaciones interface {
-	Obtener(ctx context.Context, id string) (dominio.Vinculacion, error)
-}
-
-type NuevaTarea struct {
-	VinculacionID string
-	Semana        time.Time // cualquier fecha de la semana (se normaliza al lunes); cero = semana en curso
-	Datos         dominio.DatosTarea
+func (h *HandlerTareas) Registrar(g *gin.RouterGroup) {
+	operativos := RequiereRol(dominio.RolesOperativos...)
+	r := g.Group("/tareas")
+	r.GET("", h.Listar)
+	r.GET("/:id", h.Obtener)
+	r.POST("", operativos, h.Crear)
+	r.PUT("/:id", operativos, h.Actualizar)
+	r.DELETE("/:id", operativos, h.Eliminar)
 }
 ```
-- Del repositorio de tareas (paso 35) se usan por ahora cinco métodos; el paso 39 agregará los de adjuntos.
-- `Semana` en su **valor cero** (`time.Time{}`) significa "la semana en curso": el caso más común es registrar lo de esta semana sin indicarla.
+- `dominio.RolesOperativos...` **desempaca** la lista `[monitor, asistente_graduado]` como argumentos de `RequiereRol`.
+- El middleware se guarda en una variable (`operativos`) para reutilizarlo en varias rutas.
 
-### 3.2 `Crear`
+### 3.2 Formato de salida
 
 ```go
-func (s *Tareas) Crear(ctx context.Context, actor auth.Actor, n NuevaTarea) (dominio.Tarea, error) {
-	v, err := s.vinculaciones.Obtener(ctx, n.VinculacionID)
-	if apperr.Es(err, apperr.TipoNoEncontrado) || (err == nil && v.UsuarioID != actor.UsuarioID) {
-		// Solo se registran tareas en vinculaciones propias (RN-04, RN-21).
-		return dominio.Tarea{}, apperr.Validacion("la vinculación indicada no existe o no le pertenece")
-	}
+type tareaJSON struct {
+	ID              string              `json:"id"`
+	VinculacionID   string              `json:"vinculacion_id"`
+	Usuario         personaRef          `json:"usuario"`
+	Espacio         espacioRef          `json:"espacio"`
+	Rol             dominio.Rol         `json:"rol"`
+	SemanaInicio    string              `json:"semana_inicio"`
+	SemanaFin       string              `json:"semana_fin"`
 	...
-	espacio := espacioDe(v)
-	if err := espacio.PermiteRegistros(); err != nil { ... }
-
-	semana := s.reloj.SemanaActual()
-	if !n.Semana.IsZero() {
-		semana = dominio.InicioSemana(n.Semana)
-	}
-	if err := dominio.ValidarSemanaDeRegistro(semana, s.reloj.Ahora(), s.reloj.Zona()); err != nil { ... }
-	if !espacio.IncluyeSemana(semana) {
-		return dominio.Tarea{}, apperr.Validacion("la semana del %s está fuera de las fechas del %s (%s a %s)", ...)
-	}
-	datos, err := n.Datos.Normalizar()
-	...
-	t := dominio.Tarea{
-		ID:            uuid.NewString(),
-		VinculacionID: v.ID,
-		SemanaInicio:  semana,
-		Tardia:        dominio.SemanaCerrada(semana, s.reloj.Ahora(), s.reloj.Zona()),
-	}
-	t.Aplicar(datos)
-
-	creada, err := s.repo.Crear(ctx, t, nil)
+	Tardia          bool                `json:"tardia"`
+	Modificable     bool                `json:"modificable"`
 	...
 }
-```
-1. **La vinculación debe ser del actor.** Una vinculación ajena se responde igual que una inexistente ("no existe o no le pertenece"), sin revelar si existe.
-2. **El espacio no puede estar cerrado** (RN-09, 422). `espacioDe(v)` arma un `dominio.Espacio` con los datos que trae la vinculación, para reutilizar sus reglas sin otra consulta.
-3. **La semana:** la actual por defecto o el lunes de la fecha indicada. No futura y dentro de las fechas del espacio.
-4. **Los datos** se validan con el dominio (paso 34).
-5. **El ID se genera aquí** (`uuid.NewString()`, paso 35).
-6. **`Tardia`** se calcula con la hora del reloj: `true` si la semana ya cerró (RN-32). Es la única forma en que una tarea queda tardía; el usuario no puede marcarla.
-7. Se guarda sin adjuntos (`nil`).
 
-### 3.3 Consultar
+func (h *HandlerTareas) aTareaJSON(actor auth.Actor, t dominio.Tarea) tareaJSON {
+	return tareaJSON{
+		...
+		SemanaInicio: fecha(t.SemanaInicio), SemanaFin: fecha(dominio.FinSemana(t.SemanaInicio)),
+		...
+		Modificable: h.servicio.Modificable(actor, t),
+		...
+	}
+}
+```
+- `aTareaJSON` es un **método** del handler (no una función suelta como en otros módulos) porque necesita el servicio para calcular `modificable` **según quién pregunta**: la misma tarea es modificable para su dueña y no para el profesor.
+
+### 3.3 Peticiones
 
 ```go
-func (s *Tareas) Listar(ctx context.Context, actor auth.Actor, f dominio.FiltroTareas) ([]dominio.Tarea, error) {
-	f.VisiblePara = visiblePara(actor)
-	return s.repo.Listar(ctx, f)
+// peticionTarea crea una tarea. semana es cualquier fecha (AAAA-MM-DD) de la
+// semana reportada; si se omite, se usa la semana en curso.
+type peticionTarea struct {
+	VinculacionID   string              `json:"vinculacion_id"`
+	Semana          string              `json:"semana"`
+	Titulo          string              `json:"titulo"`
+	Descripcion     string              `json:"descripcion"`
+	Estado          dominio.EstadoTarea `json:"estado"`
+	HorasInvertidas int                 `json:"horas_invertidas"`
+	Observaciones   string              `json:"observaciones"`
 }
 
-func (s *Tareas) Obtener(ctx context.Context, actor auth.Actor, id string) (dominio.Tarea, error) {
-	t, err := s.repo.Obtener(ctx, id)
-	...
-	if t.UsuarioID != actor.UsuarioID && !puedeVerDeProfesor(actor, t.ProfesorID) {
-		return dominio.Tarea{}, noEncontrado("tarea")
-	}
-	return t, nil
-}
+type peticionActualizarTarea struct { ... los cinco campos editables ... }
+
+func (p peticionActualizarTarea) datos() dominio.DatosTarea { ... }
 ```
-- Ven una tarea: la persona que la registró, el profesor del espacio y el administrador. Los demás reciben 404.
-
-### 3.4 Modificar
+- `HorasInvertidas int`: `"horas_invertidas": 2.5` → **400** "el campo \"horas_invertidas\" tiene un tipo inválido (se esperaba int)" (RN-24).
+- La actualización **no** tiene `semana` ni `vinculacion_id`: no se pueden cambiar (RN-26).
+- `datos()` convierte la petición en `dominio.DatosTarea`. `Crear` también la reutiliza para los campos comunes.
 
 ```go
-func (s *Tareas) verificarModificable(actor auth.Actor, t dominio.Tarea) error {
-	if t.UsuarioID != actor.UsuarioID {
-		return apperr.Prohibido("solo la persona que registró la tarea puede modificarla")
+	var semana time.Time // vacía = semana en curso, la decide el servicio
+	if p.Semana != "" {
+		if semana, err = parsearFecha("semana", p.Semana); err != nil { ... }
 	}
-	if t.EspacioEstado == dominio.EspacioCerrado {
-		return apperr.ReglaNegocio("el %s %q está cerrado y solo admite consultas", t.EspacioTipo, t.EspacioNombre)
-	}
-	return t.PuedeModificarse(s.reloj.Ahora(), s.reloj.Zona())
-}
-
-func (s *Tareas) obtenerModificable(ctx context.Context, actor auth.Actor, id string) (dominio.Tarea, error) {
-	t, err := s.Obtener(ctx, actor, id)
-	if err != nil {
-		return t, err
-	}
-	return t, s.verificarModificable(actor, t)
-}
 ```
-- Cuatro condiciones: puede **verla** (si no, 404); es **suya** (el profesor la ve pero no la edita: 403); el espacio **no está cerrado** (422); y el dominio lo permite (**no tardía**, **semana activa**: 422).
-- `Actualizar` y `Eliminar` empiezan con `obtenerModificable`. `Actualizar` normaliza los datos, los aplica (`t.Aplicar`) y guarda; la semana y la vinculación no cambian (RN-26).
+- Si no se envía la semana, se pasa el **valor cero** al servicio (paso 36).
+
+### 3.4 Listado con semana normalizada
 
 ```go
-func (s *Tareas) Modificable(actor auth.Actor, t dominio.Tarea) bool {
-	return s.verificarModificable(actor, t) == nil
+func consultaFecha(c *gin.Context, nombre string) (*time.Time, error) { ... }
+
+func consultaSemana(c *gin.Context, nombre string) (*time.Time, error) {
+	f, err := consultaFecha(c, nombre)
+	if f == nil || err != nil {
+		return nil, err
+	}
+	semana := dominio.InicioSemana(*f)
+	return &semana, nil
 }
 ```
-- Responde sí o no. El handler (paso 37) lo incluirá en cada tarea (`"modificable": true/false`) para que una interfaz sepa si mostrar los botones de editar y eliminar.
+- `?semana=2026-10-08` (un jueves) se convierte en el lunes `2026-10-05`. El cliente puede mandar cualquier día.
+- Devuelven **punteros**: `nil` = filtro no indicado.
 
----
+```go
+	f := dominio.FiltroTareas{SemanaInicio: semana, Paginacion: consultaPaginacion(c)}
+	for nombre, destino := range map[string]*string{"vinculacion_id": &f.VinculacionID, "espacio_id": &f.EspacioID, "usuario_id": &f.UsuarioID} {
+		if *destino, err = consultaUUID(c, nombre); err != nil { ... }
+	}
+```
+- Un **mapa de punteros** para leer tres filtros iguales sin repetir el mismo bloque tres veces: para cada nombre de parámetro, se escribe su valor validado en el campo correspondiente del filtro.
 
-## 4. Las pruebas
+### 3.5 Eliminar
 
-El reloj de prueba marca el **miércoles 14 de octubre de 2026** (semana del 12 al 18). `lectorVinculacionesFalso` tiene tres vinculaciones: `v1` (propia, espacio activo de agosto a diciembre), `cerrada` (propia, espacio cerrado) y `ajena` (de otra persona).
+```go
+	c.Status(http.StatusNoContent)
+```
+- **204 No Content**: se eliminó y no hay nada que devolver.
+
+### 3.6 Pruebas
+
+- `TestRutasProtegidasExigenToken` incluye `/api/v1/tareas`; `TestControlDeAccesoPorRol`, que un profesor no registra tareas.
+- En `modulos_test.go`:
 
 | Prueba | Qué verifica |
 |---|---|
-| `TestCrearTareaEnLaSemanaActual` | Con la fecha 15/10 la semana queda en el lunes 12/10; no es tardía; se genera ID; las horas llegan al repositorio. |
-| `TestCrearTareaSinSemanaUsaLaSemanaActual` | Sin semana → semana actual (12/10). |
-| `TestCrearTareaEnSemanaPasadaEsTardia` | Una tarea del 07/10 (semana cerrada) queda **tardía** (RN-32). |
-| `TestCrearTareaValidaciones` | Vinculación ajena o inexistente (400), espacio cerrado (422), semana futura (400), semana fuera de las fechas del espacio (400) y título vacío (400). |
-| `TestModificarTareas` | La tarea de la semana activa se edita; `Modificable` es verdadero solo para su dueña. Pasada, tardía o de espacio cerrado → 422 al editar y al eliminar. El profesor la ve pero no la edita (403); otro profesor ni la ve (404); la dueña la elimina. |
+| `TestCrearTareaConJSON` | Los datos llegan al servicio (vinculación, semana del 07/10, horas, estado) y la respuesta trae `semana_inicio` 05/10, `semana_fin` 11/10 y `modificable`. |
+| `TestCrearTareaSinSemanaUsaLaSemanaEnCurso` | Sin semana, el servicio recibe el valor cero. |
+| `TestCrearTareaRechazaHorasNoEnterasYCamposDesconocidos` | Horas `2.5`, campo desconocido, vinculación que no es UUID y fecha `07/10/2026` → 400. |
+| `TestListarActualizarYEliminarTareas` | `?semana=2026-10-08` llega como el lunes 05/10, con la vinculación y el límite; la actualización llega al servicio; eliminar responde 204. |
 
 ---
 
-## 5. Conceptos de este paso
+## 4. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| `t.IsZero()` | ¿Es el valor cero de `time.Time`? (fecha "no indicada"). |
-| `uuid.NewString()` | Genera un UUID aleatorio (versión 4). |
-| Reutilizar reglas con un valor armado | `espacioDe(v)` construye un `Espacio` para usar `PermiteRegistros` e `IncluyeSemana`. |
-| 404 → 403 → 422 | No verla, no ser dueño, regla de negocio: en ese orden. |
+| `lista...` en una llamada | Pasa los elementos de una lista como argumentos separados. |
+| Método de conversión | `h.aTareaJSON(actor, t)` usa el servicio para un campo que depende del actor. |
+| Mapa de punteros | Leer varios filtros con el mismo código. |
+| 204 No Content | Éxito sin cuerpo de respuesta. |
 
 ---
 
-## 6. Cómo comprobarlo
+## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/servicio/ -v -run 'Tarea'
+make pruebas
+docker compose up --build -d --wait
 ```
 
+Con un profesor, Laura vinculada como monitora (paso 33) y su token:
+1. Crear una tarea sin `semana` → `semana_inicio` = lunes de esta semana, `tardia: false`, `modificable: true`.
+2. Crear otra con `"semana":"<una fecha de la semana pasada>"` → `tardia: true`, `modificable: false`.
+3. `PUT` sobre la tardía → **422** "los reportes tardíos no pueden modificarse ni eliminarse".
+4. Con el token del profesor: `POST /api/v1/tareas` → **403**; `GET /api/v1/tareas?usuario_id=<laura>` → las 2 tareas.
+5. `"horas_invertidas": 2.5` → **400**; una semana futura → **400**.
+6. `DELETE /api/v1/tareas/<la de esta semana>` con el token de Laura → **204**.
+
 ---
 
-## 7. Pasos para lograr esta versión desde el paso 35
+## 6. Pasos para lograr esta versión desde el paso 36
 
-1. Crear `backend/internal/servicio/tareas.go` con `RepositorioTareas` (cinco métodos), `LectorVinculaciones`, `NuevaTarea`, `Tareas`, `NuevoTareas(repo, vinculaciones, reloj, log)` y los métodos de la sección 3.
-2. En `modulos_test.go`, después de vinculaciones, la sección `// --- tareas ---` con `repoTareasFalso`, `lectorVinculacionesFalso`, `entornoTareas`, `nuevaTarea` y las cinco pruebas.
-3. `make pruebas lint`
-4. Commit: `git add . && git commit -m "Paso 36: servicio de tareas"`
+1. En `respuestas.go`: `consultaFecha` y `consultaSemana`.
+2. Crear `backend/internal/handler/tareas.go` con `ServicioTareas` (sin adjuntos), `HandlerTareas`, `Registrar`, `tareaJSON`, `aTareaJSON`, las peticiones y los cinco endpoints.
+3. En `router.go`: campo `Tareas` y `&HandlerTareas{servicio: d.Tareas, log: d.Log}`.
+4. En `router_test.go`: `/api/v1/tareas` en la lista de rutas protegidas (y el token inválido sobre esa ruta) y el caso del profesor.
+5. En `handler/modulos_test.go`: `servicioTareasFalso`, `tareaFalsa`, `entornoTareas` y las cuatro pruebas.
+6. En `main.go`: `tareas = repositorio.NuevoTareas(db)` y `Tareas: servicio.NuevoTareas(tareas, vinculaciones, reloj, log)`.
+7. `make pruebas lint` y commit: `git add . && git commit -m "Paso 37: endpoints de tareas"`
 
 ---
 
-## 8. Requisitos que atiende
+## 7. Requisitos que atiende
 
 | Requisito | Cómo |
 |---|---|
-| RF-06.1, RF-06.2, RF-06.6 | `Crear` en una vinculación propia; varias por semana. |
-| RF-06.7, RF-06.8 | `Actualizar`, `Eliminar`. |
-| RF-08.1 a RF-08.5 | Semana normalizada, pasadas permitidas, futuras no, tardanza e inmutabilidad. |
-| RN-09, RN-21, RN-26, RN-30, RN-32 a RN-34 | Ver tabla de la sección 2. |
-| RF-10.5, RF-11.2, RF-12 | `Listar` y `Obtener` con visibilidad. |
+| RF-06.1 a RF-06.3, RF-06.5, RF-06.6 | `POST /api/v1/tareas` con datos validados y horas enteras. |
+| RF-06.7 / RF-06.8 | `PUT` y `DELETE` sobre tareas propias y modificables. |
+| RF-08.1 a RF-08.5 | Semana normalizada, pasadas permitidas (tardías), futuras rechazadas, tardías inmutables. |
+| RF-10.5 / RF-11.2 / RF-12 | `GET /api/v1/tareas` según quién consulta. |

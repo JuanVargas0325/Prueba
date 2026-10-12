@@ -117,6 +117,26 @@ func validarUUIDOpcional(nombre, valor string) (string, error) {
 	return valor, nil
 }
 
+// consultaFecha lee una fecha opcional (AAAA-MM-DD) de la consulta.
+func consultaFecha(c *gin.Context, nombre string) (*time.Time, error) {
+	texto := c.Query(nombre)
+	if texto == "" {
+		return nil, nil
+	}
+	f, err := parsearFecha(nombre, texto)
+	return &f, err
+}
+
+// consultaSemana lee una fecha opcional y la normaliza al lunes de su semana.
+func consultaSemana(c *gin.Context, nombre string) (*time.Time, error) {
+	f, err := consultaFecha(c, nombre)
+	if f == nil || err != nil {
+		return nil, err
+	}
+	semana := dominio.InicioSemana(*f)
+	return &semana, nil
+}
+
 // parsearFecha interpreta un campo de fecha con formato AAAA-MM-DD.
 func parsearFecha(campo, texto string) (time.Time, error) {
 	f, err := dominio.ParsearFecha(texto)
