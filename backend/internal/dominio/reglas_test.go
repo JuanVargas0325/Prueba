@@ -212,3 +212,92 @@ func TestPaginacion(t *testing.T) {
 		t.Errorf("paginación inesperada: %+v", p)
 	}
 }
+
+// --- seguimiento --------------------------------------------------------------
+
+func datosSeguimiento(t *testing.T) ([]Vinculacion, []Tarea) {
+	vs := []Vinculacion{
+		{ID: "v1", UsuarioID: "u1", UsuarioNombre: "Laura", Rol: RolMonitor, HorasSemanales: 4, EspacioEstado: EspacioActivo,
+			EspacioFechaInicio: fecha(t, "2026-09-07"), EspacioFechaCierre: fecha(t, "2026-12-04"), CreadoEn: fecha(t, "2026-09-01")},
+		{ID: "v2", UsuarioID: "u1", UsuarioNombre: "Laura", Rol: RolAsistenteGraduado, HorasSemanales: 12, EspacioEstado: EspacioActivo,
+			EspacioFechaInicio: fecha(t, "2026-09-21"), EspacioFechaCierre: fecha(t, "2026-12-04"), CreadoEn: fecha(t, "2026-09-01")},
+	}
+	tareas := []Tarea{
+		{VinculacionID: "v1", SemanaInicio: fecha(t, "2026-09-07"), HorasInvertidas: 3, Estado: TareaFinalizada},
+		{VinculacionID: "v2", SemanaInicio: fecha(t, "2026-09-21"), HorasInvertidas: 10, Estado: TareaEnDesarrollo},
+		{VinculacionID: "v1", SemanaInicio: fecha(t, "2026-09-21"), HorasInvertidas: 2, Estado: TareaAbierta, Tardia: true},
+		{VinculacionID: "v1", SemanaInicio: fecha(t, "2026-10-05"), HorasInvertidas: 1, Estado: TareaAbierta},
+	}
+	return vs, tareas
+}
+
+func TestConstruirSemanasDetectaSinReporte(t *testing.T) {
+	vs, tareas := datosSeguimiento(t)
+	ahora := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC) // semana actual: 2026-10-05
+
+	semanas := ConstruirSemanas(vs, tareas, fecha(t, "2026-08-31"), fecha(t, "2026-10-05"), ahora, time.UTC)
+	esperado := map[string]EstadoSemana{
+		"2026-10-05": SemanaEnCurso,
+		"2026-09-28": SemanaSinReporte,
+		"2026-09-21": SemanaConReporte,
+		"2026-09-14": SemanaSinReporte,
+		"2026-09-07": SemanaConReporte,
+	}
+	if len(semanas) != len(esperado) {
+		t.Fatalf("se esperaban %d semanas (sin la del 31/08, anterior al espacio), se obtuvieron %d", len(esperado), len(semanas))
+	}
+	for _, s := range semanas {
+		clave := s.SemanaInicio.Format(FormatoFecha)
+		if s.Estado != esperado[clave] {
+			t.Errorf("semana %s: estado %s, se esperaba %s", clave, s.Estado, esperado[clave])
+		}
+	}
+	// Orden descendente y totales de la semana del 21/09.
+	if semanas[0].SemanaInicio.Format(FormatoFecha) != "2026-10-05" {
+		t.Error("las semanas deben ir de la más reciente a la más antigua")
+	}
+	s21 := semanas[2]
+	if s21.HorasReportadas != 12 || s21.HorasContratadas != 16 || len(s21.Vinculaciones) != 2 {
+		t.Errorf("semana 21/09 inesperada: %+v", s21)
+	}
+	if s21.Vinculaciones[0].TareasTardias != 1 {
+		t.Error("debería contar la tarea tardía")
+	}
+	// En la semana del 14/09 solo estaba vigente la monitoría.
+	if len(semanas[3].Vinculaciones) != 1 {
+		t.Error("la asistencia aún no estaba vigente el 14/09")
+	}
+}
+
+func TestConstruirConsolidado(t *testing.T) {
+	vs, tareas := datosSeguimiento(t)
+	ahora := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+
+	c := ConstruirConsolidado(vs, tareas, ahora, time.UTC)
+	if len(c) != 2 {
+		t.Fatalf("se esperaban 2 consolidados, hay %d", len(c))
+	}
+	monitoria := c[0]
+	// Semanas cerradas vigentes: 07/09, 14/09, 21/09, 28/09 → con reporte 07/09 y 21/09.
+	if monitoria.SemanasTranscurridas != 4 || monitoria.SemanasConReporte != 2 || monitoria.SemanasSinReporte != 2 {
+		t.Errorf("semanas de la monitoría inesperadas: %+v", monitoria)
+	}
+	if monitoria.TotalTareas != 3 || monitoria.TotalHoras != 6 || monitoria.TareasTardias != 1 || monitoria.TareasPorEstado[TareaAbierta] != 2 {
+		t.Errorf("totales de la monitoría inesperados: %+v", monitoria)
+	}
+	if monitoria.PromedioHorasSemana != 5.0/4.0 {
+		t.Errorf("promedio = %v, se esperaba 1.25 (solo semanas cerradas)", monitoria.PromedioHorasSemana)
+	}
+}
+
+func TestAgruparPorPersona(t *testing.T) {
+	vs := []Vinculacion{
+		{UsuarioID: "u2", UsuarioNombre: "Zoe", HorasSemanales: 4, EspacioEstado: EspacioActivo},
+		{UsuarioID: "u1", UsuarioNombre: "andrés", HorasSemanales: 6, EspacioEstado: EspacioActivo},
+		{UsuarioID: "u2", UsuarioNombre: "Zoe", HorasSemanales: 3, EspacioEstado: EspacioCerrado},
+	}
+	p := AgruparPorPersona(vs)
+	if len(p) != 2 || p[0].Nombre != "andrés" || p[1].HorasContratadas != 4 || len(p[1].Vinculaciones) != 2 {
+		t.Errorf("agrupación inesperada: %+v", p)
+	}
+}
