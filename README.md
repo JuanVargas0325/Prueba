@@ -1,177 +1,204 @@
-# Paso 1 · Configuración por variables de entorno
+# Paso 2 · Servidor HTTP con Gin y endpoint `/salud`
 
-> Rama `paso-a-paso` · paso 1 de 65 · anterior: **Paso 0 · Estructura inicial** · siguiente: **Paso 2 · Servidor HTTP con Gin y /salud**
+> Rama `paso-a-paso` · paso 2 de 65 · anterior: **Paso 1 · Configuración** · siguiente: **Paso 3 · Conexión a PostgreSQL**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el paquete `config`, el único lugar del programa que lee variables de entorno, y la API lo usa al arrancar.
+La API ya es un **servidor web**: escucha en el puerto configurado (`APP_PUERTO`, 8080 por defecto) y responde a `GET /salud`.
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/config/config.go` | **Nuevo.** Define la estructura `Config` y la función `Cargar()`, que lee `APP_ENTORNO`, `APP_PUERTO` y `APP_ZONA_HORARIA`, aplica valores por defecto y valida. |
-| `backend/internal/config/config_test.go` | **Nuevo.** Primeras pruebas unitarias del proyecto. |
-| `backend/cmd/api/main.go` | **Modificado.** Llama a `config.Cargar()` y registra la configuración en el log. |
+| `backend/go.mod`, `backend/go.sum` | **Modificados / nuevo.** Se agrega la librería **Gin** (`github.com/gin-gonic/gin v1.12.0`). |
+| `backend/internal/handler/router.go` | **Nuevo.** Crea el router de Gin y el endpoint `/salud`. |
+| `backend/internal/handler/router_test.go` | **Nuevo.** Utilidades de prueba HTTP y dos pruebas de `/salud`. |
+| `backend/cmd/api/main.go` | **Modificado.** Levanta el servidor HTTP y lo apaga de forma ordenada al recibir Ctrl+C o `SIGTERM`. |
 
-Ahora `go run ./cmd/api` imprime:
+Ejemplo:
 
-```json
-{"time":"...","level":"INFO","msg":"configuración cargada","servicio":"api","entorno":"desarrollo","puerto":"8080","zona_horaria":"America/Bogota"}
+```bash
+curl http://localhost:8080/salud
+# {"estado":"ok","componentes":{}}
 ```
 
 ---
 
 ## 2. Por qué
 
-- **Un solo lugar para la configuración.** Si cada parte del código leyera `os.Getenv` por su cuenta, sería difícil saber qué variables existen, cuáles son obligatorias y qué valores por defecto tienen. Con un paquete `config`:
-  - todas las variables se ven en un archivo;
-  - se validan **al arrancar** (si falta algo, el programa se detiene con un mensaje claro en lugar de fallar más tarde en medio de una petición);
-  - el resto del código recibe un `struct` ya validado y se puede probar sin tocar el entorno.
-- **Sin secretos en el código** (lineamientos, sección 10): los valores reales vienen del `.env` de cada persona o de la plataforma donde se despliegue.
-- **La zona horaria importa para las reglas de negocio:** las semanas del proyecto van de lunes a domingo (RF-08.1). Un registro hecho el domingo a las 11 p. m. en Bogotá ya es lunes en UTC. Por eso la zona es configurable y por defecto es `America/Bogota`.
+- **Gin** es uno de los dos frameworks web que exige el stack del curso (Gin o Echo). Sobre la librería estándar `net/http` agrega: rutas con parámetros (`/tareas/:id`), grupos de rutas, middleware (código que se ejecuta antes o después de cada petición) y utilidades para leer y escribir JSON.
+- **`/salud` (health check)** es el primer endpoint porque lo necesita la infraestructura:
+  - Docker lo consultará (paso 5) para saber si el contenedor está sano;
+  - Docker Compose y Nginx esperarán a que la API esté sana antes de enviarle tráfico (pasos 6 y 7);
+  - en la Entrega 3, el balanceador de carga de la nube lo usará para sacar de servicio una instancia que falle.
+- **Apagado ordenado (graceful shutdown):** cuando Docker detiene un contenedor envía la señal `SIGTERM`. Si el programa simplemente muriera, las peticiones en curso se cortarían a la mitad. Con el apagado ordenado, el servidor deja de aceptar conexiones nuevas, termina las que están en curso (hasta 15 segundos) y sale.
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 `internal/config/config.go`
+### 3.1 Agregar la dependencia
 
-#### Por qué en `internal/`
+```bash
+cd backend
+go get github.com/gin-gonic/gin@v1.12.0
+go mod tidy
+```
 
-`internal` es una carpeta con significado especial para el compilador de Go: los paquetes que están dentro solo pueden ser importados por código del mismo módulo (`seguimiento`). Así se deja claro que es código interno de esta aplicación y no una librería pública.
+- `go get` descarga la librería en la versión indicada y la anota en `go.mod` (`require github.com/gin-gonic/gin v1.12.0`).
+- `go mod tidy` ordena `go.mod`: agrega las dependencias indirectas (las librerías que Gin necesita, marcadas `// indirect`) y quita las que ya no se usan.
+- Se crea **`go.sum`**, que guarda un hash criptográfico de cada dependencia. Garantiza que todos (usted, sus compañeros, Docker y GitHub Actions) descarguen exactamente el mismo código. Se versiona, pero nunca se edita a mano.
+- Las librerías se descargan del proxy oficial `proxy.golang.org` y quedan en la caché local (`%USERPROFILE%\go\pkg\mod` en Windows).
 
-El paquete se llama `config` (igual que su carpeta, que es la convención) y se importa como `seguimiento/internal/config`, es decir, la ruta del módulo (`go.mod`) más la carpeta.
+### 3.2 `internal/handler/router.go`
 
-#### La estructura `Config`
+El paquete `handler` será la **capa de presentación**: la única que sabe de HTTP. En los pasos siguientes recibirá un archivo por módulo (usuarios, tareas, reportes...).
 
 ```go
-type Config struct {
-	Entorno     string // desarrollo | produccion
-	PuertoHTTP  string
-	ZonaHoraria *time.Location
+type ComprobadorSalud func(ctx context.Context) error
+```
+
+- Define un **tipo función**: cualquier función que reciba un `context.Context` y devuelva un `error` es un `ComprobadorSalud`. En el paso 3 se pasará la función que hace *ping* a PostgreSQL; en el paso 49, la que hace *ping* a Redis. El router no necesita saber qué hay detrás.
+
+```go
+type Dependencias struct {
+	Salud map[string]ComprobadorSalud
 }
 ```
 
-- Un `struct` agrupa datos con nombre, como una clase sin métodos de otros lenguajes.
-- Los campos empiezan en mayúscula: se **exportan**, así que `main` puede leer `cfg.PuertoHTTP`.
-- `*time.Location` es un puntero a la zona horaria ya interpretada (no el texto `"America/Bogota"`, sino el objeto que sabe calcular la hora local).
-- `PuertoHTTP` es texto porque se usará para armar la dirección `":8080"`.
-
-#### Un método
+- `Dependencias` agrupa todo lo que el router necesita desde fuera. Hoy solo los comprobadores de salud; después, los servicios de cada módulo. Así `NuevoRouter` no crea nada por su cuenta: **recibe** lo que usa (inyección de dependencias), y las pruebas pueden pasarle versiones falsas.
+- `map[string]ComprobadorSalud` es un diccionario: nombre de la dependencia → función que la comprueba.
 
 ```go
-func (c Config) EsDesarrollo() bool { return c.Entorno == "desarrollo" }
-```
-
-- `(c Config)` es el **receptor**: convierte la función en un método de `Config`. Se usa como `cfg.EsDesarrollo()`.
-- Se usará en el paso 2 para decidir el modo del framework web.
-
-#### `Cargar()`
-
-```go
-func Cargar() (Config, error) {
-	var errs []error
-	c := Config{
-		Entorno:    texto("APP_ENTORNO", "desarrollo"),
-		PuertoHTTP: texto("APP_PUERTO", "8080"),
-	}
-```
-
-- Devuelve **dos valores**: la configuración y un error. En Go es la forma normal de informar errores.
-- `var errs []error` declara una lista (slice) vacía de errores. La idea es **acumular todos los problemas** y reportarlos juntos, para que quien configura vea de una vez todo lo que falta en lugar de corregir un error, volver a arrancar y descubrir el siguiente.
-- `Config{Campo: valor, ...}` crea el struct con los valores que se conocen ya.
-
-```go
-	zona, err := time.LoadLocation(texto("APP_ZONA_HORARIA", "America/Bogota"))
-	if err != nil {
-		errs = append(errs, fmt.Errorf("APP_ZONA_HORARIA: %w", err))
-	}
-	c.ZonaHoraria = zona
-```
-
-- `time.LoadLocation` busca la zona en la base de datos de zonas horarias. Falla si el nombre no existe (`Marte/Monte_Olimpo`).
-- `fmt.Errorf("APP_ZONA_HORARIA: %w", err)` crea un error nuevo que **envuelve** al original (`%w`): el mensaje dice qué variable está mal y conserva la causa.
-- `append` agrega un elemento a la lista y devuelve la lista nueva.
-
-```go
-	return c, errors.Join(errs...)
+func NuevoRouter(d Dependencias) *gin.Engine {
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.GET("/salud", salud(d.Salud))
+	return r
 }
 ```
 
-- `errors.Join` une varios errores en uno solo (un mensaje por línea). Si la lista está vacía, devuelve `nil`, es decir, "sin error".
-- `errs...` "desempaca" la lista como argumentos separados.
-
-#### La función auxiliar `texto`
+- `gin.New()` crea un router vacío (sin el middleware que trae `gin.Default()`, para decidir explícitamente cuál usar).
+- `r.Use(gin.Recovery())`: si algún handler entra en **pánico** (un error grave como acceder a un puntero `nil`), Recovery lo captura y responde 500 en lugar de tumbar todo el servidor.
+- `r.GET("/salud", ...)` asocia la ruta y el método HTTP con una función que atiende la petición.
 
 ```go
-func texto(clave, porDefecto string) string {
-	if v := strings.TrimSpace(os.Getenv(clave)); v != "" {
-		return v
-	}
-	return porDefecto
+type estadoSalud struct {
+	Estado      string            `json:"estado"`
+	Componentes map[string]string `json:"componentes"`
 }
 ```
 
-- `os.Getenv` devuelve el valor de la variable de entorno, o `""` si no existe.
-- `strings.TrimSpace` quita espacios al inicio y al final. Así, `APP_PUERTO= 8080 ` funciona igual que `APP_PUERTO=8080`.
-- Si queda vacía, usa el valor por defecto.
-- Empieza en minúscula: es **privada** del paquete `config`.
-- `clave, porDefecto string`: cuando parámetros seguidos tienen el mismo tipo, basta escribirlo una vez.
-
-### 3.2 `internal/config/config_test.go`
-
-Las pruebas de Go viven junto al código, en archivos que terminan en `_test.go` (no se incluyen en el programa compilado).
+- Las **etiquetas** entre comillas invertidas (`` `json:"estado"` ``) le dicen al paquete de JSON qué nombre usar para cada campo. Sin ellas, el JSON tendría `"Estado"` con mayúscula.
 
 ```go
-func TestCargarUsaValoresPorDefecto(t *testing.T) {
-	t.Setenv("APP_ENTORNO", "")
-	t.Setenv("APP_PUERTO", "")
-	t.Setenv("APP_ZONA_HORARIA", "")
-
-	c, err := Cargar()
-	if err != nil {
-		t.Fatal(err)
+func salud(comprobadores map[string]ComprobadorSalud) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx, cancelar := context.WithTimeout(c.Request.Context(), 3*time.Second)
+		defer cancelar()
+		respuesta := estadoSalud{Estado: "ok", Componentes: map[string]string{}}
+		codigo := http.StatusOK
+		for nombre, comprobar := range comprobadores {
+			if err := comprobar(ctx); err != nil {
+				respuesta.Componentes[nombre] = "error"
+				respuesta.Estado = "degradado"
+				codigo = http.StatusServiceUnavailable
+				continue
+			}
+			respuesta.Componentes[nombre] = "ok"
+		}
+		c.JSON(codigo, respuesta)
 	}
-	...
 }
 ```
 
-- Toda función `TestXxx(t *testing.T)` es una prueba; `go test` las encuentra y ejecuta automáticamente.
-- `t.Setenv` cambia una variable de entorno **solo durante esa prueba** y la restaura al final. Así la prueba no depende de lo que haya en su computador.
-- `t.Fatal` marca la prueba como fallida y la detiene; `t.Errorf` la marca como fallida pero sigue ejecutando para reportar más problemas.
-- `%+v` en `t.Errorf` imprime un struct con los nombres de sus campos, útil para entender qué salió mal.
+- `salud` es una función que **devuelve otra función** (el handler). La función interna "recuerda" el mapa `comprobadores` aunque `salud` ya haya terminado: eso se llama **closure**.
+- `gin.Context` (`c`) representa la petición y la respuesta en curso.
+- `context.WithTimeout(..., 3*time.Second)`: cada comprobación tiene como máximo 3 segundos. Si la base de datos no responde, `/salud` no se queda colgado.
+- `defer cancelar()`: `defer` programa una instrucción para que se ejecute **al salir de la función**, pase lo que pase. Aquí libera los recursos del temporizador.
+- `for nombre, comprobar := range comprobadores` recorre el mapa (clave y valor).
+- Si alguna dependencia falla, la respuesta es **503 Service Unavailable** con estado `degradado`; si todas responden, **200 OK**. Ese código es lo que mirarán Docker y el balanceador.
+- `continue` salta a la siguiente vuelta del ciclo.
+- `c.JSON(codigo, respuesta)` convierte el struct a JSON y lo envía con el código indicado.
+- En este paso el mapa está vacío, así que la respuesta es `{"estado":"ok","componentes":{}}`.
 
-La segunda prueba comprueba que una zona inexistente produce un error que **nombra la variable** (`APP_ZONA_HORARIA`), que es lo que necesita quien configura el sistema.
+### 3.3 `internal/handler/router_test.go`
 
-### 3.3 `cmd/api/main.go`
+Las pruebas HTTP no levantan un servidor real: usan `httptest`, que permite entregar una petición falsa al router y capturar la respuesta en memoria. Son rápidas y no ocupan puertos.
+
+- `nuevoEntorno(t, configurar)` arma un router con dependencias por defecto (un "postgres" que siempre responde bien). El parámetro `configurar` permite que cada prueba cambie lo que necesite.
+- `peticion(metodo, ruta, cuerpo)` crea la petición con `httptest.NewRequest`, la pasa por el router (`ServeHTTP`) y devuelve el `ResponseRecorder` con el código y el cuerpo.
+- `esperarEstado` falla la prueba si el código no es el esperado y muestra el cuerpo para entender por qué.
+- `t.Helper()` le indica a Go que, si la prueba falla dentro de esta función auxiliar, reporte la línea de **quien la llamó**, que es la que interesa.
+- `gin.SetMode(gin.TestMode)` silencia los mensajes de depuración de Gin durante las pruebas.
+
+Las dos pruebas verifican el contrato de `/salud`: 200 cuando todo está bien y 503 cuando una dependencia falla.
+
+### 3.4 `cmd/api/main.go`
 
 ```go
-import (
-	"log/slog"
-	"os"
-	_ "time/tzdata" // incluye las zonas horarias en el binario
-
-	"seguimiento/internal/config"
-)
-```
-
-- `_ "time/tzdata"` es un **import en blanco**: no se usa nada del paquete por nombre, pero al importarlo se incluye dentro del ejecutable la base de datos completa de zonas horarias. Sin esto, `time.LoadLocation("America/Bogota")` dependería de que el sistema operativo tenga esa información instalada, y la imagen mínima de Linux que se usará en el paso 5 podría no tenerla.
-- Los imports se agrupan por convención: primero la librería estándar y, separados por una línea en blanco, los paquetes propios.
-
-```go
-func ejecutar(log *slog.Logger) error {
-	cfg, err := config.Cargar()
-	if err != nil {
-		return err
+	if !cfg.EsDesarrollo() {
+		gin.SetMode(gin.ReleaseMode)
 	}
-	log.Info("configuración cargada", "entorno", cfg.Entorno, "puerto", cfg.PuertoHTTP, "zona_horaria", cfg.ZonaHoraria.String())
-	return nil
-}
 ```
+- En producción, Gin no imprime sus avisos de depuración.
 
-- Si la configuración es inválida, `ejecutar` devuelve el error; `main` lo registra y termina con código 1.
-- `log.Info(mensaje, clave, valor, clave, valor...)` agrega campos al JSON del log.
+```go
+	ctx, detener := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer detener()
+```
+- Crea un **contexto** que se cancela cuando el proceso recibe Ctrl+C (`os.Interrupt`) o `SIGTERM` (lo que envía `docker stop`). Un `context.Context` es la forma estándar de Go de avisar "hay que parar" a todo lo que esté trabajando.
+
+```go
+	router := handler.NuevoRouter(handler.Dependencias{})
+
+	servidor := &http.Server{
+		Addr:              ":" + cfg.PuertoHTTP,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+```
+- Se usa el servidor de la librería estándar (`http.Server`) con el router de Gin como `Handler`. Así se controlan los **tiempos máximos**:
+  - `ReadHeaderTimeout` (10 s): un cliente que envía las cabeceras muy despacio no puede retener una conexión indefinidamente (protección contra el ataque *Slowloris*);
+  - `ReadTimeout` y `WriteTimeout` (5 min): margen para subir y descargar archivos (adjuntos y PDF, pasos 40 y 49);
+  - `IdleTimeout` (2 min): cuánto se mantiene abierta una conexión sin uso.
+- `":" + cfg.PuertoHTTP` produce `":8080"`: escuchar en el puerto 8080 de **todas** las interfaces de red (necesario dentro de un contenedor).
+- `&http.Server{...}` crea el struct y devuelve un **puntero** a él (`&`).
+
+```go
+	errServidor := make(chan error, 1)
+	go func() {
+		log.Info("API escuchando", "puerto", cfg.PuertoHTTP, "entorno", cfg.Entorno)
+		errServidor <- servidor.ListenAndServe()
+	}()
+```
+- `ListenAndServe` **bloquea**: se queda atendiendo peticiones hasta que el servidor se detiene. Por eso se ejecuta en una **goroutine** (`go func() {...}()`), un hilo de ejecución liviano de Go, para que `ejecutar` pueda seguir y esperar la señal de apagado.
+- `make(chan error, 1)` crea un **canal**: una "tubería" por la que la goroutine envía (`<-`) el error con el que terminó el servidor. El `1` le da espacio para un mensaje sin que nadie lo esté leyendo todavía.
+
+```go
+	select {
+	case err := <-errServidor:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case <-ctx.Done():
+		log.Info("deteniendo la API")
+	}
+```
+- `select` espera a que **uno** de los casos ocurra:
+  - el servidor terminó por su cuenta (por ejemplo, el puerto ya estaba ocupado): se devuelve ese error;
+  - llegó Ctrl+C o `SIGTERM` (`ctx.Done()` se cierra): se procede a apagar.
+- `errors.Is(err, http.ErrServerClosed)` distingue el "error" normal de un servidor que se cerró a propósito.
+
+```go
+	ctxCierre, cancelar := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelar()
+	return servidor.Shutdown(ctxCierre)
+```
+- `Shutdown` deja de aceptar conexiones y espera a que terminen las peticiones en curso, como máximo 15 segundos. Docker espera 10 segundos por defecto antes de matar el proceso; para la mayoría de peticiones es suficiente.
 
 ---
 
@@ -179,65 +206,67 @@ func ejecutar(log *slog.Logger) error {
 
 | Concepto | Explicación |
 |---|---|
-| `struct` | Tipo que agrupa campos con nombre. Se crea con `Config{Campo: valor}`. |
-| Método | Función con receptor: `func (c Config) EsDesarrollo() bool`. |
-| Varios valores de retorno | `func Cargar() (Config, error)`; se reciben con `cfg, err := config.Cargar()`. |
-| Patrón `if err != nil` | Después de cada operación que puede fallar se revisa el error y, si existe, se devuelve hacia arriba. |
-| Slice (`[]error`) | Lista de tamaño variable. `append` agrega elementos. |
-| Envolver errores (`%w`) | `fmt.Errorf("contexto: %w", err)` añade contexto sin perder la causa original. |
-| Import en blanco (`_`) | Importa un paquete solo por su efecto (aquí, incluir las zonas horarias). |
-| Pruebas | Archivos `_test.go`, funciones `TestXxx(t *testing.T)`, ejecutadas con `go test`. |
+| Dependencias externas | `go get` + `go mod tidy`; quedan en `go.mod` y `go.sum`. |
+| Tipo función | `type ComprobadorSalud func(ctx context.Context) error`. |
+| `map[K]V` | Diccionario. Se recorre con `for clave, valor := range m`. |
+| Closure | Función interna que usa variables de la función que la creó (`salud`). |
+| Etiquetas de struct | `` `json:"estado"` `` define el nombre del campo en JSON. |
+| `defer` | Ejecuta algo al salir de la función, aunque haya error. |
+| `context.Context` | Lleva cancelación y tiempos máximos a través de las llamadas. |
+| Goroutine | `go f()` ejecuta `f` en paralelo. |
+| Canal | `make(chan T, n)`; se envía con `c <- v` y se recibe con `v := <-c`. |
+| `select` | Espera al primero de varios canales que tenga algo. |
+| `&T{...}` | Crea un valor y devuelve un puntero a él. |
+| `httptest` | Paquete estándar para probar handlers HTTP sin red. |
 
 ---
 
 ## 5. Cómo comprobarlo
 
-Desde `backend/` (o con Docker, como se explica en el paso 0):
-
 ```bash
-go test ./...          # ejecuta las pruebas de todos los paquetes
-go run ./cmd/api       # muestra la configuración cargada
-
-APP_ZONA_HORARIA=Marte/Monte_Olimpo go run ./cmd/api
-# {"level":"ERROR","msg":"la API terminó con error","error":"APP_ZONA_HORARIA: unknown time zone Marte/Monte_Olimpo"}
+cd backend
+go test ./...
+go run ./cmd/api
+# en otra terminal:
+curl -i http://localhost:8080/salud      # 200 {"estado":"ok","componentes":{}}
+curl -i http://localhost:8080/no-existe  # 404 (texto plano por ahora; en el paso 10 será JSON)
 ```
 
-`./...` significa "este paquete y todos los que estén debajo".
-
-Con Docker, para pasar una variable se usa `-e`:
+Con Docker hay que publicar el puerto (`-p`):
 
 ```bash
-docker run --rm -e APP_PUERTO=9000 -v "${PWD}/backend:/src" -w /src golang:1.26 go run ./cmd/api
+docker run --rm -p 8080:8080 -v "${PWD}/backend:/src" -w /src golang:1.26 go run ./cmd/api
 ```
+
+Al presionar Ctrl+C se ve `deteniendo la API` y el programa termina sin error.
 
 ---
 
-## 6. Pasos para lograr esta versión desde el paso 0
+## 6. Pasos para lograr esta versión desde el paso 1
 
-1. Crear la carpeta del paquete: `mkdir -p backend/internal/config`
-2. Crear `backend/internal/config/config.go` con:
-   - el comentario de paquete y `package config`;
-   - el struct `Config` con `Entorno`, `PuertoHTTP` y `ZonaHoraria`;
-   - el método `EsDesarrollo()`;
-   - la función `Cargar()` que acumula errores y usa `errors.Join`;
-   - la función privada `texto(clave, porDefecto)`.
-3. Crear `backend/internal/config/config_test.go` con las dos pruebas.
-4. Modificar `backend/cmd/api/main.go`:
-   - agregar los imports `_ "time/tzdata"` y `"seguimiento/internal/config"`;
-   - en `ejecutar`, llamar a `config.Cargar()`, devolver el error si existe y registrar la configuración.
-5. Desde `backend/`, ejecutar las pruebas y el programa:
+1. Agregar Gin (desde `backend/`):
    ```bash
-   go test ./...
-   go run ./cmd/api
+   go get github.com/gin-gonic/gin@v1.12.0
+   go mod tidy
    ```
-6. Commit: `git add . && git commit -m "Paso 1: configuración por variables de entorno"`
+2. Crear `backend/internal/handler/router.go` con `ComprobadorSalud`, `Dependencias`, `NuevoRouter`, `estadoSalud` y `salud` (sección 3.2).
+3. Crear `backend/internal/handler/router_test.go` con las utilidades (`entorno`, `nuevoEntorno`, `peticion`, `peticionCon`, `esperarEstado`) y las dos pruebas de `/salud`.
+4. Modificar `backend/cmd/api/main.go`:
+   - imports: `context`, `errors`, `net/http`, `os/signal`, `syscall`, `time`, `github.com/gin-gonic/gin` y `seguimiento/internal/handler`;
+   - modo release de Gin fuera de desarrollo;
+   - contexto que se cancela con Ctrl+C o `SIGTERM`;
+   - `http.Server` con los tiempos máximos;
+   - `ListenAndServe` en una goroutine, `select` y `Shutdown` con 15 s.
+5. Probar: `go test ./...` y `go run ./cmd/api` + `curl http://localhost:8080/salud`.
+6. Commit: `git add . && git commit -m "Paso 2: servidor HTTP con Gin y endpoint de salud"`
 
 ---
 
 ## 7. Preparación para las próximas entregas
 
-- Cuando la API corra en una máquina virtual (Entrega 2) o en Cloud Run (Entrega 4), bastará con definir las mismas variables en la plataforma. El código no cambia.
-- Como `Cargar()` valida todo al arrancar, un despliegue mal configurado falla de inmediato con un mensaje claro. En la nube eso se ve como un contenedor que no inicia, mucho más fácil de diagnosticar que un error intermitente.
+- **`/salud` devuelve 503 si una dependencia falla.** En la Entrega 3, el balanceador de carga de GCP usará exactamente ese código para dejar de enviar tráfico a una instancia enferma.
+- **El apagado ordenado** permite reiniciar o escalar instancias (Entrega 3) y desplegar versiones nuevas en Cloud Run (Entrega 4) sin cortar peticiones en curso.
+- **El puerto sale de `APP_PUERTO`.** Cloud Run asigna el puerto con una variable de entorno; bastará con mapearla.
 
 ---
 
@@ -245,6 +274,6 @@ docker run --rm -e APP_PUERTO=9000 -v "${PWD}/backend:/src" -w /src golang:1.26 
 
 | Requisito | Cómo |
 |---|---|
-| Lineamientos 10: configuración sin secretos en el código | Toda la configuración llega por variables de entorno. |
-| RF-08.1 (semana de lunes a domingo) | Se prepara la zona horaria con la que se calcularán las semanas. |
-| RNF-05 Mantenibilidad | Un único paquete responsable de la configuración, con pruebas. |
+| Stack: Go + Gin | Servidor HTTP con Gin. |
+| RNF-01: backend sólido | Tiempos máximos, recuperación de pánicos y apagado ordenado. |
+| Despliegue reproducible (pasos 5 a 7) | `/salud` es la base de los healthchecks de Docker. |

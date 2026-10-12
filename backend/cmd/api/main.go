@@ -2,11 +2,20 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 	_ "time/tzdata" // incluye las zonas horarias en el binario
 
+	"github.com/gin-gonic/gin"
+
 	"seguimiento/internal/config"
+	"seguimiento/internal/handler"
 )
 
 func main() {
@@ -17,13 +26,46 @@ func main() {
 	}
 }
 
-// ejecutar arma la aplicación. En los siguientes pasos se agregan el servidor
-// HTTP y la base de datos.
 func ejecutar(log *slog.Logger) error {
 	cfg, err := config.Cargar()
 	if err != nil {
 		return err
 	}
-	log.Info("configuración cargada", "entorno", cfg.Entorno, "puerto", cfg.PuertoHTTP, "zona_horaria", cfg.ZonaHoraria.String())
-	return nil
+	if !cfg.EsDesarrollo() {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	ctx, detener := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer detener()
+
+	// Capa de presentación
+	router := handler.NuevoRouter(handler.Dependencias{})
+
+	servidor := &http.Server{
+		Addr:              ":" + cfg.PuertoHTTP,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+
+	errServidor := make(chan error, 1)
+	go func() {
+		log.Info("API escuchando", "puerto", cfg.PuertoHTTP, "entorno", cfg.Entorno)
+		errServidor <- servidor.ListenAndServe()
+	}()
+
+	select {
+	case err := <-errServidor:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case <-ctx.Done():
+		log.Info("deteniendo la API")
+	}
+
+	ctxCierre, cancelar := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelar()
+	return servidor.Shutdown(ctxCierre)
 }
