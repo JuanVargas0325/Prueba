@@ -98,7 +98,7 @@ func TestSaludResponde503SiUnaDependenciaFalla(t *testing.T) {
 
 func TestRutasProtegidasExigenToken(t *testing.T) {
 	e := nuevoEntorno(t, nil)
-	for _, ruta := range []string{"/api/v1/tareas", "/api/v1/usuarios", "/api/v1/auth/yo"} {
+	for _, ruta := range []string{"/api/v1/tareas", "/api/v1/usuarios", "/api/v1/auth/yo", "/api/v1/seguimiento/personas"} {
 		if w := e.peticion(http.MethodGet, ruta, "", ""); w.Code != http.StatusUnauthorized {
 			t.Errorf("%s sin token: estado = %d", ruta, w.Code)
 		}
@@ -161,6 +161,7 @@ func TestControlDeAccesoPorRol(t *testing.T) {
 		{http.MethodPost, "/api/v1/vinculaciones", monitor},          // solo profesor
 		{http.MethodPut, "/api/v1/vinculaciones/" + uuidA, profesor}, // solo administrador
 		{http.MethodPost, "/api/v1/tareas", profesor},                // solo operativos
+		{http.MethodGet, "/api/v1/seguimiento/personas", monitor},    // profesor o administrador
 	}
 	for _, c := range casos {
 		if w := e.peticion(c.metodo, c.ruta, c.token, `{}`); w.Code != http.StatusForbidden {

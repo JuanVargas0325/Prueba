@@ -1,233 +1,203 @@
-# Paso 43 · Servicio de seguimiento
+# Paso 44 · Endpoints de seguimiento
 
-> Rama `paso-a-paso` · paso 43 de 65 · anterior: **Paso 42 · Consulta de tareas por vinculaciones** · siguiente: **Paso 44 · Endpoints de seguimiento**
+> Rama `paso-a-paso` · paso 44 de 65 · anterior: **Paso 43 · Servicio de seguimiento** · siguiente: **Paso 45 · Dominio: lotes y reportes**
 
 ---
 
 ## 1. Qué se hizo en este paso
 
-Se creó el caso de uso que arma las **vistas de seguimiento** combinando vinculaciones, tareas y los cálculos del dominio (paso 41).
+Las vistas de seguimiento quedan disponibles por HTTP:
+
+| Método | Ruta | Rol | Descripción |
+|---|---|---|---|
+| GET | `/api/v1/seguimiento/personas` | profesor o administrador | Vista principal: personas a cargo, sus vinculaciones y la semana actual y la anterior. Filtros: `?espacio_id=` y, para el administrador, `?profesor_id=`. |
+| GET | `/api/v1/seguimiento/personas/{id}/semanas` | profesor de la persona, administrador o la propia persona | Detalle semana a semana con tareas y estado. Rango opcional `?desde=&hasta=`. |
+| GET | `/api/v1/seguimiento/personas/{id}/consolidado` | ídem | Resumen acumulado por vinculación. |
+| GET | `/api/v1/seguimiento/mi-historial` | cualquier usuario | El historial semanal del usuario autenticado. |
 
 | Archivo | Cambio |
 |---|---|
-| `backend/internal/servicio/seguimiento.go` | **Nuevo.** Servicio `Seguimiento` con `PersonasACargo`, `SemanasPersona` y `Consolidado`, más `vinculacionesVisibles`, `rangoSemanas`, `tareasPorPersona` e `idsDe`. |
-| `backend/internal/servicio/modulos_test.go` | **Modificado.** Listador falso de tareas y dos pruebas. |
+| `backend/internal/handler/seguimiento.go` | **Nuevo.** Módulo de seguimiento con sus formatos JSON. |
+| `backend/internal/handler/formatos.go` | **Modificado.** `tareaResumenJSON`: forma corta de una tarea dentro de otras respuestas. |
+| `backend/internal/handler/router.go` | **Modificado.** Servicio `Seguimiento` y su módulo. |
+| `backend/internal/handler/router_test.go` | **Modificado.** La ruta exige token y un monitor no ve "personas a cargo". |
+| `backend/internal/handler/modulos_test.go` | **Modificado.** Servicio falso y `TestSeguimiento`. |
+| `backend/cmd/api/main.go` | **Modificado.** Servicio de seguimiento. |
+
+Ejemplo de la vista del profesor:
+
+```json
+[{"usuario":{"id":"75b5...","nombre":"Laura Martínez","correo":"laura@uniandes.edu.co"},
+  "horas_contratadas":4,
+  "vinculaciones":[{"id":"...","espacio":{"id":"...","nombre":"Desarrollo en la nube","tipo":"curso","estado":"activo"},"rol":"monitor","horas_semanales":4}],
+  "semana_actual":{"semana_inicio":"2026-10-05","semana_fin":"2026-10-11","estado":"en_curso","horas_contratadas":4,"horas_reportadas":3,"tareas":1},
+  "semana_anterior":{"semana_inicio":"2026-09-28","semana_fin":"2026-10-04","estado":"sin_reporte","horas_contratadas":4,"horas_reportadas":0,"tareas":0}}]
+```
 
 ---
 
 ## 2. Por qué
 
-| Vista | Requisito | Quién la usa |
-|---|---|---|
-| **Personas a cargo:** cada monitor y asistente con sus vinculaciones y cómo va en la semana actual y la anterior | RF-10.1, RF-10.2 | El profesor (vista principal) y el administrador |
-| **Semanas de una persona:** detalle semana a semana con tareas y estado (incluido "sin reporte") | RF-10.3, RF-10.6, RF-09, RF-11.3 | El profesor, el administrador y la propia persona (su historial) |
-| **Consolidado de una persona:** acumulado por vinculación | RF-10.4 | El profesor y el administrador |
-
-La visibilidad (RF-12, RN-03 a RN-05) se aplica eligiendo **qué vinculaciones** se consultan.
+- **RF-10:** la pantalla principal del profesor debe mostrar, por persona, sus vinculaciones, lo que reportó y si dejó semanas sin reporte. Con esta respuesta un frontend puede pintar una tabla con una fila por persona y un indicador rojo para `sin_reporte`.
+- **RF-11.3:** el monitor o asistente ve su propio historial con `mi-historial`, sin conocer su ID.
+- **Visibilidad en el servicio:** las rutas de detalle no exigen rol en el router porque **la misma ruta** sirve a tres actores distintos (la persona, su profesor y el administrador). La decisión la toma el servicio (paso 43).
 
 ---
 
 ## 3. Explicación detallada
 
-### 3.1 Dependencias mínimas
+### 3.1 Rutas
 
 ```go
-type ListadorVinculaciones interface {
-	Listar(ctx context.Context, f dominio.FiltroVinculaciones) ([]dominio.Vinculacion, error)
-}
-
-type ListadorTareasPorVinculacion interface {
-	ListarPorVinculaciones(ctx context.Context, vinculacionIDs []string, desde, hasta *time.Time) ([]dominio.Tarea, error)
-}
-
-type BuscadorUsuarios interface {
-	BuscarPorID(ctx context.Context, id string) (dominio.Usuario, error)
-}
-```
-- Tres interfaces de **un solo método** cada una: el servicio solo lee.
-
-### 3.2 `PersonasACargo`: la vista principal del profesor
-
-```go
-type ResumenPersona struct {
-	dominio.PersonaACargo
-	SemanaActual   *dominio.SemanaPersona
-	SemanaAnterior *dominio.SemanaPersona
-}
-
-func (s *Seguimiento) PersonasACargo(ctx context.Context, actor auth.Actor, f FiltroPersonas) ([]ResumenPersona, error) {
-	filtro := dominio.FiltroVinculaciones{EspacioID: f.EspacioID, Paginacion: dominio.SinPaginar}
-	switch {
-	case actor.EsAdministrador():
-		filtro.ProfesorID = f.ProfesorID
-	case actor.TieneRol(dominio.RolProfesor):
-		filtro.ProfesorID = actor.UsuarioID // RN-03
-	default:
-		return nil, apperr.Prohibido("solo profesores y administradores consultan personas a cargo")
-	}
-
-	vinculaciones, err := s.vinculaciones.Listar(ctx, filtro)
-	...
-	actual := s.reloj.SemanaActual()
-	anterior := actual.AddDate(0, 0, -7)
-	tareas, err := s.tareas.ListarPorVinculaciones(ctx, idsDe(vinculaciones), &anterior, &actual)
-	...
-	personas := dominio.AgruparPorPersona(vinculaciones)
-	tareasDe := tareasPorPersona(vinculaciones, tareas)
-	resultado := make([]ResumenPersona, 0, len(personas))
-	for _, p := range personas {
-		r := ResumenPersona{PersonaACargo: p}
-		for _, semana := range dominio.ConstruirSemanas(p.Vinculaciones, tareasDe[p.UsuarioID], anterior, actual, s.reloj.Ahora(), s.reloj.Zona()) {
-			semana := semana
-			if semana.SemanaInicio.Equal(actual) {
-				r.SemanaActual = &semana
-			} else {
-				r.SemanaAnterior = &semana
-			}
-		}
-		resultado = append(resultado, r)
-	}
-	return resultado, nil
-}
-```
-- **Struct embebido:** `ResumenPersona` incluye `dominio.PersonaACargo` sin nombre de campo. Sus campos (`Nombre`, `Vinculaciones`...) se usan como propios: `r.Nombre`.
-- **Visibilidad:** el profesor solo ve sus personas (RN-03; se **ignora** el `ProfesorID` que pida); el administrador puede filtrar por cualquier profesor; los demás roles → 403.
-- **Dos consultas en total**, sin importar cuántas personas haya: las vinculaciones y las tareas de las dos últimas semanas (paso 42).
-- `SinPaginar` (paso 11): aquí sí se necesitan todas las vinculaciones del profesor.
-- Para cada persona se construyen solo dos semanas: la **actual** (qué lleva reportado) y la **anterior** (¿quedó sin reporte?). Es lo que un profesor necesita ver de un vistazo.
-- `semana := semana` crea una **copia** de la variable del ciclo antes de tomar su dirección con `&semana`, para que cada puntero apunte a su propia semana. (Desde Go 1.22 cada vuelta ya tiene su propia variable, pero la copia explícita deja clara la intención.)
-- Un puntero `nil` en `SemanaActual` o `SemanaAnterior` significa "no estaba vinculada esa semana".
-
-**Cada persona recibe solo sus tareas:**
-
-```go
-func tareasPorPersona(vinculaciones []dominio.Vinculacion, tareas []dominio.Tarea) map[string][]dominio.Tarea {
-	duenoDe := make(map[string]string, len(vinculaciones))
-	for _, v := range vinculaciones {
-		duenoDe[v.ID] = v.UsuarioID
-	}
-	resultado := map[string][]dominio.Tarea{}
-	for _, t := range tareas {
-		persona := duenoDe[t.VinculacionID]
-		resultado[persona] = append(resultado[persona], t)
-	}
-	return resultado
-}
-```
-- La consulta del paso 42 trae las tareas de **todas** las personas del profesor juntas. `ConstruirSemanas` (paso 41) agrupa las tareas que recibe; si se le pasaran todas a cada persona, cada una volvería a recorrer y agrupar las tareas de todos los demás para luego no usarlas.
-- Con 40 personas y 3.000 tareas eso eran unas **120.000** operaciones por petición; repartiéndolas una vez son unas **3.000**. Las pruebas de carga lo confirmaron: la vista del profesor pasó de ~1.270 a ~2.560 peticiones por segundo con datos normales, y de 46 a 217 con 3.000 tareas extra (paso 64). Es la mejora principal de la deuda técnica DT-08.
-- `duenoDe` es un mapa "vinculación → persona": permite saber de quién es cada tarea con una sola búsqueda.
-- `make(map[string]string, len(vinculaciones))` reserva desde el inicio espacio para todas las entradas.
-- `append` sobre una clave que aún no existe funciona: el mapa devuelve una lista vacía (`nil`) y `append` crea la lista.
-
-### 3.3 `SemanasPersona`: el detalle y el historial
-
-```go
-func (s *Seguimiento) SemanasPersona(ctx context.Context, actor auth.Actor, personaID string, desde, hasta *time.Time) (DetallePersona, error) {
-	inicio, fin, err := s.rangoSemanas(desde, hasta)
-	...
-	persona, vinculaciones, err := s.vinculacionesVisibles(ctx, actor, personaID)
-	...
-	tareas, err := s.tareas.ListarPorVinculaciones(ctx, idsDe(vinculaciones), &inicio, &fin)
-	...
-	return DetallePersona{
-		Persona: persona,
-		Semanas: dominio.ConstruirSemanas(vinculaciones, tareas, inicio, fin, s.reloj.Ahora(), s.reloj.Zona()),
-	}, nil
+func (h *HandlerSeguimiento) Registrar(g *gin.RouterGroup) {
+	r := g.Group("/seguimiento")
+	r.GET("/personas", RequiereRol(dominio.RolProfesor, dominio.RolAdministrador), h.PersonasACargo)
+	// La visibilidad por persona la decide el servicio: la propia persona, su
+	// profesor (solo sus espacios) o el administrador.
+	r.GET("/personas/:id/semanas", h.SemanasPersona)
+	r.GET("/personas/:id/consolidado", h.Consolidado)
+	r.GET("/mi-historial", h.MiHistorial)
 }
 ```
 
-```go
-func (s *Seguimiento) rangoSemanas(desde, hasta *time.Time) (time.Time, time.Time, error) {
-	actual := s.reloj.SemanaActual()
-	fin := actual
-	if hasta != nil && dominio.InicioSemana(*hasta).Before(actual) {
-		fin = dominio.InicioSemana(*hasta)
-	}
-	inicio := fin.AddDate(0, 0, -7*7) // 8 semanas por defecto
-	if desde != nil {
-		inicio = dominio.InicioSemana(*desde)
-	}
-	if inicio.After(fin) { ... 400 ... }
-	if fin.Sub(inicio) > time.Duration(dominio.MaxSemanasConsulta-1)*7*24*time.Hour { ... 400 ... }
-	return inicio, fin, nil
-}
-```
-- Por defecto, **las últimas 8 semanas** (la actual y 7 anteriores). Nunca más allá de la semana actual. Máximo 53 semanas por consulta.
-
-### 3.4 `vinculacionesVisibles`: quién puede ver a quién
+### 3.2 Formatos
 
 ```go
-func (s *Seguimiento) vinculacionesVisibles(ctx context.Context, actor auth.Actor, personaID string) (dominio.Usuario, []dominio.Vinculacion, error) {
-	filtro := dominio.FiltroVinculaciones{UsuarioID: personaID, Paginacion: dominio.SinPaginar}
-	propio := actor.UsuarioID == personaID
-	switch {
-	case propio || actor.EsAdministrador():
-	case actor.TieneRol(dominio.RolProfesor):
-		filtro.ProfesorID = actor.UsuarioID
-	default:
-		return dominio.Usuario{}, nil, noEncontrado("persona")
+type vinculacionResumenJSON struct {
+	ID             string      `json:"id"`
+	Espacio        espacioRef  `json:"espacio"`
+	Rol            dominio.Rol `json:"rol"`
+	HorasSemanales int         `json:"horas_semanales"`
+}
+
+type resumenSemanaJSON struct {
+	SemanaInicio     string               `json:"semana_inicio"`
+	SemanaFin        string               `json:"semana_fin"`
+	Estado           dominio.EstadoSemana `json:"estado"`
+	HorasContratadas int                  `json:"horas_contratadas"`
+	HorasReportadas  int                  `json:"horas_reportadas"`
+	Tareas           int                  `json:"tareas"`
+}
+
+func aResumenSemanaJSON(s *dominio.SemanaPersona) *resumenSemanaJSON {
+	if s == nil {
+		return nil
 	}
-	persona, err := s.usuarios.BuscarPorID(ctx, personaID)
 	...
-	vinculaciones, err := s.vinculaciones.Listar(ctx, filtro)
-	...
-	if len(vinculaciones) == 0 && !propio && !actor.EsAdministrador() {
-		return dominio.Usuario{}, nil, noEncontrado("persona")
-	}
-	return persona, vinculaciones, nil
 }
 ```
-- **La propia persona** ve **todas** sus vinculaciones (RF-11.3: su historial).
-- **El administrador** ve todo (RN-05).
-- **Un profesor** ve a la persona **solo a través de sus propios espacios** (RN-03): si Laura es monitora de dos profesores, cada uno ve únicamente su parte. Si no tiene ninguna vinculación con él → 404.
-- Un `case` vacío en un `switch` significa "no hacer nada en este caso".
+- Dentro de la vista de seguimiento la vinculación se muestra **resumida** (sin repetir la persona en cada una).
+- Si la persona no estaba vinculada esa semana, el servicio devuelve `nil` y el JSON muestra `"semana_actual": null`.
 
-### 3.5 `Consolidado`
+```go
+type semanaJSON struct {
+	resumenSemanaJSON
+	Vinculaciones []detalleVinculacionSemanaJSON `json:"vinculaciones"`
+}
+```
+- **Embeber un struct en JSON:** `semanaJSON` incluye `resumenSemanaJSON` sin nombre de campo; al serializar, sus campos aparecen **al mismo nivel** (`semana_inicio`, `estado`, …, `vinculaciones`). Así se reutiliza el resumen y se le agrega el detalle.
 
-- Las vinculaciones visibles + **todas** sus tareas (`nil, nil` = sin rango) → `dominio.ConstruirConsolidado` (paso 41).
+```go
+type tareaResumenJSON struct {
+	ID              string              `json:"id"`
+	Titulo          string              `json:"titulo"`
+	Descripcion     string              `json:"descripcion"`
+	Estado          dominio.EstadoTarea `json:"estado"`
+	HorasInvertidas int                 `json:"horas_invertidas"`
+	Observaciones   string              `json:"observaciones"`
+	Tardia          bool                `json:"tardia"`
+}
+```
+- En `formatos.go`: dentro de una semana, cada tarea se muestra en su forma corta (ya se sabe de qué vinculación y semana es).
+
+```go
+type consolidadoVinculacionJSON struct {
+	...
+	TareasPorEstado      map[dominio.EstadoTarea]int `json:"tareas_por_estado"`
+	PromedioHorasSemana  float64                     `json:"promedio_horas_semana"`
+}
+```
+- Un **mapa** se serializa como objeto JSON: `"tareas_por_estado": {"abierto": 2, "en_desarrollo": 0, "finalizado": 1}`.
+
+### 3.3 `mi-historial` reutiliza el detalle
+
+```go
+func (h *HandlerSeguimiento) SemanasPersona(c *gin.Context) {
+	id, err := parametroUUID(c, "id")
+	...
+	h.responderSemanas(c, id)
+}
+
+func (h *HandlerSeguimiento) MiHistorial(c *gin.Context) {
+	h.responderSemanas(c, ActorDe(c).UsuarioID)
+}
+```
+- Las dos rutas comparten la misma función; la única diferencia es **de quién**: el ID de la ruta o el del usuario autenticado.
+
+### 3.4 Pruebas
+
+- `TestRutasProtegidasExigenToken` incluye `/api/v1/seguimiento/personas`; `TestControlDeAccesoPorRol`, que un monitor no ve personas a cargo (403).
+- `TestSeguimiento` (handler):
+  - la vista de personas incluye `"estado":"sin_reporte"` en la semana anterior y `"semana_actual":null` cuando no hay semana actual;
+  - `?desde=2026-09-01` llega al servicio y `hasta` queda en `nil`;
+  - `mi-historial` consulta al usuario autenticado (`usuario-1`);
+  - el consolidado responde 200.
 
 ---
 
-## 4. Las pruebas
-
-El reloj marca el miércoles 14/10/2026 (semana actual: 12/10). Laura tiene una monitoría (4 h) con el profesor `prof-1` desde agosto y una tarea de 2 h esta semana.
-
-| Prueba | Qué verifica |
-|---|---|
-| `TestPersonasACargo` | Aunque el profesor pida `prof-2`, el filtro usa su propio ID (RN-03). Laura aparece con la semana actual (2 h reportadas) y la anterior **sin reporte**. Un monitor → 403. |
-| `TestSemanasPersonaVisibilidadYRango` | Por defecto 8 semanas, del 24/08 al 12/10. La propia Laura ve su historial (RF-11.3). Otro profesor → 404 (RN-03). Un monitor ajeno → 404 (RN-04). Rango invertido → 400. Rango de más de 53 semanas → 400. El consolidado del administrador suma las 2 h. |
-
----
-
-## 5. Conceptos de Go de este paso
+## 4. Conceptos de este paso
 
 | Concepto | Explicación |
 |---|---|
-| Struct embebido | `ResumenPersona` incluye `dominio.PersonaACargo`; sus campos se promueven. |
-| Copia de la variable del ciclo | `semana := semana` antes de tomar `&semana`. |
-| `case` vacío | En un `switch`, un caso que solo detiene la evaluación. |
-| `t.Sub(u)` | Diferencia entre dos instantes (`time.Duration`). |
-| `make(map[K]V, n)` | Crea un mapa con espacio reservado para `n` entradas. |
-| `append` sobre un mapa | `m[k] = append(m[k], v)` funciona aunque `k` no exista todavía. |
+| Struct embebido en JSON | Sus campos aparecen al mismo nivel que los del struct que lo contiene. |
+| `null` en JSON | Un puntero `nil` se serializa como `null`. |
+| Mapa → objeto JSON | `map[clave]valor` produce `{"clave": valor}`. |
+| Una ruta, varios actores | Permisos decididos por el servicio según la relación con el dato. |
 
 ---
 
-## 6. Cómo comprobarlo
+## 5. Cómo comprobarlo
 
 ```bash
-cd backend
-go test ./internal/servicio/ -v -run 'PersonasACargo|SemanasPersona'
+make pruebas
+docker compose up --build -d --wait
 ```
+
+Con la profesora, Laura vinculada a uno de sus cursos y algunas tareas (pasos 33 y 37):
+
+```bash
+curl -s localhost:8080/api/v1/seguimiento/personas -H "Authorization: Bearer $TOKEN_PROFESORA"
+curl -s "localhost:8080/api/v1/seguimiento/mi-historial?desde=2026-09-01" -H "Authorization: Bearer $TOKEN_LAURA"
+curl -s localhost:8080/api/v1/seguimiento/personas/<id de Laura>/consolidado -H "Authorization: Bearer $TOKEN_PROFESORA"
+curl -s -o /dev/null -w "%{http_code}" localhost:8080/api/v1/seguimiento/personas -H "Authorization: Bearer $TOKEN_LAURA"   # 403
+```
+
+Para ver semanas **sin reporte** en una prueba local, la vinculación debe existir desde semanas atrás (por la API se crea con la fecha de hoy). Se puede simular:
+
+```bash
+docker compose exec postgres psql -U seguimiento -d seguimiento -c "UPDATE vinculaciones SET creado_en = '2026-09-01'"
+```
+
+Los datos de demostración del paso 59 ya traen vinculaciones y tareas en varias semanas.
 
 ---
 
-## 7. Pasos para lograr esta versión desde el paso 42
+## 6. Pasos para lograr esta versión desde el paso 43
 
-1. Crear `backend/internal/servicio/seguimiento.go` con las tres interfaces, `FiltroPersonas`, `ResumenPersona`, `DetallePersona`, `ConsolidadoPersona`, `Seguimiento`, `NuevoSeguimiento`, los tres casos de uso y las funciones auxiliares.
-2. Al final de `modulos_test.go`, la sección `// --- seguimiento ---` con `listadorTareasFalso`, `entornoSeguimiento` y las dos pruebas.
-3. `make pruebas lint`
-4. Commit: `git add . && git commit -m "Paso 43: servicio de seguimiento"`
+1. En `formatos.go`: `tareaResumenJSON` y `aTareaResumenJSON`.
+2. Crear `backend/internal/handler/seguimiento.go` (interfaz, handler, `Registrar`, formatos y los cuatro endpoints con `responderSemanas`).
+3. En `router.go`: campo `Seguimiento` y `&HandlerSeguimiento{...}`.
+4. En `router_test.go`: `/api/v1/seguimiento/personas` en la lista de rutas protegidas y el caso del monitor.
+5. En `handler/modulos_test.go`: `servicioSeguimientoFalso` y `TestSeguimiento`.
+6. En `main.go`: `Seguimiento: servicio.NuevoSeguimiento(vinculaciones, tareas, usuarios, reloj)`.
+7. `make pruebas lint` y commit: `git add . && git commit -m "Paso 44: endpoints de seguimiento"`
+
+---
+
+## 7. Preparación para las próximas entregas
+
+- **El frontend de la Entrega 2** tiene aquí su pantalla principal: una llamada a `/seguimiento/personas` trae todo lo necesario para la tabla del profesor.
+- **Escenario de carga E2:** esta es la consulta que se mide en las pruebas de carga (paso 64), la más costosa de la API después del inicio de sesión.
 
 ---
 
@@ -235,9 +205,9 @@ go test ./internal/servicio/ -v -run 'PersonasACargo|SemanasPersona'
 
 | Requisito | Cómo |
 |---|---|
-| RF-10.1 / RF-10.2 Personas a cargo | `PersonasACargo`. |
-| RF-10.3 / RF-10.6 Detalle semanal | `SemanasPersona`. |
-| RF-10.4 Consolidado | `Consolidado`. |
-| RF-11.3 Historial propio | `SemanasPersona` sobre el propio usuario. |
-| RF-09 Sin reporte | Semanas cerradas sin tareas. |
-| RF-12 / RN-03 a RN-05 Visibilidad | `vinculacionesVisibles` y filtro por profesor. |
+| RF-10.1 / RF-10.2 Personas a cargo y sus vinculaciones | `GET /seguimiento/personas`. |
+| RF-10.3 / RF-10.6 Detalle semanal con horas | `GET /seguimiento/personas/{id}/semanas`. |
+| RF-10.4 Consolidado | `GET /seguimiento/personas/{id}/consolidado`. |
+| RF-11.3 Historial propio | `GET /seguimiento/mi-historial`. |
+| RF-09 Sin reporte | Estado `sin_reporte` en las semanas cerradas sin tareas. |
+| RF-12 Visibilidad | Según la relación del actor con la persona. |

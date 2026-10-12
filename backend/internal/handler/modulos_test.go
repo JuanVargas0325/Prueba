@@ -348,3 +348,44 @@ func TestVinculaciones(t *testing.T) {
 		t.Errorf("rectificación inesperada: %+v", srv.rectificacion)
 	}
 }
+
+// --- seguimiento --------------------------------------------------------------------------
+
+type servicioSeguimientoFalso struct {
+	personaID    string
+	desde, hasta *time.Time
+}
+
+func (s *servicioSeguimientoFalso) PersonasACargo(context.Context, auth.Actor, servicio.FiltroPersonas) ([]servicio.ResumenPersona, error) {
+	semana := dominio.SemanaPersona{SemanaInicio: time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC), Estado: dominio.SemanaSinReporte, HorasContratadas: 6}
+	return []servicio.ResumenPersona{{PersonaACargo: dominio.PersonaACargo{UsuarioID: uuidA, Nombre: "Ana"}, SemanaAnterior: &semana}}, nil
+}
+func (s *servicioSeguimientoFalso) SemanasPersona(_ context.Context, _ auth.Actor, id string, desde, hasta *time.Time) (servicio.DetallePersona, error) {
+	s.personaID, s.desde, s.hasta = id, desde, hasta
+	return servicio.DetallePersona{Persona: dominio.Usuario{ID: id}}, nil
+}
+func (s *servicioSeguimientoFalso) Consolidado(_ context.Context, _ auth.Actor, id string) (servicio.ConsolidadoPersona, error) {
+	return servicio.ConsolidadoPersona{Persona: dominio.Usuario{ID: id}}, nil
+}
+
+func TestSeguimiento(t *testing.T) {
+	srv := &servicioSeguimientoFalso{}
+	e := nuevoEntorno(t, func(d *Dependencias) { d.Seguimiento = srv })
+
+	w := e.peticion(http.MethodGet, "/api/v1/seguimiento/personas", e.token(t, dominio.RolProfesor), "")
+	esperarEstado(t, w, http.StatusOK)
+	if !strings.Contains(w.Body.String(), `"estado":"sin_reporte"`) || !strings.Contains(w.Body.String(), `"semana_actual":null`) {
+		t.Errorf("respuesta inesperada: %s", w.Body.String())
+	}
+
+	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/seguimiento/personas/"+uuidA+"/semanas?desde=2026-09-01", e.token(t, dominio.RolProfesor), ""), http.StatusOK)
+	if srv.personaID != uuidA || srv.desde == nil || srv.hasta != nil {
+		t.Errorf("parámetros inesperados: %s %v %v", srv.personaID, srv.desde, srv.hasta)
+	}
+
+	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/seguimiento/mi-historial", e.token(t, dominio.RolMonitor), ""), http.StatusOK)
+	if srv.personaID != "usuario-1" {
+		t.Errorf("mi-historial debe consultar al usuario autenticado, se consultó %s", srv.personaID)
+	}
+	esperarEstado(t, e.peticion(http.MethodGet, "/api/v1/seguimiento/personas/"+uuidA+"/consolidado", e.token(t, dominio.RolProfesor), ""), http.StatusOK)
+}

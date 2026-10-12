@@ -84,6 +84,7 @@ func ejecutar(log *slog.Logger) error {
 		Espacios:      servicio.NuevoEspacios(espacios, periodos, reloj, log),
 		Vinculaciones: servicio.NuevoVinculaciones(vinculaciones, usuarios, espacios, log),
 		Tareas:        servicio.NuevoTareas(tareas, vinculaciones, almacen, reloj, maxBytesAdjunto, log),
+		Seguimiento:   servicio.NuevoSeguimiento(vinculaciones, tareas, usuarios, reloj),
 		Tokens:        tokens,
 		// Todos los adjuntos de una tarea más un margen para los demás campos.
 		MaxCuerpoArchivosMB: cfg.MaxAdjuntoMB*dominio.MaxAdjuntosPorTarea + 1,

@@ -63,3 +63,19 @@ func aVinculacionJSON(v dominio.Vinculacion) vinculacionJSON {
 		ActualizadoEn:  v.ActualizadoEn,
 	}
 }
+
+// tareaResumenJSON es la forma corta de una tarea dentro de otras respuestas.
+type tareaResumenJSON struct {
+	ID              string              `json:"id"`
+	Titulo          string              `json:"titulo"`
+	Descripcion     string              `json:"descripcion"`
+	Estado          dominio.EstadoTarea `json:"estado"`
+	HorasInvertidas int                 `json:"horas_invertidas"`
+	Observaciones   string              `json:"observaciones"`
+	Tardia          bool                `json:"tardia"`
+}
+
+func aTareaResumenJSON(t dominio.Tarea) tareaResumenJSON {
+	return tareaResumenJSON{ID: t.ID, Titulo: t.Titulo, Descripcion: t.Descripcion, Estado: t.Estado,
+		HorasInvertidas: t.HorasInvertidas, Observaciones: t.Observaciones, Tardia: t.Tardia}
+}

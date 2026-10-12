@@ -21,6 +21,7 @@ type Dependencias struct {
 	Espacios      ServicioEspacios
 	Vinculaciones ServicioVinculaciones
 	Tareas        ServicioTareas
+	Seguimiento   ServicioSeguimiento
 
 	Tokens ValidadorTokens
 	Salud  map[string]ComprobadorSalud
@@ -67,6 +68,7 @@ func NuevoRouter(d Dependencias) *gin.Engine {
 		&HandlerEspacios{servicio: d.Espacios, log: d.Log},
 		&HandlerVinculaciones{servicio: d.Vinculaciones, log: d.Log},
 		&HandlerTareas{servicio: d.Tareas, maxCuerpo: int64(d.MaxCuerpoArchivosMB) << 20, log: d.Log},
+		&HandlerSeguimiento{servicio: d.Seguimiento, log: d.Log},
 	}
 	for _, m := range modulos {
 		m.Registrar(protegidas)
